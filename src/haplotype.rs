@@ -84,7 +84,10 @@ impl Haplotype {
         let query_end_i32 = query_end.saturating_sub(1) as i32;
         let mut overlapping_indices: Vec<u32> = Vec::new();
         self.variant_tree.query(ref_start as i32, query_end_i32, |node| {
-            overlapping_indices.push(*node.metadata);
+            // clone() rather than *deref because coitrees' query callback
+            // yields &T on NEON (ARM) but T directly on nosimd (x86).
+            #[allow(clippy::clone_on_copy)]
+            overlapping_indices.push(node.metadata.clone());
         });
 
         // Sort variants by position for sequential processing.

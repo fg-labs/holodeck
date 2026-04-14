@@ -1,6 +1,26 @@
+[![Build](https://github.com/fg-labs/holodeck/actions/workflows/check.yml/badge.svg)](https://github.com/fg-labs/holodeck/actions/workflows/check.yml)
+[![License](http://img.shields.io/badge/license-MIT-blue.svg)](https://github.com/fg-labs/holodeck/blob/main/LICENSE)
+
 # Holodeck
 
 Modern NGS read simulator written in Rust.
+
+<p>
+<a href="https://fulcrumgenomics.com">
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset=".github/logos/fulcrumgenomics-dark.svg">
+  <source media="(prefers-color-scheme: light)" srcset=".github/logos/fulcrumgenomics-light.svg">
+  <img alt="Fulcrum Genomics" src=".github/logos/fulcrumgenomics-light.svg" height="100">
+</picture>
+</a>
+</p>
+
+[Visit us at Fulcrum Genomics](https://www.fulcrumgenomics.com) to learn more about how we can power your Bioinformatics with holodeck and beyond.
+
+<a href="mailto:contact@fulcrumgenomics.com?subject=[GitHub inquiry]"><img src="https://img.shields.io/badge/Email_us-%2338b44a.svg?&style=for-the-badge&logo=gmail&logoColor=white"/></a>
+<a href="https://www.fulcrumgenomics.com"><img src="https://img.shields.io/badge/Visit_Us-%2326a8e0.svg?&style=for-the-badge&logo=wordpress&logoColor=white"/></a>
+
+## Overview
 
 Holodeck generates simulated sequencing reads from a reference genome with optional variants from a VCF file.  It supports Illumina-style paired-end and single-end reads with a position-dependent error model, targeted sequencing with BED files, and arbitrary ploidy with per-contig overrides.
 
