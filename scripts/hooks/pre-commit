@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+echo "Running pre-commit checks..."
+
+echo "  Checking formatting..."
+cargo ci-fmt
+echo "  Formatting OK."
+
+echo "  Running clippy..."
+cargo ci-lint
+echo "  Clippy OK."
+
+# Optionally run tests; set HOLODECK_PRECOMMIT_TEST=1 to enable.
+if [[ "${HOLODECK_PRECOMMIT_TEST:-0}" == "1" ]]; then
+    echo "  Running tests..."
+    cargo ci-test
+    echo "  Tests OK."
+fi
+
+echo "Pre-commit checks passed."
