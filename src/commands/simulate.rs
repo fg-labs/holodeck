@@ -152,6 +152,26 @@ impl Simulate {
         if self.compression > 12 {
             bail!("--compression must be between 0 and 12");
         }
+
+        // --sample without --vcf is nonsensical.
+        if self.vcf.sample.is_some() && self.vcf.vcf.is_none() {
+            bail!("--sample requires --vcf");
+        }
+
+        // Validate VCF sample configuration upfront so the user gets a clear
+        // error before the simulation loop starts.
+        if let Some(vcf_path) = &self.vcf.vcf {
+            crate::vcf::validate_vcf_sample(vcf_path, self.vcf.sample.as_deref())?;
+        }
+
+        // Validate output parent directory exists.
+        if let Some(parent) = self.output.output.parent()
+            && !parent.as_os_str().is_empty()
+            && !parent.exists()
+        {
+            bail!("Output directory does not exist: {}", parent.display());
+        }
+
         Ok(())
     }
 
