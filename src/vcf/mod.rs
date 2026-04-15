@@ -89,6 +89,27 @@ pub fn load_variants_for_contig(
     Ok(variants)
 }
 
+/// Validate that a VCF file has the expected sample configuration.
+///
+/// Opens the VCF, reads the header, and checks:
+/// - If `sample_name` is `Some`, that the named sample exists.
+/// - If `sample_name` is `None`, that the VCF has exactly one sample.
+///
+/// Call this during argument validation to surface sample errors before
+/// the per-contig simulation loop begins.
+///
+/// # Errors
+/// Returns an error if the VCF cannot be read or the sample configuration
+/// is invalid.
+pub(crate) fn validate_vcf_sample(path: &Path, sample_name: Option<&str>) -> Result<()> {
+    let mut reader = vcf::io::reader::Builder::default()
+        .build_from_path(path)
+        .with_context(|| format!("Failed to open VCF: {}", path.display()))?;
+    let header = reader.read_header()?;
+    resolve_sample_index(&header, sample_name)?;
+    Ok(())
+}
+
 /// Resolve the sample index from a VCF header.
 ///
 /// If `sample_name` is `Some`, looks up that sample. If `None` and the VCF has
@@ -99,10 +120,18 @@ fn resolve_sample_index(header: &vcf::Header, sample_name: Option<&str>) -> Resu
 
     match sample_name {
         Some(name) => {
-            let idx = sample_names
-                .iter()
-                .position(|s| s == name)
-                .ok_or_else(|| anyhow::anyhow!("Sample '{name}' not found in VCF header"))?;
+            let idx = sample_names.iter().position(|s| s == name).ok_or_else(|| {
+                if sample_names.is_empty() {
+                    anyhow::anyhow!("Sample '{name}' not found in VCF (VCF has no sample columns)")
+                } else {
+                    let available: Vec<&str> =
+                        sample_names.iter().map(String::as_str).take(10).collect();
+                    anyhow::anyhow!(
+                        "Sample '{name}' not found in VCF. Available samples: {}",
+                        available.join(", ")
+                    )
+                }
+            })?;
             Ok(idx)
         }
         None => {
@@ -115,7 +144,7 @@ fn resolve_sample_index(header: &vcf::Header, sample_name: Option<&str>) -> Resu
                     "VCF has {} samples but no --sample was specified. \
                      Available samples: {}",
                     sample_names.len(),
-                    sample_names.iter().take(5).cloned().collect::<Vec<_>>().join(", ")
+                    sample_names.iter().take(10).cloned().collect::<Vec<_>>().join(", ")
                 )
             }
         }

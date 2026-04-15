@@ -2970,3 +2970,142 @@ fn test_simulate_then_eval() {
     }
     panic!("ALL row not found in eval output");
 }
+
+// ── VCF and CLI validation tests ──────────────────────────────────────────
+
+#[test]
+fn test_sample_without_vcf_fails() {
+    let env = simple_env();
+    let out = env.output_prefix();
+    let out_str = out.to_str().unwrap();
+    let ref_str = env.fasta_path.to_str().unwrap();
+
+    let (ok, _stdout, stderr) = run_simulate(&[
+        "simulate",
+        "-r",
+        ref_str,
+        "-o",
+        out_str,
+        "--sample",
+        "NA12878",
+        "--coverage",
+        "1",
+    ]);
+    assert!(!ok, "should fail when --sample is given without --vcf");
+    assert!(
+        stderr.contains("--sample requires --vcf"),
+        "error should mention --sample requires --vcf, got: {stderr}"
+    );
+}
+
+#[test]
+fn test_wrong_sample_name_fails() {
+    let env = simple_env();
+    let out = env.output_prefix();
+    let out_str = out.to_str().unwrap();
+    let ref_str = env.fasta_path.to_str().unwrap();
+
+    let vcf_path = env.write_vcf_header_only(&["SampleA"], &[("chr1", 1000)]);
+    let vcf_str = vcf_path.to_str().unwrap();
+
+    let (ok, _stdout, stderr) = run_simulate(&[
+        "simulate",
+        "-r",
+        ref_str,
+        "-v",
+        vcf_str,
+        "--sample",
+        "NoSuchSample",
+        "-o",
+        out_str,
+        "--coverage",
+        "1",
+    ]);
+    assert!(!ok, "should fail when sample name is not in VCF");
+    assert!(
+        stderr.contains("NoSuchSample") && stderr.contains("not found"),
+        "error should name the missing sample, got: {stderr}"
+    );
+    assert!(stderr.contains("SampleA"), "error should list available samples, got: {stderr}");
+}
+
+#[test]
+fn test_multi_sample_vcf_without_sample_flag_fails() {
+    let env = simple_env();
+    let out = env.output_prefix();
+    let out_str = out.to_str().unwrap();
+    let ref_str = env.fasta_path.to_str().unwrap();
+
+    let vcf_path = env.write_vcf_header_only(&["SampleA", "SampleB", "SampleC"], &[("chr1", 1000)]);
+    let vcf_str = vcf_path.to_str().unwrap();
+
+    let (ok, _stdout, stderr) =
+        run_simulate(&["simulate", "-r", ref_str, "-v", vcf_str, "-o", out_str, "--coverage", "1"]);
+    assert!(!ok, "should fail when multi-sample VCF has no --sample");
+    assert!(
+        stderr.contains("3 samples") && stderr.contains("--sample"),
+        "error should mention sample count and --sample flag, got: {stderr}"
+    );
+    assert!(
+        stderr.contains("SampleA") && stderr.contains("SampleB") && stderr.contains("SampleC"),
+        "error should list available samples, got: {stderr}"
+    );
+}
+
+#[test]
+fn test_single_sample_vcf_without_sample_flag_works() {
+    let env = simple_env();
+    let out = env.output_prefix();
+    let out_str = out.to_str().unwrap();
+    let ref_str = env.fasta_path.to_str().unwrap();
+
+    let vcf_path = env.write_vcf_header_only(&["OnlySample"], &[("chr1", 1000)]);
+    let vcf_str = vcf_path.to_str().unwrap();
+
+    let (ok, _stdout, stderr) =
+        run_simulate(&["simulate", "-r", ref_str, "-v", vcf_str, "-o", out_str, "--coverage", "1"]);
+    assert!(ok, "single-sample VCF without --sample should succeed: {stderr}");
+}
+
+#[test]
+fn test_multi_sample_vcf_with_correct_sample_works() {
+    let env = simple_env();
+    let out = env.output_prefix();
+    let out_str = out.to_str().unwrap();
+    let ref_str = env.fasta_path.to_str().unwrap();
+
+    let vcf_path = env.write_vcf_header_only(&["SampleA", "SampleB"], &[("chr1", 1000)]);
+    let vcf_str = vcf_path.to_str().unwrap();
+
+    let (ok, _stdout, stderr) = run_simulate(&[
+        "simulate",
+        "-r",
+        ref_str,
+        "-v",
+        vcf_str,
+        "--sample",
+        "SampleB",
+        "-o",
+        out_str,
+        "--coverage",
+        "1",
+    ]);
+    assert!(ok, "multi-sample VCF with correct --sample should succeed: {stderr}");
+}
+
+#[test]
+fn test_output_directory_does_not_exist_fails() {
+    let env = simple_env();
+    let ref_str = env.fasta_path.to_str().unwrap();
+
+    let bad_out = env.dir.path().join("no_such_dir").join("output");
+    let out_str = bad_out.to_str().unwrap();
+
+    let (ok, _stdout, stderr) =
+        run_simulate(&["simulate", "-r", ref_str, "-o", out_str, "--coverage", "1"]);
+    assert!(!ok, "should fail when output directory doesn't exist");
+    assert!(
+        stderr.contains("Output directory does not exist"),
+        "error should mention missing output directory, got: {stderr}"
+    );
+}

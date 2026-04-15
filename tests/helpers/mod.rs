@@ -145,6 +145,37 @@ impl TestEnv {
         path
     }
 
+    /// Write a VCF file with the given sample names and contig definitions but
+    /// no variant records.
+    ///
+    /// Useful for testing sample-level validation logic without needing actual
+    /// variants.  Uses raw VCF text to support arbitrary sample configurations
+    /// (single-sample, multi-sample, zero-sample).
+    ///
+    /// # Panics
+    /// Panics on I/O errors.
+    #[must_use]
+    pub fn write_vcf_header_only(
+        &self,
+        sample_names: &[&str],
+        contig_lengths: &[(&str, usize)],
+    ) -> PathBuf {
+        let path = self.dir.path().join("samples.vcf");
+        let mut f = std::fs::File::create(&path).unwrap();
+        writeln!(f, "##fileformat=VCFv4.3").unwrap();
+        for &(name, len) in contig_lengths {
+            writeln!(f, "##contig=<ID={name},length={len}>").unwrap();
+        }
+        writeln!(f, "##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\">").unwrap();
+        write!(f, "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT").unwrap();
+        for name in sample_names {
+            write!(f, "\t{name}").unwrap();
+        }
+        writeln!(f).unwrap();
+        f.flush().unwrap();
+        path
+    }
+
     /// Write a BED file with the given intervals and return the path.
     ///
     /// Each entry is `(contig, start, end)` in 0-based half-open coordinates.
