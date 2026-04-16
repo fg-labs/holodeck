@@ -17,10 +17,15 @@ use crate::fasta::Fasta;
 use crate::fragment::extract_fragment;
 use crate::haplotype::build_haplotypes;
 use crate::output::fastq::FastqWriter;
-use crate::output::golden_bam::GoldenBamWriter;
+use crate::output::golden_bam::{GoldenBamMetadata, GoldenBamWriter};
 use crate::read::generate_read_pair;
 use crate::seed::resolve_seed;
 use crate::sequence_dict::SequenceDictionary;
+use crate::version::VERSION;
+
+/// Default sample name used in the golden BAM `@RG SM` field when the
+/// simulation is not driven by a VCF sample.
+const DEFAULT_SAMPLE_NAME: &str = "holodeck-simulation";
 
 /// Default Illumina TruSeq adapter sequence for read 1.
 const DEFAULT_ADAPTER_R1: &str = "AGATCGGAAGAGCACACGTCTGAACTCCAGTCA";
@@ -231,12 +236,13 @@ impl Simulate {
         let mut golden_bam_writer = if self.golden_bam {
             let bam_path = output_path(&self.output.output, ".golden.bam");
             log::info!("Writing golden BAM to: {}", bam_path.display());
+            let meta = self.golden_bam_metadata()?;
             if let Some(pb) = &mut pool_builder {
                 let file = File::create(&bam_path)?;
                 let pooled = pb.exchange(BufWriter::new(file));
-                Some(GoldenBamWriter::from_writer(Box::new(pooled), &dict)?)
+                Some(GoldenBamWriter::from_writer(Box::new(pooled), &dict, &meta)?)
             } else {
-                Some(GoldenBamWriter::new(&bam_path, &dict, compression)?)
+                Some(GoldenBamWriter::new(&bam_path, &dict, compression, &meta)?)
             }
         } else {
             None
@@ -305,6 +311,21 @@ impl Simulate {
         } else {
             FastqWriter::new(&path, self.compression)
         }
+    }
+
+    /// Build the `@PG`/`@RG` metadata for the golden BAM header.  The
+    /// command line is captured verbatim from `std::env::args`.  The sample
+    /// name is the resolved VCF sample when `--vcf` is given (either the
+    /// value of `--sample`, or the sole sample in a single-sample VCF), and
+    /// [`DEFAULT_SAMPLE_NAME`] otherwise.
+    fn golden_bam_metadata(&self) -> Result<GoldenBamMetadata> {
+        let command_line = std::env::args().collect::<Vec<_>>().join(" ");
+        let sample = if let Some(vcf_path) = &self.vcf.vcf {
+            crate::vcf::validate_vcf_sample(vcf_path, self.vcf.sample.as_deref())?
+        } else {
+            DEFAULT_SAMPLE_NAME.to_string()
+        };
+        Ok(GoldenBamMetadata { command_line, version: VERSION.clone(), sample })
     }
 
     /// Compute the deterministic seed from simulation parameters.
