@@ -404,6 +404,11 @@ fn test_simulate_reads_overlap_targets() {
 
 #[test]
 fn test_simulate_golden_bam() {
+    use noodles::sam::alignment::record::data::field::Tag as DataTag;
+    use noodles::sam::alignment::record::data::field::Value as DataValueRef;
+    use noodles::sam::header::record::value::map::program::tag as pg_tag;
+    use noodles::sam::header::record::value::map::read_group::tag as rg_tag;
+
     let env = simple_env();
     let out = env.output_prefix();
 
@@ -441,15 +446,106 @@ fn test_simulate_golden_bam() {
     let (name, _) = header.reference_sequences().get_index(0).unwrap();
     assert_eq!(name.as_ref() as &[u8], b"chr1");
 
-    // Count records: should be 2x the read pairs (R1 + R2).
-    let record_count = reader.records().count();
-    assert!(record_count > 0, "Golden BAM should have records");
+    // Exactly one @PG line, ID=holodeck, PN=holodeck, CL echoes the argv.
+    assert_eq!(header.programs().as_ref().len(), 1);
+    let (pg_id, pg) = header.programs().as_ref().iter().next().unwrap();
+    assert_eq!(pg_id.as_ref() as &[u8], b"holodeck");
+    let pg_name = pg.other_fields().get(&pg_tag::NAME).expect("@PG missing PN");
+    assert_eq!(pg_name.as_ref() as &[u8], b"holodeck");
+    let pg_cl = pg.other_fields().get(&pg_tag::COMMAND_LINE).expect("@PG missing CL");
+    let pg_cl_str = std::str::from_utf8(pg_cl).unwrap();
+    assert!(pg_cl_str.contains("--golden-bam"), "@PG CL should echo argv, got: {pg_cl_str}");
+    let pg_vn = pg.other_fields().get(&pg_tag::VERSION).expect("@PG missing VN");
+    assert!(!pg_vn.is_empty(), "@PG VN should be non-empty");
+
+    // Exactly one @RG: ID=A, SM=LB=holodeck-simulation, PL=ILLUMINA.
+    assert_eq!(header.read_groups().len(), 1);
+    let (rg_id, rg) = header.read_groups().iter().next().unwrap();
+    assert_eq!(rg_id.as_ref() as &[u8], b"A");
+    let rg_sm = rg.other_fields().get(&rg_tag::SAMPLE).expect("@RG missing SM");
+    assert_eq!(rg_sm.as_ref() as &[u8], b"holodeck-simulation");
+    let rg_lb = rg.other_fields().get(&rg_tag::LIBRARY).expect("@RG missing LB");
+    assert_eq!(rg_lb.as_ref() as &[u8], b"holodeck-simulation");
+    let rg_pl = rg.other_fields().get(&rg_tag::PLATFORM).expect("@RG missing PL");
+    assert_eq!(rg_pl.as_ref() as &[u8], b"ILLUMINA");
+
+    // Every record carries the RG:Z:A tag.
+    let records: Vec<_> = reader.records().map(Result::unwrap).collect();
+    assert!(!records.is_empty(), "Golden BAM should have records");
+    for rec in &records {
+        let rg_field = rec
+            .data()
+            .get(&DataTag::READ_GROUP)
+            .expect("record missing RG tag")
+            .expect("failed to decode RG");
+        match rg_field {
+            DataValueRef::String(s) => assert_eq!(s as &[u8], b"A"),
+            other => panic!("RG tag should be a Z-string, got {other:?}"),
+        }
+    }
 
     // FASTQ read count should be half the BAM record count (PE).
     let r1_path = std::path::PathBuf::from(format!("{}.r1.fastq.gz", out.display()));
     let r1_contents = read_gzipped(&r1_path);
     let fastq_records = count_fastq_records(&r1_contents);
-    assert_eq!(record_count, fastq_records * 2, "Golden BAM should have 2 records per read pair");
+    assert_eq!(records.len(), fastq_records * 2, "Golden BAM should have 2 records per read pair");
+}
+
+#[test]
+fn test_golden_bam_read_group_uses_vcf_sample_name() {
+    use noodles::sam::header::record::value::map::read_group::tag as rg_tag;
+
+    // When a VCF drives the simulation, the @RG SM field should match the
+    // resolved VCF sample name (either explicit via --sample or auto-resolved
+    // when the VCF has a single sample).
+    let contig_len = 2_000usize;
+    let seq = non_repetitive_seq(contig_len);
+    let env = TestEnv::new(&[("chr1", &seq)]);
+
+    let vcf_path = env.write_vcf(
+        "NA12878",
+        &[("chr1", contig_len)],
+        &[VcfVariant {
+            chrom: "chr1",
+            pos_1based: 500,
+            ref_allele: "A",
+            alt_alleles: &["T"],
+            gt: "0|1",
+        }],
+    );
+    let out = env.output_prefix();
+
+    let (ok, _, stderr) = run_simulate(&[
+        "simulate",
+        "-r",
+        env.fasta_path.to_str().unwrap(),
+        "-v",
+        vcf_path.to_str().unwrap(),
+        "-o",
+        out.to_str().unwrap(),
+        "--coverage",
+        "5",
+        "--read-length",
+        "50",
+        "--fragment-mean",
+        "100",
+        "--fragment-stddev",
+        "20",
+        "--golden-bam",
+        "--seed",
+        "42",
+    ]);
+    assert!(ok, "simulate failed: {stderr}");
+
+    let bam_path = std::path::PathBuf::from(format!("{}.golden.bam", out.display()));
+    let mut reader = noodles::bam::io::reader::Builder.build_from_path(&bam_path).unwrap();
+    let header = reader.read_header().unwrap();
+
+    let (_id, rg) = header.read_groups().iter().next().unwrap();
+    let sm = rg.other_fields().get(&rg_tag::SAMPLE).expect("@RG missing SM");
+    assert_eq!(sm.as_ref() as &[u8], b"NA12878");
+    let lb = rg.other_fields().get(&rg_tag::LIBRARY).expect("@RG missing LB");
+    assert_eq!(lb.as_ref() as &[u8], b"NA12878");
 }
 
 /// Verify that actual per-base coverage over targets of varying sizes matches

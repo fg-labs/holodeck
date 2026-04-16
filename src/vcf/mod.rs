@@ -89,7 +89,8 @@ pub fn load_variants_for_contig(
     Ok(variants)
 }
 
-/// Validate that a VCF file has the expected sample configuration.
+/// Validate that a VCF file has the expected sample configuration and
+/// return the resolved sample name.
 ///
 /// Opens the VCF, reads the header, and checks:
 /// - If `sample_name` is `Some`, that the named sample exists.
@@ -101,13 +102,17 @@ pub fn load_variants_for_contig(
 /// # Errors
 /// Returns an error if the VCF cannot be read or the sample configuration
 /// is invalid.
-pub(crate) fn validate_vcf_sample(path: &Path, sample_name: Option<&str>) -> Result<()> {
+pub(crate) fn validate_vcf_sample(path: &Path, sample_name: Option<&str>) -> Result<String> {
     let mut reader = vcf::io::reader::Builder::default()
         .build_from_path(path)
         .with_context(|| format!("Failed to open VCF: {}", path.display()))?;
     let header = reader.read_header()?;
-    resolve_sample_index(&header, sample_name)?;
-    Ok(())
+    let idx = resolve_sample_index(&header, sample_name)?;
+    Ok(header
+        .sample_names()
+        .get_index(idx)
+        .expect("resolve_sample_index returned a valid index")
+        .clone())
 }
 
 /// Resolve the sample index from a VCF header.

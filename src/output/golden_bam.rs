@@ -16,13 +16,40 @@ use noodles::sam;
 use noodles::sam::alignment::RecordBuf;
 use noodles::sam::alignment::io::Write as AlignmentWrite;
 use noodles::sam::alignment::record::Flags;
+use noodles::sam::alignment::record::data::field::Tag as DataTag;
 use noodles::sam::alignment::record_buf::data::field::Value as DataValue;
 use noodles::sam::alignment::record_buf::{Cigar, QualityScores, Sequence};
-use noodles::sam::header::record::value::{Map, map::ReferenceSequence};
+use noodles::sam::header::record::value::Map;
+use noodles::sam::header::record::value::map::program::tag as pg_tag;
+use noodles::sam::header::record::value::map::read_group::tag as rg_tag;
+use noodles::sam::header::record::value::map::{Program, ReadGroup, ReferenceSequence};
 
 use crate::read::ReadPair;
 use crate::read_naming::TruthAlignment;
 use crate::sequence_dict::SequenceDictionary;
+
+/// Program ID used for the `@PG` header entry and the program name (`PN`).
+const PROGRAM_ID: &str = "holodeck";
+
+/// Sequencing platform string used for the `@RG` `PL` field.  Holodeck
+/// currently only models an Illumina-style error profile.
+const PLATFORM: &str = "ILLUMINA";
+
+/// Read group identifier used for the single `@RG` entry and as the value of
+/// the per-record `RG:Z` tag.
+pub const READ_GROUP_ID: &str = "A";
+
+/// Metadata used to populate the `@PG` and `@RG` header entries of a golden
+/// BAM file.
+#[derive(Debug, Clone)]
+pub struct GoldenBamMetadata {
+    /// Verbatim command-line invocation, written to the `@PG CL` field.
+    pub command_line: String,
+    /// Holodeck version string, written to the `@PG VN` field.
+    pub version: String,
+    /// Sample name, used for the `@RG SM` and `@RG LB` fields.
+    pub sample: String,
+}
 
 /// A writer for golden (ground-truth) BAM files.
 ///
@@ -43,9 +70,14 @@ impl GoldenBamWriter {
     /// Uses noodles-bgzf with the specified compression level (0-12).
     ///
     /// # Errors
-    /// Returns an error if the file cannot be created or the header cannot
-    /// be written.
-    pub fn new(path: &Path, dict: &SequenceDictionary, compression: u8) -> Result<Self> {
+    /// Returns an error if the file cannot be created, the header cannot be
+    /// built, or the header cannot be written.
+    pub fn new(
+        path: &Path,
+        dict: &SequenceDictionary,
+        compression: u8,
+        meta: &GoldenBamMetadata,
+    ) -> Result<Self> {
         let file = File::create(path)
             .with_context(|| format!("Failed to create golden BAM: {}", path.display()))?;
         let level = noodles_bgzf::io::writer::CompressionLevel::new(compression)
@@ -53,17 +85,21 @@ impl GoldenBamWriter {
         let bgzf_writer = noodles_bgzf::io::writer::Builder::default()
             .set_compression_level(level)
             .build_from_writer(BufWriter::new(file));
-        Self::from_writer(Box::new(bgzf_writer), dict)
+        Self::from_writer(Box::new(bgzf_writer), dict, meta)
     }
 
     /// Create a golden BAM writer from an existing writer that handles BGZF
     /// compression (e.g. a [`pooled_writer::PooledWriter`]).
     ///
     /// # Errors
-    /// Returns an error if the header cannot be written.
-    pub fn from_writer(writer: Box<dyn Write>, dict: &SequenceDictionary) -> Result<Self> {
+    /// Returns an error if the header cannot be built or written.
+    pub fn from_writer(
+        writer: Box<dyn Write>,
+        dict: &SequenceDictionary,
+        meta: &GoldenBamMetadata,
+    ) -> Result<Self> {
         let mut writer = bam::io::Writer::from(writer);
-        let header = build_header(dict);
+        let header = build_header(dict, meta)?;
         writer.write_header(&header)?;
         Ok(Self { writer, header })
     }
@@ -139,16 +175,36 @@ impl GoldenBamWriter {
     }
 }
 
-/// Build a SAM header from a sequence dictionary.
-fn build_header(dict: &SequenceDictionary) -> sam::Header {
+/// Build a SAM header from a sequence dictionary plus program/read-group
+/// metadata.  Emits one `@SQ` line per contig, a single `@PG` entry describing
+/// the holodeck invocation, and a single `@RG` entry tying every record in
+/// the file to the simulated sample.
+fn build_header(dict: &SequenceDictionary, meta: &GoldenBamMetadata) -> Result<sam::Header> {
     let mut builder = sam::Header::builder();
-    for meta in dict.iter() {
+    for contig_meta in dict.iter() {
         let ref_seq = Map::<ReferenceSequence>::new(
-            NonZeroUsize::new(meta.length()).expect("contig len > 0"),
+            NonZeroUsize::new(contig_meta.length()).expect("contig len > 0"),
         );
-        builder = builder.add_reference_sequence(meta.name().as_bytes(), ref_seq);
+        builder = builder.add_reference_sequence(contig_meta.name().as_bytes(), ref_seq);
     }
-    builder.build()
+
+    let program = Map::<Program>::builder()
+        .insert(pg_tag::NAME, PROGRAM_ID)
+        .insert(pg_tag::VERSION, meta.version.as_str())
+        .insert(pg_tag::COMMAND_LINE, meta.command_line.as_str())
+        .build()
+        .map_err(|e| anyhow::anyhow!("failed to build @PG entry: {e}"))?;
+    builder = builder.add_program(PROGRAM_ID, program);
+
+    let read_group = Map::<ReadGroup>::builder()
+        .insert(rg_tag::SAMPLE, meta.sample.as_str())
+        .insert(rg_tag::LIBRARY, meta.sample.as_str())
+        .insert(rg_tag::PLATFORM, PLATFORM)
+        .build()
+        .map_err(|e| anyhow::anyhow!("failed to build @RG entry: {e}"))?;
+    builder = builder.add_read_group(READ_GROUP_ID, read_group);
+
+    Ok(builder.build())
 }
 
 /// Build a single BAM `RecordBuf` from truth alignment data and a
@@ -210,16 +266,18 @@ fn build_record(
         builder = builder.set_mate_alignment_start(pos);
     }
 
-    // Add custom tags: hp (haplotype index), ne (number of errors).
+    // Add standard RG tag plus custom tags: hp (haplotype index), ne
+    // (number of errors).
     let mut data = sam::alignment::record_buf::Data::default();
+    data.insert(DataTag::READ_GROUP, DataValue::from(READ_GROUP_ID));
     #[expect(clippy::cast_possible_truncation, reason = "haplotype index is small")]
     #[expect(clippy::cast_possible_wrap, reason = "haplotype index is small")]
     let hp_val = truth.haplotype as i32;
-    data.insert(sam::alignment::record::data::field::Tag::new(b'h', b'p'), DataValue::from(hp_val));
+    data.insert(DataTag::new(b'h', b'p'), DataValue::from(hp_val));
     #[expect(clippy::cast_possible_truncation, reason = "error count is small")]
     #[expect(clippy::cast_possible_wrap, reason = "error count is small")]
     let ne_val = truth.n_errors as i32;
-    data.insert(sam::alignment::record::data::field::Tag::new(b'n', b'e'), DataValue::from(ne_val));
+    data.insert(DataTag::new(b'n', b'e'), DataValue::from(ne_val));
     builder = builder.set_data(data);
 
     builder.build()

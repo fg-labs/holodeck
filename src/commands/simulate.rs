@@ -17,10 +17,15 @@ use crate::fasta::Fasta;
 use crate::fragment::extract_fragment;
 use crate::haplotype::build_haplotypes;
 use crate::output::fastq::FastqWriter;
-use crate::output::golden_bam::GoldenBamWriter;
+use crate::output::golden_bam::{GoldenBamMetadata, GoldenBamWriter};
 use crate::read::generate_read_pair;
 use crate::seed::resolve_seed;
 use crate::sequence_dict::SequenceDictionary;
+use crate::version::VERSION;
+
+/// Default sample name used in the golden BAM `@RG SM` field when the
+/// simulation is not driven by a VCF sample.
+const DEFAULT_SAMPLE_NAME: &str = "holodeck-simulation";
 
 /// Default Illumina TruSeq adapter sequence for read 1.
 const DEFAULT_ADAPTER_R1: &str = "AGATCGGAAGAGCACACGTCTGAACTCCAGTCA";
@@ -126,14 +131,16 @@ pub struct Simulate {
 
 impl Command for Simulate {
     fn execute(&self) -> Result<()> {
-        self.validate()?;
-        self.run_simulation()
+        let resolved_sample = self.validate()?;
+        self.run_simulation(resolved_sample.as_deref())
     }
 }
 
 impl Simulate {
-    /// Validate command-line arguments before running.
-    fn validate(&self) -> Result<()> {
+    /// Validate command-line arguments before running and return the
+    /// resolved VCF sample name (if a VCF was provided).  Resolving the
+    /// sample here means the VCF header is read only once per run.
+    fn validate(&self) -> Result<Option<String>> {
         if !self.coverage.is_finite() || self.coverage <= 0.0 {
             bail!("--coverage must be a finite positive number");
         }
@@ -159,10 +166,14 @@ impl Simulate {
         }
 
         // Validate VCF sample configuration upfront so the user gets a clear
-        // error before the simulation loop starts.
-        if let Some(vcf_path) = &self.vcf.vcf {
-            crate::vcf::validate_vcf_sample(vcf_path, self.vcf.sample.as_deref())?;
-        }
+        // error before the simulation loop starts, and capture the resolved
+        // sample name for use in downstream metadata (e.g. the golden BAM
+        // `@RG` line).
+        let resolved_sample = if let Some(vcf_path) = &self.vcf.vcf {
+            Some(crate::vcf::validate_vcf_sample(vcf_path, self.vcf.sample.as_deref())?)
+        } else {
+            None
+        };
 
         // Validate output parent directory exists.
         if let Some(parent) = self.output.output.parent()
@@ -172,11 +183,14 @@ impl Simulate {
             bail!("Output directory does not exist: {}", parent.display());
         }
 
-        Ok(())
+        Ok(resolved_sample)
     }
 
     /// Run the main simulation pipeline.
-    fn run_simulation(&self) -> Result<()> {
+    ///
+    /// `resolved_vcf_sample` is the sample name resolved from the VCF during
+    /// validation (if any), used for the golden BAM `@RG SM` field.
+    fn run_simulation(&self, resolved_vcf_sample: Option<&str>) -> Result<()> {
         let seed = self.compute_seed();
         let mut rng = SmallRng::seed_from_u64(seed);
         log::info!("Using random seed: {seed}");
@@ -231,12 +245,13 @@ impl Simulate {
         let mut golden_bam_writer = if self.golden_bam {
             let bam_path = output_path(&self.output.output, ".golden.bam");
             log::info!("Writing golden BAM to: {}", bam_path.display());
+            let meta = Self::golden_bam_metadata(resolved_vcf_sample);
             if let Some(pb) = &mut pool_builder {
                 let file = File::create(&bam_path)?;
                 let pooled = pb.exchange(BufWriter::new(file));
-                Some(GoldenBamWriter::from_writer(Box::new(pooled), &dict)?)
+                Some(GoldenBamWriter::from_writer(Box::new(pooled), &dict, &meta)?)
             } else {
-                Some(GoldenBamWriter::new(&bam_path, &dict, compression)?)
+                Some(GoldenBamWriter::new(&bam_path, &dict, compression, &meta)?)
             }
         } else {
             None
@@ -305,6 +320,22 @@ impl Simulate {
         } else {
             FastqWriter::new(&path, self.compression)
         }
+    }
+
+    /// Build the `@PG`/`@RG` metadata for the golden BAM header.  The
+    /// command line is captured verbatim from `std::env::args_os`, using
+    /// lossy UTF-8 conversion so that non-Unicode arguments do not panic.
+    /// `resolved_vcf_sample` should be the sample name returned by
+    /// [`crate::vcf::validate_vcf_sample`] during validation; when absent,
+    /// the sample defaults to [`DEFAULT_SAMPLE_NAME`].
+    fn golden_bam_metadata(resolved_vcf_sample: Option<&str>) -> GoldenBamMetadata {
+        let command_line = std::env::args_os()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>()
+            .join(" ");
+        let sample =
+            resolved_vcf_sample.map_or_else(|| DEFAULT_SAMPLE_NAME.to_string(), str::to_string);
+        GoldenBamMetadata { command_line, version: VERSION.clone(), sample }
     }
 
     /// Compute the deterministic seed from simulation parameters.
