@@ -1,4 +1,7 @@
 [![Build](https://github.com/fg-labs/holodeck/actions/workflows/check.yml/badge.svg)](https://github.com/fg-labs/holodeck/actions/workflows/check.yml)
+[![Version at crates.io](https://img.shields.io/crates/v/holodeck)](https://crates.io/crates/holodeck)
+[![Documentation at docs.rs](https://img.shields.io/docsrs/holodeck)](https://docs.rs/holodeck)
+[![Bioconda](https://img.shields.io/conda/vn/bioconda/holodeck.svg?label=bioconda)](https://bioconda.github.io/recipes/holodeck/README.html)
 [![License](http://img.shields.io/badge/license-MIT-blue.svg)](https://github.com/fg-labs/holodeck/blob/main/LICENSE)
 
 # Holodeck
