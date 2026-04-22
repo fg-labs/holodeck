@@ -174,18 +174,20 @@ Read names encode ground-truth alignment information for use by `holodeck eval` 
 
 **Encoded format** (default):
 ```
-PE: @holodeck:READ_NUM:CONTIG:POS1+STRAND:POS2+STRAND:HAP:ERRS1:ERRS2
-SE: @holodeck:READ_NUM:CONTIG:POS+STRAND:HAP:ERRS
+PE: @holodeck:READ_NUM:FRAG_LEN:CONTIG:POS1+STRAND:POS2+STRAND:HAP:ERRS1:ERRS2
+SE: @holodeck:READ_NUM:FRAG_LEN:CONTIG:POS+STRAND:HAP:ERRS
 ```
 
 Example:
 ```
-@holodeck:42:chr1:10000F:10450R:0:2:1
+@holodeck:42:600:chr1:10000F:10450R:0:2:1
 ```
 
-Fields: read number, contig, R1 position (1-based) + strand (F/R), R2 position + strand, haplotype index, R1 errors, R2 errors.
+Fields: read number, source fragment length (bp), contig, R1 position (1-based) + strand (F/R), R2 position + strand, haplotype index, R1 errors, R2 errors.
 
-Contig names may contain colons (e.g. HLA alleles); the parser handles this via right-to-left splitting.
+`FRAG_LEN` is the length of the originating template. When it is smaller than the read length, the remainder of each read (`read_length - FRAG_LEN` bases) is adapter sequence (possibly padded with `N` if the configured adapter is shorter than that remainder). This lets consumers locate the adapter boundary in both PE and SE reads without the golden BAM.
+
+Contig names may contain colons (e.g. HLA alleles); the parser handles this via right-to-left splitting. `FRAG_LEN` is placed immediately after `READ_NUM` so it sits in a fixed position relative to the `holodeck:` prefix, independent of the contig name.
 
 **Simple format** (`--simple-names`):
 ```

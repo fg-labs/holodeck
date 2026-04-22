@@ -118,9 +118,18 @@ pub fn generate_read_pair(
         n_errors: r1_errors,
     };
 
+    // Fragment length in the *read's* frame: before any adapter/N padding.
+    // For short fragments this is < read_length and tells consumers exactly
+    // where the adapter starts in the emitted read (adapter_start = frag_len).
+    #[expect(clippy::cast_possible_truncation, reason = "fragment length fits in u32")]
+    let fragment_length = frag_len as u32;
+
     if !paired {
-        let name =
-            if simple_names { simple_name(read_num) } else { encoded_se_name(read_num, &r1_truth) };
+        let name = if simple_names {
+            simple_name(read_num)
+        } else {
+            encoded_se_name(read_num, fragment_length, &r1_truth)
+        };
 
         return ReadPair {
             read1: SimulatedRead { name, bases: r1_bases, qualities: r1_quals },
@@ -168,7 +177,7 @@ pub fn generate_read_pair(
     let name = if simple_names {
         simple_name(read_num)
     } else {
-        encoded_pe_name(read_num, &r1_truth, &r2_truth)
+        encoded_pe_name(read_num, fragment_length, &r1_truth, &r2_truth)
     };
 
     ReadPair {

@@ -89,8 +89,8 @@ impl Command for Eval {
 
             // Parse truth from encoded read name.
             let truth = parse_encoded_pe_name(name)
-                .map(|(_, r1, _)| r1)
-                .or_else(|| parse_encoded_se_name(name).map(|(_, r1)| r1));
+                .map(|(_, _, r1, _)| r1)
+                .or_else(|| parse_encoded_se_name(name).map(|(_, _, r1)| r1));
 
             let Some(truth) = truth else {
                 parse_failures += 1;
