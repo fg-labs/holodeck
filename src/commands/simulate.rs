@@ -113,7 +113,7 @@ pub struct Simulate {
     #[arg(long)]
     pub golden_vcf: bool,
 
-    /// Use simple read names (`holodeck:N`) instead of encoding truth
+    /// Use simple read names (`holodeck::N`) instead of encoding truth
     /// coordinates in the read name.
     #[arg(long)]
     pub simple_names: bool,

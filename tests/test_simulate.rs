@@ -133,13 +133,15 @@ fn test_simulate_basic_pe() {
     // Verify encoded read names.
     let first_name = r1_contents.lines().next().unwrap();
     assert!(
-        first_name.starts_with("@holodeck:"),
-        "Read name should start with @holodeck: got {first_name}"
+        first_name.starts_with("@holodeck::"),
+        "Read name should start with @holodeck:: got {first_name}"
     );
 }
 
 #[test]
 fn test_simulate_single_end() {
+    use holodeck_lib::read_naming::parse_encoded_se_name;
+
     let env = simple_env();
     let out = env.output_prefix();
 
@@ -172,10 +174,92 @@ fn test_simulate_single_end() {
     let r1_records = count_fastq_records(&r1_contents);
     assert!(r1_records > 0, "Should have generated some SE reads");
 
-    // SE read names should have 6 colon-separated fields.
+    // SE encoded read names must round-trip through the parser, including
+    // when contig names contain single `:` characters.
     let first_name = r1_contents.lines().next().unwrap().trim_start_matches('@');
-    let fields = first_name.split(':').count();
-    assert!(fields >= 6, "SE encoded name should have at least 6 fields, got {fields}");
+    let (_read_num, truth) = parse_encoded_se_name(first_name)
+        .unwrap_or_else(|| panic!("SE encoded name should parse: {first_name}"));
+    assert!(!truth.contig.is_empty(), "contig should be non-empty: {first_name}");
+    assert!(truth.fragment_length > 0, "fragment_length should be positive: {first_name}");
+}
+
+/// Verify the encoded `FRAG_LEN` field accurately marks the adapter boundary
+/// in both R1 and R2 when the template is shorter than the read length.
+#[test]
+fn test_fragment_length_identifies_adapter_boundary() {
+    use holodeck_lib::read_naming::parse_encoded_pe_name;
+
+    // Default TruSeq adapters (first few bases are distinctive).
+    let adapter_r1_prefix = b"AGATCGG";
+    let adapter_r2_prefix = b"AGATCGG";
+
+    // Force many short fragments: mean 40, read length 150 -> most reads will
+    // have ≥100 adapter bases. Zero errors so the adapter bytes are intact.
+    let seq = non_repetitive_seq(20_000);
+    let env = TestEnv::new(&[("chr1", &seq)]);
+    let out = env.output_prefix();
+
+    let (ok, _, stderr) = run_simulate(&[
+        "simulate",
+        "-r",
+        env.fasta_path.to_str().unwrap(),
+        "-o",
+        out.to_str().unwrap(),
+        "--coverage",
+        "20",
+        "--read-length",
+        "150",
+        "--fragment-mean",
+        "40",
+        "--fragment-stddev",
+        "10",
+        "--min-error-rate",
+        "0",
+        "--max-error-rate",
+        "0",
+        "--seed",
+        "11",
+    ]);
+    assert!(ok, "simulate failed: {stderr}");
+
+    let check = |fastq_path: &std::path::Path, adapter_prefix: &[u8], label: &str| {
+        let contents = read_gzipped(fastq_path);
+        let mut lines = contents.lines();
+        let mut short_reads_checked = 0usize;
+        while let (Some(name_line), Some(seq_line), Some(_plus), Some(_qual)) =
+            (lines.next(), lines.next(), lines.next(), lines.next())
+        {
+            let name = name_line.trim_start_matches('@');
+            let Some((_num, r1, _r2)) = parse_encoded_pe_name(name) else { continue };
+            let frag_len = r1.fragment_length as usize;
+            let bases = seq_line.as_bytes();
+            assert_eq!(bases.len(), 150, "read length mismatch in {label}");
+            if frag_len < bases.len() {
+                let prefix_take = adapter_prefix.len().min(bases.len() - frag_len);
+                assert_eq!(
+                    &bases[frag_len..frag_len + prefix_take],
+                    &adapter_prefix[..prefix_take],
+                    "{label}: bases starting at FRAG_LEN={frag_len} should match the adapter; got read={name}",
+                );
+                short_reads_checked += 1;
+            }
+        }
+        assert!(
+            short_reads_checked > 0,
+            "{label}: expected some reads with FRAG_LEN < read_length"
+        );
+    };
+
+    check(
+        &std::path::PathBuf::from(format!("{}.r1.fastq.gz", out.display())),
+        adapter_r1_prefix,
+        "R1",
+    );
+    check(
+        &std::path::PathBuf::from(format!("{}.r2.fastq.gz", out.display())),
+        adapter_r2_prefix,
+        "R2",
+    );
 }
 
 #[test]
@@ -205,7 +289,7 @@ fn test_simulate_simple_names() {
     let r1_path = std::path::PathBuf::from(format!("{}.r1.fastq.gz", out.display()));
     let r1_contents = read_gzipped(&r1_path);
     let first_name = r1_contents.lines().next().unwrap();
-    assert_eq!(first_name, "@holodeck:1", "Simple name should be holodeck:N");
+    assert_eq!(first_name, "@holodeck::1", "Simple name should be holodeck::N");
 }
 
 #[test]
@@ -387,10 +471,10 @@ fn test_simulate_reads_overlap_targets() {
             continue;
         };
 
-        // R1 and R2 truth positions are 1-based.  The fragment spans from the
-        // smaller position to the larger position + read_length (approximately).
+        // Truth positions are 1-based. The leftmost of R1/R2 is the fragment
+        // start; fragment_length gives the span on the reference.
         let frag_start_0 = r1.position.min(r2.position) - 1;
-        let frag_end_0 = r1.position.max(r2.position) - 1 + read_length;
+        let frag_end_0 = frag_start_0 + r1.fragment_length;
 
         assert!(
             frag_end_0 > target_start && frag_start_0 < target_end,

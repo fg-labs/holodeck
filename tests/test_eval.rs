@@ -31,10 +31,6 @@ fn parse_eval_all_row(eval_path: &std::path::Path) -> (u64, u64, u64, u64) {
 /// Simulate single-end reads with a golden BAM, then run eval using the
 /// golden BAM as the mapped BAM.  Since positions are truth, eval should
 /// report 100% correct at MAPQ 60.
-///
-/// Uses single-end mode because the eval command always compares against R1's
-/// truth position; for PE golden BAMs, R2 records would be at R2's truth
-/// position but compared against R1's, causing false mismaps.
 #[test]
 fn test_eval_perfect_alignment() {
     let seq = non_repetitive_seq(2_000);
@@ -82,6 +78,60 @@ fn test_eval_perfect_alignment() {
     assert_eq!(mismapped, 0, "No reads should be mismapped with golden BAM");
     assert_eq!(unmapped, 0, "No reads should be unmapped with golden BAM");
     assert_eq!(correct, total, "All reads should be correct");
+}
+
+/// Paired-end variant of `test_eval_perfect_alignment`.
+///
+/// Regression test: previously eval compared every record against the R1
+/// truth position, so R2 records in a PE golden BAM were reported as
+/// mismapped even though the BAM was ground truth. Now eval picks the R1 or
+/// R2 truth based on the record's `is_last_segment` flag.
+#[test]
+fn test_eval_perfect_alignment_paired_end() {
+    let seq = non_repetitive_seq(4_000);
+    let env = TestEnv::new(&[("chr1", &seq)]);
+    let sim_out = env.output_prefix();
+
+    let (ok, _, stderr) = run_simulate(&[
+        "simulate",
+        "-r",
+        env.fasta_path.to_str().unwrap(),
+        "-o",
+        sim_out.to_str().unwrap(),
+        "--coverage",
+        "20",
+        "--read-length",
+        "50",
+        "--fragment-mean",
+        "150",
+        "--fragment-stddev",
+        "20",
+        "--golden-bam",
+        "--seed",
+        "42",
+    ]);
+    assert!(ok, "simulate failed: {stderr}");
+
+    let bam_path = PathBuf::from(format!("{}.golden.bam", sim_out.display()));
+    let eval_out = env.dir.path().join("eval");
+
+    let (ok, _, stderr) = run_eval(&[
+        "eval",
+        "--mapped",
+        bam_path.to_str().unwrap(),
+        "-o",
+        eval_out.to_str().unwrap(),
+    ]);
+    assert!(ok, "eval failed: {stderr}");
+
+    let eval_file = PathBuf::from(format!("{}.eval.txt", eval_out.display()));
+    let (total, correct, mismapped, unmapped) = parse_eval_all_row(&eval_file);
+    assert!(total > 0, "Should have evaluated some reads");
+    // The golden BAM contains both R1 and R2 records; every one must be scored
+    // against the matching truth, not just R1's.
+    assert_eq!(mismapped, 0, "No PE records should be mismapped against their own truth");
+    assert_eq!(unmapped, 0, "No reads should be unmapped in a golden BAM");
+    assert_eq!(correct, total, "All R1 and R2 records should be correct");
 }
 
 /// Create a BAM where all reads are unmapped.  Eval should report 100%

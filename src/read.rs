@@ -110,11 +110,18 @@ pub fn generate_read_pair(
         fragment.ref_positions[0] + 1
     };
 
+    // Fragment length in bases. When it is shorter than the read length,
+    // bases `[fragment_length..read_length)` of each emitted read are adapter
+    // (optionally N-padded).
+    #[expect(clippy::cast_possible_truncation, reason = "fragment length fits in u32")]
+    let fragment_length = frag_len as u32;
+
     let r1_truth = TruthAlignment {
         contig: contig_name.to_string(),
         position: r1_ref_pos,
         is_forward: fragment.is_forward,
         haplotype: fragment.haplotype_index,
+        fragment_length,
         n_errors: r1_errors,
     };
 
@@ -162,6 +169,7 @@ pub fn generate_read_pair(
         position: r2_ref_pos,
         is_forward: !fragment.is_forward,
         haplotype: fragment.haplotype_index,
+        fragment_length,
         n_errors: r2_errors,
     };
 
@@ -444,7 +452,7 @@ mod tests {
         let pair =
             generate_read_pair(&fragment, "chr1", 42, 4, true, b"A", b"A", &model, true, &mut rng);
 
-        assert_eq!(pair.read1.name, "holodeck:42");
+        assert_eq!(pair.read1.name, "holodeck::42");
     }
 
     #[test]
