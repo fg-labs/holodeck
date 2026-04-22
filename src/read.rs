@@ -110,26 +110,24 @@ pub fn generate_read_pair(
         fragment.ref_positions[0] + 1
     };
 
+    // Fragment length in bases. When it is shorter than the read length,
+    // bases `[fragment_length..read_length)` of each emitted read are adapter
+    // (optionally N-padded).
+    #[expect(clippy::cast_possible_truncation, reason = "fragment length fits in u32")]
+    let fragment_length = frag_len as u32;
+
     let r1_truth = TruthAlignment {
         contig: contig_name.to_string(),
         position: r1_ref_pos,
         is_forward: fragment.is_forward,
         haplotype: fragment.haplotype_index,
+        fragment_length,
         n_errors: r1_errors,
     };
 
-    // Fragment length in the *read's* frame: before any adapter/N padding.
-    // For short fragments this is < read_length and tells consumers exactly
-    // where the adapter starts in the emitted read (adapter_start = frag_len).
-    #[expect(clippy::cast_possible_truncation, reason = "fragment length fits in u32")]
-    let fragment_length = frag_len as u32;
-
     if !paired {
-        let name = if simple_names {
-            simple_name(read_num)
-        } else {
-            encoded_se_name(read_num, fragment_length, &r1_truth)
-        };
+        let name =
+            if simple_names { simple_name(read_num) } else { encoded_se_name(read_num, &r1_truth) };
 
         return ReadPair {
             read1: SimulatedRead { name, bases: r1_bases, qualities: r1_quals },
@@ -171,13 +169,14 @@ pub fn generate_read_pair(
         position: r2_ref_pos,
         is_forward: !fragment.is_forward,
         haplotype: fragment.haplotype_index,
+        fragment_length,
         n_errors: r2_errors,
     };
 
     let name = if simple_names {
         simple_name(read_num)
     } else {
-        encoded_pe_name(read_num, fragment_length, &r1_truth, &r2_truth)
+        encoded_pe_name(read_num, &r1_truth, &r2_truth)
     };
 
     ReadPair {
@@ -453,7 +452,7 @@ mod tests {
         let pair =
             generate_read_pair(&fragment, "chr1", 42, 4, true, b"A", b"A", &model, true, &mut rng);
 
-        assert_eq!(pair.read1.name, "holodeck:42");
+        assert_eq!(pair.read1.name, "holodeck::42");
     }
 
     #[test]

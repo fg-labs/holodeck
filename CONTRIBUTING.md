@@ -66,8 +66,8 @@ cargo test --lib -- module::tests::test_name
 
 ### Naming
 
-- Encoded read names support colons in contig names (parser uses `rsplitn`).
-- Contig names must not contain `@` characters (FASTQ header delimiter).
+- Encoded read names use `::` (double colon) as the field separator so contig names may legally contain single `:` characters (e.g. HLA alleles).
+- Contig names must not contain `@` (FASTQ header delimiter) or `::` (field separator); both are rejected by a debug assertion in the read-name formatter.
 
 ## Architecture
 

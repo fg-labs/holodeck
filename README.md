@@ -102,7 +102,7 @@ holodeck simulate -r ref.fa -o output --fragment-mean 400 --fragment-stddev 80 -
 | `--max-error-rate` | 0.01 | Error rate at end of reads |
 | `--golden-bam` | off | Write ground-truth BAM |
 | `--single-end` | off | Generate SE instead of PE reads |
-| `--simple-names` | off | Use `holodeck:N` names instead of encoded truth |
+| `--simple-names` | off | Use `holodeck::N` names instead of encoded truth |
 | `--compression` | 1 | BGZF compression level (0-12) |
 | `-t, --threads` | 4 | Threads for BGZF compression |
 | `--seed` | auto | Random seed (deterministic by default) |
@@ -173,25 +173,25 @@ holodeck eval --mapped aligned.bam -o eval_results --wiggle 10
 Read names encode ground-truth alignment information for use by `holodeck eval` and other tools.
 
 **Encoded format** (default):
-```
-PE: @holodeck:READ_NUM:FRAG_LEN:CONTIG:POS1+STRAND:POS2+STRAND:HAP:ERRS1:ERRS2
-SE: @holodeck:READ_NUM:FRAG_LEN:CONTIG:POS+STRAND:HAP:ERRS
+```text
+PE: @holodeck::READ_NUM::FRAG_LEN::CONTIG::POS1+STRAND::POS2+STRAND::HAP::ERRS1::ERRS2
+SE: @holodeck::READ_NUM::FRAG_LEN::CONTIG::POS+STRAND::HAP::ERRS
 ```
 
 Example:
-```
-@holodeck:42:600:chr1:10000F:10450R:0:2:1
+```text
+@holodeck::42::600::chr1::10000F::10450R::0::2::1
 ```
 
 Fields: read number, source fragment length (bp), contig, R1 position (1-based) + strand (F/R), R2 position + strand, haplotype index, R1 errors, R2 errors.
 
 `FRAG_LEN` is the length of the originating template. When it is smaller than the read length, the remainder of each read (`read_length - FRAG_LEN` bases) is adapter sequence (possibly padded with `N` if the configured adapter is shorter than that remainder). This lets consumers locate the adapter boundary in both PE and SE reads without the golden BAM.
 
-Contig names may contain colons (e.g. HLA alleles); the parser handles this via right-to-left splitting. `FRAG_LEN` is placed immediately after `READ_NUM` so it sits in a fixed position relative to the `holodeck:` prefix, independent of the contig name.
+Fields are separated by `::` (double colon) so contig names that legally contain single `:` characters (e.g. HLA alleles like `HLA-A*01:01:01:01`) parse unambiguously. Contig names must not contain `@` (the FASTQ header prefix) or `::`; both are rejected by a debug assertion in the read-name formatter.
 
 **Simple format** (`--simple-names`):
-```
-@holodeck:42
+```text
+@holodeck::42
 ```
 
 ## Performance

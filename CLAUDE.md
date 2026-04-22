@@ -64,5 +64,5 @@ Holodeck is a single-crate Rust project with a binary (`holodeck`) and library (
 - Module-level `//!` documentation on all modules.
 - Generate all test data programmatically -- never commit test data files.
 - Many small individual tests over parameterized/table-driven tests.
-- Encoded read names support colons in contig names (parser uses `rsplitn`).
-- Contig names must not contain `@` characters (FASTQ header prefix).
+- Encoded read names use `::` (double colon) as the field separator so contig names may legally contain single `:` characters (e.g. HLA alleles).
+- Contig names must not contain `@` (FASTQ header prefix) or `::` (field separator); both are rejected by a debug assertion in the read-name formatter.

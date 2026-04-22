@@ -87,10 +87,14 @@ impl Command for Eval {
             let name_bytes = record.name().map_or(&b""[..], |n| n.as_bytes());
             let name = name_bytes.to_str().unwrap_or("");
 
-            // Parse truth from encoded read name.
-            let truth = parse_encoded_pe_name(name)
-                .map(|(_, _, r1, _)| r1)
-                .or_else(|| parse_encoded_se_name(name).map(|(_, _, r1)| r1));
+            // Parse truth from encoded read name. For PE names, pick R1 or R2
+            // based on the record's segment flag; mis-selecting here caused R2
+            // alignments to be scored against the R1 truth position.
+            let truth = if let Some((_, r1, r2)) = parse_encoded_pe_name(name) {
+                if flags.is_last_segment() { Some(r2) } else { Some(r1) }
+            } else {
+                parse_encoded_se_name(name).map(|(_, truth)| truth)
+            };
 
             let Some(truth) = truth else {
                 parse_failures += 1;
