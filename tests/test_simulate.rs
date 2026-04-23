@@ -3289,3 +3289,220 @@ fn test_output_directory_does_not_exist_fails() {
         "error should mention missing output directory, got: {stderr}"
     );
 }
+
+#[test]
+fn test_simulate_emits_only_acgt_with_iupac_reference() {
+    // Reference has a 500bp ACGT prefix, a run of 100 IUPAC codes
+    // (including N), then a 500bp ACGT suffix. Every read should emit only
+    // ACGT regardless of which region the fragment lands in.
+    let mut seq: Vec<u8> = b"ACGTACGTAC".repeat(50); // 500 bp
+    let iupac: Vec<u8> = b"RYSWKMBDHVN".repeat(10); // 110 bp covering every IUPAC code
+    seq.extend_from_slice(&iupac);
+    seq.extend_from_slice(&b"ACGTACGTAC".repeat(50));
+    let env = TestEnv::new(&[("chr1", &seq)]);
+    let out = env.output_prefix();
+
+    let (ok, _, stderr) = run_simulate(&[
+        "simulate",
+        "-r",
+        env.fasta_path.to_str().unwrap(),
+        "-o",
+        out.to_str().unwrap(),
+        "--coverage",
+        "20",
+        "--read-length",
+        "50",
+        "--fragment-mean",
+        "100",
+        "--fragment-stddev",
+        "10",
+        "--min-error-rate",
+        "0",
+        "--max-error-rate",
+        "0",
+        "--max-n-frac",
+        "1.0", // Accept all reads so IUPAC-heavy reads still land in output.
+    ]);
+    assert!(ok, "simulate failed: {stderr}");
+
+    let r1 = read_gzipped(&PathBuf::from(format!("{}.r1.fastq.gz", out.display())));
+    let r2 = read_gzipped(&PathBuf::from(format!("{}.r2.fastq.gz", out.display())));
+
+    for (label, contents) in [("R1", &r1), ("R2", &r2)] {
+        // FASTQ sequence lines are every 4th line starting from line 1 (0-indexed).
+        for (i, line) in contents.lines().enumerate() {
+            if i % 4 != 1 {
+                continue;
+            }
+            for &b in line.as_bytes() {
+                assert!(
+                    matches!(b, b'A' | b'C' | b'G' | b'T' | b'N'),
+                    "{label} line {i} has non-ACGTN byte {:?} (full line: {line})",
+                    char::from(b),
+                );
+                // In particular, no raw IUPAC codes should appear.
+                assert!(
+                    !matches!(
+                        b,
+                        b'R' | b'Y' | b'S' | b'W' | b'K' | b'M' | b'B' | b'D' | b'H' | b'V'
+                    ),
+                    "{label} line {i} leaked IUPAC byte {:?}",
+                    char::from(b),
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn test_simulate_rejects_unresolved_ambiguity_bytes() {
+    // An unsupported byte in the reference (here '?') must cause simulate to
+    // fail with a clear message rather than silently emit garbage.
+    let mut seq: Vec<u8> = b"ACGT".repeat(100);
+    seq[50] = b'?';
+    let env = TestEnv::new(&[("chr1", &seq)]);
+    let out = env.output_prefix();
+
+    let (ok, _, stderr) = run_simulate(&[
+        "simulate",
+        "-r",
+        env.fasta_path.to_str().unwrap(),
+        "-o",
+        out.to_str().unwrap(),
+        "--coverage",
+        "1",
+        // Single-threaded path avoids the pooled-writer cleanup edge case
+        // when simulate bails out mid-run; we're only testing the error
+        // from the reference normalizer here.
+        "--threads",
+        "1",
+    ]);
+    assert!(!ok, "simulate should fail on unrecognized reference byte");
+    assert!(
+        stderr.contains("unrecognized base"),
+        "error should mention unrecognized base, got: {stderr}"
+    );
+}
+
+#[test]
+fn test_simulate_max_n_frac_zero_avoids_ambiguous_regions() {
+    // Three 500bp ACGT regions separated by two 200bp N blocks. With
+    // --max-n-frac=0.0 and a 50bp read, *no* emitted read should contain a
+    // base from either N block.
+    let acgt_block: Vec<u8> = b"ACGTACGTAC".repeat(50); // 500 bp
+    let n_block: Vec<u8> = vec![b'N'; 200];
+    let mut seq = Vec::new();
+    seq.extend_from_slice(&acgt_block); // 0..500
+    seq.extend_from_slice(&n_block); // 500..700
+    seq.extend_from_slice(&acgt_block); // 700..1200
+    seq.extend_from_slice(&n_block); // 1200..1400
+    seq.extend_from_slice(&acgt_block); // 1400..1900
+    let total_len = seq.len();
+    let env = TestEnv::new(&[("chr1", &seq)]);
+    let out = env.output_prefix();
+
+    let (ok, _, stderr) = run_simulate(&[
+        "simulate",
+        "-r",
+        env.fasta_path.to_str().unwrap(),
+        "-o",
+        out.to_str().unwrap(),
+        "--coverage",
+        "30",
+        "--read-length",
+        "50",
+        "--fragment-mean",
+        "120",
+        "--fragment-stddev",
+        "20",
+        "--min-error-rate",
+        "0",
+        "--max-error-rate",
+        "0",
+        "--max-n-frac",
+        "0.0",
+        "--simple-names",
+        "--golden-bam",
+    ]);
+    assert!(ok, "simulate failed: {stderr}");
+
+    // Parse golden BAM and ensure every mapped position is inside an ACGT
+    // block (so the read can't have crossed into an N region).
+    let bam_path = PathBuf::from(format!("{}.golden.bam", out.display()));
+    assert!(bam_path.exists(), "golden BAM missing");
+    let mut reader = bam::io::reader::Builder.build_from_path(&bam_path).unwrap();
+    let header = reader.read_header().unwrap();
+
+    let mut seen_reads = 0usize;
+    for rec in reader.record_bufs(&header) {
+        let rec = rec.unwrap();
+        let Some(start) = rec.alignment_start() else { continue };
+        let start0 = usize::from(start) - 1;
+        // Reference span = sum of ref-consuming CIGAR ops. Soft-clipped
+        // adapter bases don't come from the reference and aren't relevant.
+        let mut ref_span = 0usize;
+        for op in rec.cigar().as_ref() {
+            match op.kind() {
+                CigarKind::Match
+                | CigarKind::SequenceMatch
+                | CigarKind::SequenceMismatch
+                | CigarKind::Deletion
+                | CigarKind::Skip => ref_span += op.len(),
+                _ => {}
+            }
+        }
+        let end = start0 + ref_span;
+        assert!(end <= total_len, "read extends past contig");
+        for pos in start0..end {
+            let in_acgt = (pos < 500) || (700..1200).contains(&pos) || (1400..1900).contains(&pos);
+            assert!(in_acgt, "read at pos {pos} overlaps an N region despite --max-n-frac=0.0");
+        }
+        seen_reads += 1;
+    }
+    assert!(seen_reads > 0, "expected some reads to survive rejection sampling");
+}
+
+#[test]
+fn test_simulate_reproducible_ambiguity_resolution() {
+    // Same seed → identical FASTQ output even when the reference contains
+    // IUPAC codes that need resolution.
+    let mut seq: Vec<u8> = b"ACGTACGTAC".repeat(100);
+    for b in [b'R', b'Y', b'N', b'W', b'S', b'K', b'M', b'B', b'D', b'H', b'V'] {
+        seq.extend(std::iter::repeat_n(b, 20));
+    }
+    seq.extend_from_slice(&b"ACGTACGTAC".repeat(100));
+    let env = TestEnv::new(&[("chr1", &seq)]);
+
+    let out_a = env.dir.path().join("out_a");
+    let out_b = env.dir.path().join("out_b");
+    let shared_args = [
+        "simulate",
+        "-r",
+        env.fasta_path.to_str().unwrap(),
+        "--coverage",
+        "10",
+        "--read-length",
+        "50",
+        "--fragment-mean",
+        "120",
+        "--fragment-stddev",
+        "20",
+        "--seed",
+        "42",
+        "--max-n-frac",
+        "1.0",
+    ];
+    let mut args_a = shared_args.to_vec();
+    args_a.extend(["-o", out_a.to_str().unwrap()]);
+    let (ok_a, _, stderr_a) = run_simulate(&args_a);
+    assert!(ok_a, "first run failed: {stderr_a}");
+
+    let mut args_b = shared_args.to_vec();
+    args_b.extend(["-o", out_b.to_str().unwrap()]);
+    let (ok_b, _, stderr_b) = run_simulate(&args_b);
+    assert!(ok_b, "second run failed: {stderr_b}");
+
+    let r1_a = read_gzipped(&PathBuf::from(format!("{}.r1.fastq.gz", out_a.display())));
+    let r1_b = read_gzipped(&PathBuf::from(format!("{}.r1.fastq.gz", out_b.display())));
+    assert_eq!(r1_a, r1_b, "seeded runs should be byte-identical");
+}

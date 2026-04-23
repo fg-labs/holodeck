@@ -103,12 +103,31 @@ holodeck simulate -r ref.fa -o output --fragment-mean 400 --fragment-stddev 80 -
 | `-s, --fragment-stddev` | 50 | Fragment size standard deviation |
 | `--min-error-rate` | 0.001 | Error rate at start of reads |
 | `--max-error-rate` | 0.01 | Error rate at end of reads |
+| `--max-n-frac` | 0.5 | Reject reads with >this fraction of bases from ambiguous reference positions (see [Ambiguous reference bases](#ambiguous-reference-bases)) |
 | `--golden-bam` | off | Write ground-truth BAM |
 | `--single-end` | off | Generate SE instead of PE reads |
 | `--simple-names` | off | Use `holodeck::N` names instead of encoded truth |
 | `--compression` | 1 | BGZF compression level (0-12) |
 | `-t, --threads` | 4 | Threads for BGZF compression |
 | `--seed` | auto | Random seed (deterministic by default) |
+
+### Ambiguous reference bases
+
+Real references contain a mix of `A`/`C`/`G`/`T`, large stretches of `N` (assembly gaps), and — rarely — IUPAC ambiguity codes (`R`, `Y`, `S`, `W`, `K`, `M`, `B`, `D`, `H`, `V`) for known-ambiguous positions. Holodeck reads these and turns them into ACGT reads without leaking non-ACGT characters into emitted FASTQ, using a two-step strategy:
+
+1. **Reference normalization at load time.** When a contig is loaded, every byte is classified:
+   - `A`/`C`/`G`/`T` (either case) → stored as uppercase.
+   - `U` → converted to `T` (so RNA-style references work).
+   - Any IUPAC ambiguity code (including `N`) → resolved to a uniformly-random base drawn from that code's ambiguity set (e.g. `R` → `A` or `G`, `N` → `A`/`C`/`G`/`T`). The drawn base is stored in **lowercase** as a marker that this position was synthesized from ambiguity.
+   - Anything else → hard error with the offending byte and position.
+
+   The RNG used for this normalization is seeded deterministically from `--seed` plus the contig name, so two runs with the same seed produce byte-identical outputs even when the reference has ambiguous positions.
+
+2. **Read rejection at sampling time.** Each generated read counts how many of its bases are lowercase (i.e. came from ambiguous positions). If either R1 or R2 has a lowercase fraction above `--max-n-frac` (default `0.5`), the pair is rejected and resampled. Accepted reads are upper-cased in place before the error model runs, so emitted FASTQ and BAM contain only `A`/`C`/`G`/`T` (plus a rare `N` when the configured adapter is shorter than the bases needed past the insert — a separate, pre-existing behavior of the adapter-padding code).
+
+   Set `--max-n-frac 1.0` to disable the filter (accept reads from any region). Set `--max-n-frac 0.0` to require every base in every read to come from an unambiguous reference position.
+
+**Known limitation:** requested `--coverage` is computed from raw contig/BED lengths, not from the non-ambiguous territory. For a reference like hs38DH (~5% N), rejection is noise and coverage lands where you'd expect. For simulations targeted at heavily-N contigs (or with `--max-n-frac 0.0` in N-dense regions), effective coverage will be slightly below the requested value; a warning is logged if the resampling budget is exhausted.
 
 ## Mutate
 
