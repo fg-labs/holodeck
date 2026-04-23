@@ -232,6 +232,12 @@ impl Simulate {
         let frag_dist = Normal::new(self.fragment_mean as f64, self.fragment_stddev as f64)
             .map_err(|e| anyhow::anyhow!("Invalid fragment distribution parameters: {e}"))?;
 
+        // Normalize user-supplied adapter sequences to uppercase so they
+        // don't register as ambiguity-resolved bases (lowercase marker) in
+        // the per-read lowercase-fraction filter.
+        let adapter_r1 = self.adapter_r1.to_ascii_uppercase();
+        let adapter_r2 = self.adapter_r2.to_ascii_uppercase();
+
         let compression = self.compression;
         let use_pool = self.threads > 1;
 
@@ -292,6 +298,8 @@ impl Simulate {
                 total_reads,
                 &error_model,
                 &frag_dist,
+                adapter_r1.as_bytes(),
+                adapter_r2.as_bytes(),
                 &mut r1_writer,
                 &mut r2_writer,
                 &mut golden_bam_writer,
@@ -400,6 +408,8 @@ impl Simulate {
         total_reads: u64,
         error_model: &IlluminaErrorModel,
         frag_dist: &Normal<f64>,
+        adapter_r1: &[u8],
+        adapter_r2: &[u8],
         r1_writer: &mut FastqWriter,
         r2_writer: &mut Option<FastqWriter>,
         golden_bam: &mut Option<GoldenBamWriter>,
@@ -531,8 +541,8 @@ impl Simulate {
                 read_num,
                 self.read_length,
                 !self.single_end,
-                self.adapter_r1.as_bytes(),
-                self.adapter_r2.as_bytes(),
+                adapter_r1,
+                adapter_r2,
                 self.max_n_frac,
                 error_model,
                 self.simple_names,

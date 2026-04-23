@@ -68,7 +68,7 @@ pub struct ReadPair {
 /// * `error_model` — Error model to apply.
 /// * `simple_names` — Use simple names instead of encoded truth names.
 /// * `rng` — Random number generator.
-#[allow(clippy::too_many_arguments)] // Simulation parameters are naturally numerous
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)] // Orchestrator for the read-pair pipeline
 pub fn generate_read_pair(
     fragment: &Fragment,
     contig_name: &str,
@@ -95,14 +95,30 @@ pub fn generate_read_pair(
     // reverse-strand; what changes is which becomes R1 vs R2.
     let r1_negative_strand = !fragment.is_forward;
 
-    // Extract R1 bases and reject if too much of the read came from
-    // ambiguity-resolved reference positions. Done before apply_errors so
-    // rejection is cheap.
+    // Extract both mates' bases and run the ambiguity-fraction check on
+    // each before applying errors. Errors mutate bases and advance `rng`, so
+    // checking first means rejection costs nothing and the RNG stream is
+    // only consumed for pairs that will actually be emitted.
     let mut r1_bases =
         extract_read_bases(&fragment.bases, read_length, adapter_r1, r1_negative_strand);
     if lowercase_fraction(&r1_bases) > max_n_frac {
         return None;
     }
+
+    // R2 is on the negative strand whenever the fragment is forward-strand.
+    let r2_negative_strand = fragment.is_forward;
+    let r2_bases_pre = if paired {
+        let bases =
+            extract_read_bases(&fragment.bases, read_length, adapter_r2, r2_negative_strand);
+        if lowercase_fraction(&bases) > max_n_frac {
+            return None;
+        }
+        Some(bases)
+    } else {
+        None
+    };
+
+    // Both mates passed the filter (or we're SE) — now apply errors.
     uppercase_in_place(&mut r1_bases);
     let (r1_errors, r1_quals) =
         error_model::apply_errors(model, &mut r1_bases, ReadEnd::Read1, rng);
@@ -141,72 +157,73 @@ pub fn generate_read_pair(
         n_errors: r1_errors,
     };
 
-    if !paired {
-        let name =
-            if simple_names { simple_name(read_num) } else { encoded_se_name(read_num, &r1_truth) };
+    // Finish R2 (or emit an SE pair). Matching on the pre-extracted R2
+    // bases avoids re-checking `paired` and keeps the panic-free path clean.
+    match r2_bases_pre {
+        None => {
+            let name = if simple_names {
+                simple_name(read_num)
+            } else {
+                encoded_se_name(read_num, &r1_truth)
+            };
 
-        return Some(ReadPair {
-            read1: SimulatedRead { name, bases: r1_bases, qualities: r1_quals },
-            read2: None,
-            r1_truth,
-            r2_truth: None,
-            r1_cigar,
-            r2_cigar: None,
-        });
+            Some(ReadPair {
+                read1: SimulatedRead { name, bases: r1_bases, qualities: r1_quals },
+                read2: None,
+                r1_truth,
+                r2_truth: None,
+                r1_cigar,
+                r2_cigar: None,
+            })
+        }
+        Some(mut r2_bases) => {
+            uppercase_in_place(&mut r2_bases);
+            let (r2_errors, r2_quals) =
+                error_model::apply_errors(model, &mut r2_bases, ReadEnd::Read2, rng);
+
+            // R2 ref_positions and CIGAR.
+            let r2_positions = if r2_negative_strand {
+                &fragment.ref_positions[right_start..frag_len]
+            } else {
+                &fragment.ref_positions[..genomic]
+            };
+            let r2_cigar =
+                cigar_from_ref_positions(r2_positions, adapter_bases, r2_negative_strand);
+
+            // R2 truth position: leftmost reference coordinate (1-based).
+            let r2_ref_pos = if fragment.ref_positions.is_empty() {
+                0
+            } else if r2_negative_strand {
+                fragment.ref_positions[right_start] + 1
+            } else {
+                fragment.ref_positions[0] + 1
+            };
+
+            let r2_truth = TruthAlignment {
+                contig: contig_name.to_string(),
+                position: r2_ref_pos,
+                is_forward: !fragment.is_forward,
+                haplotype: fragment.haplotype_index,
+                fragment_length,
+                n_errors: r2_errors,
+            };
+
+            let name = if simple_names {
+                simple_name(read_num)
+            } else {
+                encoded_pe_name(read_num, &r1_truth, &r2_truth)
+            };
+
+            Some(ReadPair {
+                read1: SimulatedRead { name: name.clone(), bases: r1_bases, qualities: r1_quals },
+                read2: Some(SimulatedRead { name, bases: r2_bases, qualities: r2_quals }),
+                r1_truth,
+                r2_truth: Some(r2_truth),
+                r1_cigar,
+                r2_cigar: Some(r2_cigar),
+            })
+        }
     }
-
-    // Paired-end: extract R2 bases from the opposite end of the fragment.
-    // R2 is on the negative strand whenever the fragment is forward-strand.
-    let r2_negative_strand = fragment.is_forward;
-    let mut r2_bases =
-        extract_read_bases(&fragment.bases, read_length, adapter_r2, r2_negative_strand);
-    if lowercase_fraction(&r2_bases) > max_n_frac {
-        return None;
-    }
-    uppercase_in_place(&mut r2_bases);
-    let (r2_errors, r2_quals) =
-        error_model::apply_errors(model, &mut r2_bases, ReadEnd::Read2, rng);
-
-    // R2 ref_positions and CIGAR.
-    let r2_positions = if r2_negative_strand {
-        &fragment.ref_positions[right_start..frag_len]
-    } else {
-        &fragment.ref_positions[..genomic]
-    };
-    let r2_cigar = cigar_from_ref_positions(r2_positions, adapter_bases, r2_negative_strand);
-
-    // R2 truth position: leftmost reference coordinate (1-based).
-    let r2_ref_pos = if fragment.ref_positions.is_empty() {
-        0
-    } else if r2_negative_strand {
-        fragment.ref_positions[right_start] + 1
-    } else {
-        fragment.ref_positions[0] + 1
-    };
-
-    let r2_truth = TruthAlignment {
-        contig: contig_name.to_string(),
-        position: r2_ref_pos,
-        is_forward: !fragment.is_forward,
-        haplotype: fragment.haplotype_index,
-        fragment_length,
-        n_errors: r2_errors,
-    };
-
-    let name = if simple_names {
-        simple_name(read_num)
-    } else {
-        encoded_pe_name(read_num, &r1_truth, &r2_truth)
-    };
-
-    Some(ReadPair {
-        read1: SimulatedRead { name: name.clone(), bases: r1_bases, qualities: r1_quals },
-        read2: Some(SimulatedRead { name, bases: r2_bases, qualities: r2_quals }),
-        r1_truth,
-        r2_truth: Some(r2_truth),
-        r1_cigar,
-        r2_cigar: Some(r2_cigar),
-    })
 }
 
 /// Compute a CIGAR from a slice of ascending reference positions, plus
@@ -532,5 +549,80 @@ mod tests {
         for &b in &pair.read2.as_ref().unwrap().bases {
             assert!(matches!(b, b'A' | b'C' | b'G' | b'T' | b'N'), "r2 got {b:?}");
         }
+    }
+
+    #[test]
+    fn test_rejects_before_applying_errors_to_r1() {
+        // Clean forward half (becomes R1), all-lowercase reverse half (becomes
+        // R2 via reverse-complement). R1 passes the filter, but the pair
+        // must be rejected *before* R1's errors advance the RNG — so a
+        // subsequent call on a clean fragment produces identical output to
+        // skipping the rejected call entirely.
+        let mut fragment_half_bad = test_fragment(&[b'A'; 20], 0);
+        // Second half lowercase: becomes R2 when is_forward=true.
+        for b in &mut fragment_half_bad.bases[10..] {
+            *b = b'a';
+        }
+        fragment_half_bad.is_forward = true;
+
+        let clean_fragment = test_fragment(&[b'A'; 20], 0);
+        let model = IlluminaErrorModel::new(10, 0.5, 0.5); // High rate so errors are observable.
+
+        // Run A: rejected pair, then clean pair.
+        let mut rng_a = SmallRng::seed_from_u64(123);
+        let rejected = generate_read_pair(
+            &fragment_half_bad,
+            "chr1",
+            1,
+            10,
+            true,
+            b"TTTTTTTTTT",
+            b"TTTTTTTTTT",
+            0.5,
+            &model,
+            false,
+            &mut rng_a,
+        );
+        assert!(rejected.is_none(), "expected rejection when R2 is all-lowercase");
+        let after_reject = generate_read_pair(
+            &clean_fragment,
+            "chr1",
+            2,
+            10,
+            true,
+            b"TTTTTTTTTT",
+            b"TTTTTTTTTT",
+            0.5,
+            &model,
+            false,
+            &mut rng_a,
+        )
+        .unwrap();
+
+        // Run B: skip the rejected call entirely on an identical RNG seed.
+        let mut rng_b = SmallRng::seed_from_u64(123);
+        let direct = generate_read_pair(
+            &clean_fragment,
+            "chr1",
+            2,
+            10,
+            true,
+            b"TTTTTTTTTT",
+            b"TTTTTTTTTT",
+            0.5,
+            &model,
+            false,
+            &mut rng_b,
+        )
+        .unwrap();
+
+        // If rejection had consumed any RNG draws (for R1's apply_errors or
+        // qualities), the clean pair's bases/qualities would diverge.
+        assert_eq!(after_reject.read1.bases, direct.read1.bases);
+        assert_eq!(after_reject.read1.qualities, direct.read1.qualities);
+        assert_eq!(
+            after_reject.read2.as_ref().unwrap().bases,
+            direct.read2.as_ref().unwrap().bases
+        );
     }
 }

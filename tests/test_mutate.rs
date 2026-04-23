@@ -254,3 +254,56 @@ fn test_mutate_ploidy_override() {
         assert_eq!(rec.gt, "1", "chrX haploid non-ref GT should be '1', got '{}'", rec.gt);
     }
 }
+
+/// IUPAC codes (and `N`) in the reference are resolved to random A/C/G/T at
+/// load time and stored lowercase. The mutation loop must not emit multi-base
+/// REF alleles (MNPs / deletions) that span those synthesized positions —
+/// such REFs would contain lowercase bytes and be invalid VCF.
+#[test]
+fn test_mutate_never_emits_ambiguity_resolved_ref_alleles() {
+    // Interleave pure-ACGT blocks with single IUPAC bytes so multi-base REFs
+    // generated on the ACGT side can easily span into ambiguity territory.
+    let mut seq: Vec<u8> = Vec::new();
+    for _ in 0..200 {
+        seq.extend_from_slice(b"ACGTACGT"); // 8 bp clean
+        seq.push(b'R'); // 1 bp IUPAC
+        seq.extend_from_slice(b"ACGTACGT"); // 8 bp clean
+        seq.push(b'N'); // 1 bp N
+    }
+    // 200 * 18 = 3600 bp; ~11% ambiguous.
+    let env = TestEnv::new(&[("chr1", &seq)]);
+    let vcf_path = env.dir.path().join("output.vcf");
+
+    // High indel/MNP rates to stress multi-base REFs.
+    let (ok, _, stderr) = run_mutate(&[
+        "mutate",
+        "-r",
+        env.fasta_path.to_str().unwrap(),
+        "-o",
+        vcf_path.to_str().unwrap(),
+        "--snp-rate",
+        "0.01",
+        "--indel-rate",
+        "0.02",
+        "--mnp-rate",
+        "0.02",
+        "--seed",
+        "7",
+    ]);
+    assert!(ok, "mutate failed: {stderr}");
+
+    let records = read_vcf_records(&vcf_path);
+    assert!(!records.is_empty(), "should have generated some variants");
+
+    for rec in &records {
+        for c in rec.ref_allele.chars() {
+            assert!(
+                matches!(c, 'A' | 'C' | 'G' | 'T'),
+                "REF allele {:?} at pos {} contains non-ACGT byte {:?}",
+                rec.ref_allele,
+                rec.pos,
+                c
+            );
+        }
+    }
+}

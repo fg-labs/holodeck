@@ -202,6 +202,16 @@ impl Mutate {
                     generate_mnp(&reference, pos, contig_len, &mut rng)
                 };
 
+                // The anchor-position check above only covers position `pos`.
+                // Multi-base REF alleles (MNPs and deletions) may still span
+                // an ambiguity-resolved lowercase byte at `pos+1` or later,
+                // which would emit a noncanonical REF into the VCF — skip
+                // those variants.
+                if !ref_allele.iter().all(|b| BASES.contains(b)) {
+                    pos += 1;
+                    continue;
+                }
+
                 // Assign genotype (het vs hom).
                 let gt = generate_genotype(ploidy, self.het_hom_ratio, &mut rng);
 
