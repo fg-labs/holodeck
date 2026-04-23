@@ -12,7 +12,7 @@ use super::common::{BedOptions, ReferenceOptions, SeedOptions};
 use crate::bed::TargetRegions;
 use crate::fasta::Fasta;
 use crate::ploidy::PloidyMap;
-use crate::seed::resolve_seed;
+use crate::seed::{derive_seed, resolve_seed};
 
 /// DNA bases for random mutation generation.
 const BASES: [u8; 4] = [b'A', b'C', b'G', b'T'];
@@ -153,7 +153,11 @@ impl Mutate {
         let contig_names: Vec<String> = dict.names().into_iter().map(String::from).collect();
 
         for contig_name in &contig_names {
-            let reference = fasta.load_contig(contig_name)?;
+            // Use a per-contig RNG for reference normalization so ambiguity
+            // resolution is reproducible and independent of the mutation RNG.
+            let contig_seed = derive_seed(seed, contig_name);
+            let mut ref_rng = SmallRng::seed_from_u64(contig_seed);
+            let reference = fasta.load_contig(contig_name, &mut ref_rng)?;
             let contig_idx = dict.get_by_name(contig_name).unwrap().index();
 
             let mut pos = 0u32;

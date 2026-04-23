@@ -19,7 +19,7 @@ use crate::haplotype::build_haplotypes;
 use crate::output::fastq::FastqWriter;
 use crate::output::golden_bam::{GoldenBamMetadata, GoldenBamWriter};
 use crate::read::generate_read_pair;
-use crate::seed::resolve_seed;
+use crate::seed::{derive_seed, resolve_seed};
 use crate::sequence_dict::SequenceDictionary;
 use crate::version::VERSION;
 
@@ -105,6 +105,16 @@ pub struct Simulate {
     #[arg(long, default_value_t = 0.01, value_name = "FLOAT")]
     pub max_error_rate: f64,
 
+    /// Maximum fraction of a read's bases that may come from ambiguous
+    /// reference positions (IUPAC codes or `N`). Reference bases resolved
+    /// from ambiguity codes are flagged at load time and counted per read;
+    /// read pairs whose R1 or R2 exceeds this fraction are rejected and
+    /// resampled. Setting this to `1.0` disables the filter; setting it to
+    /// `0.0` requires every base to come from an unambiguous reference
+    /// position. Value must be in `[0.0, 1.0]`.
+    #[arg(long, default_value_t = 0.5, value_name = "FLOAT")]
+    pub max_n_frac: f64,
+
     /// Write a ground-truth BAM file with correct alignments.
     #[arg(long)]
     pub golden_bam: bool,
@@ -155,6 +165,9 @@ impl Simulate {
         }
         if self.min_error_rate > self.max_error_rate {
             bail!("--min-error-rate must be <= --max-error-rate");
+        }
+        if !self.max_n_frac.is_finite() || !(0.0..=1.0).contains(&self.max_n_frac) {
+            bail!("--max-n-frac must be in [0.0, 1.0]");
         }
         if self.compression > 12 {
             bail!("--compression must be between 0 and 12");
@@ -283,6 +296,7 @@ impl Simulate {
                 &mut r2_writer,
                 &mut golden_bam_writer,
                 read_num,
+                seed,
                 &mut rng,
             )?;
         }
@@ -390,6 +404,7 @@ impl Simulate {
         r2_writer: &mut Option<FastqWriter>,
         golden_bam: &mut Option<GoldenBamWriter>,
         start_read_num: u64,
+        main_seed: u64,
         rng: &mut SmallRng,
     ) -> Result<u64> {
         let contig_meta = dict.get_by_name(contig_name).unwrap();
@@ -432,7 +447,11 @@ impl Simulate {
             PaddedIntervalSampler::new(tgt.contig_intervals(contig_idx), pad, contig_len as u32)
         });
 
-        let reference = fasta.load_contig(contig_name)?;
+        // Seed a dedicated RNG for reference normalization so ambiguity-code
+        // resolution is reproducible and independent of the main sampling RNG.
+        let contig_seed = derive_seed(main_seed, contig_name);
+        let mut ref_rng = SmallRng::seed_from_u64(contig_seed);
+        let reference = fasta.load_contig(contig_name, &mut ref_rng)?;
 
         // Load variants if VCF provided.
         let variants = if let Some(vcf_path) = &self.vcf.vcf {
@@ -506,7 +525,7 @@ impl Simulate {
                 extract_fragment(&haplotypes[hap_idx], &reference, ref_start, frag_len, is_forward);
 
             let read_num = start_read_num + generated + 1;
-            let pair = generate_read_pair(
+            let Some(pair) = generate_read_pair(
                 &fragment,
                 contig_name,
                 read_num,
@@ -514,10 +533,14 @@ impl Simulate {
                 !self.single_end,
                 self.adapter_r1.as_bytes(),
                 self.adapter_r2.as_bytes(),
+                self.max_n_frac,
                 error_model,
                 self.simple_names,
                 rng,
-            );
+            ) else {
+                // Too many ambiguity-resolved bases in this read pair; resample.
+                continue;
+            };
 
             r1_writer.write_read(&pair.read1)?;
             if let Some(w) = r2_writer

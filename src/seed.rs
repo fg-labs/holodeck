@@ -28,6 +28,15 @@ pub fn resolve_seed(explicit: Option<u64>, description: &str) -> u64 {
     explicit.unwrap_or_else(|| compute_seed(description))
 }
 
+/// Derive a deterministic sub-seed scoped to a named namespace (e.g. a
+/// contig name) from a parent seed. Used to produce independent, reproducible
+/// RNG streams for per-contig work (reference normalization, etc.) without
+/// disturbing the main simulation RNG.
+#[must_use]
+pub fn derive_seed(parent: u64, namespace: &str) -> u64 {
+    compute_seed(&format!("{parent:016x}:{namespace}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -64,5 +73,26 @@ mod tests {
         let seed = resolve_seed(None, "hello");
         let expected = compute_seed("hello");
         assert_eq!(seed, expected);
+    }
+
+    #[test]
+    fn test_derive_seed_deterministic() {
+        let a = derive_seed(42, "chr1");
+        let b = derive_seed(42, "chr1");
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn test_derive_seed_varies_with_namespace() {
+        let a = derive_seed(42, "chr1");
+        let b = derive_seed(42, "chr2");
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn test_derive_seed_varies_with_parent() {
+        let a = derive_seed(1, "chr1");
+        let b = derive_seed(2, "chr1");
+        assert_ne!(a, b);
     }
 }

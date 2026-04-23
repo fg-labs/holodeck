@@ -10,7 +10,7 @@ use noodles::sam::alignment::record_buf::Cigar;
 use rand::Rng;
 
 use crate::error_model::{self, ErrorModel, ReadEnd};
-use crate::fragment::{Fragment, extract_read_bases};
+use crate::fragment::{Fragment, extract_read_bases, lowercase_fraction, uppercase_in_place};
 use crate::read_naming::{TruthAlignment, encoded_pe_name, encoded_se_name, simple_name};
 
 /// A single simulated read with bases, quality scores, and metadata.
@@ -48,6 +48,13 @@ pub struct ReadPair {
 /// model, constructs read names with truth information, and computes CIGARs
 /// from the fragment's reference coordinate mapping.
 ///
+/// Returns `None` if either R1 or R2 has a lowercase-base fraction greater
+/// than `max_n_frac` (i.e. too many bases came from ambiguity-resolved
+/// reference positions); the caller should resample. See the [`fragment`]
+/// module documentation for the lowercase-marker convention.
+///
+/// [`fragment`]: crate::fragment
+///
 /// # Arguments
 /// * `fragment` — The source fragment with bases and reference positions.
 /// * `contig_name` — Contig name for read naming.
@@ -56,6 +63,8 @@ pub struct ReadPair {
 /// * `paired` — Whether to generate both R1 and R2.
 /// * `adapter_r1` — Adapter sequence for R1.
 /// * `adapter_r2` — Adapter sequence for R2.
+/// * `max_n_frac` — Reject the pair if R1 or R2 has a lowercase fraction
+///   exceeding this threshold. Use `1.0` to disable.
 /// * `error_model` — Error model to apply.
 /// * `simple_names` — Use simple names instead of encoded truth names.
 /// * `rng` — Random number generator.
@@ -68,10 +77,11 @@ pub fn generate_read_pair(
     paired: bool,
     adapter_r1: &[u8],
     adapter_r2: &[u8],
+    max_n_frac: f64,
     model: &impl ErrorModel,
     simple_names: bool,
     rng: &mut impl Rng,
-) -> ReadPair {
+) -> Option<ReadPair> {
     let frag_len = fragment.bases.len();
     let genomic = frag_len.min(read_length);
     let adapter_bases = read_length.saturating_sub(genomic);
@@ -85,9 +95,15 @@ pub fn generate_read_pair(
     // reverse-strand; what changes is which becomes R1 vs R2.
     let r1_negative_strand = !fragment.is_forward;
 
-    // Extract R1 bases.
+    // Extract R1 bases and reject if too much of the read came from
+    // ambiguity-resolved reference positions. Done before apply_errors so
+    // rejection is cheap.
     let mut r1_bases =
         extract_read_bases(&fragment.bases, read_length, adapter_r1, r1_negative_strand);
+    if lowercase_fraction(&r1_bases) > max_n_frac {
+        return None;
+    }
+    uppercase_in_place(&mut r1_bases);
     let (r1_errors, r1_quals) =
         error_model::apply_errors(model, &mut r1_bases, ReadEnd::Read1, rng);
 
@@ -129,14 +145,14 @@ pub fn generate_read_pair(
         let name =
             if simple_names { simple_name(read_num) } else { encoded_se_name(read_num, &r1_truth) };
 
-        return ReadPair {
+        return Some(ReadPair {
             read1: SimulatedRead { name, bases: r1_bases, qualities: r1_quals },
             read2: None,
             r1_truth,
             r2_truth: None,
             r1_cigar,
             r2_cigar: None,
-        };
+        });
     }
 
     // Paired-end: extract R2 bases from the opposite end of the fragment.
@@ -144,6 +160,10 @@ pub fn generate_read_pair(
     let r2_negative_strand = fragment.is_forward;
     let mut r2_bases =
         extract_read_bases(&fragment.bases, read_length, adapter_r2, r2_negative_strand);
+    if lowercase_fraction(&r2_bases) > max_n_frac {
+        return None;
+    }
+    uppercase_in_place(&mut r2_bases);
     let (r2_errors, r2_quals) =
         error_model::apply_errors(model, &mut r2_bases, ReadEnd::Read2, rng);
 
@@ -179,14 +199,14 @@ pub fn generate_read_pair(
         encoded_pe_name(read_num, &r1_truth, &r2_truth)
     };
 
-    ReadPair {
+    Some(ReadPair {
         read1: SimulatedRead { name: name.clone(), bases: r1_bases, qualities: r1_quals },
         read2: Some(SimulatedRead { name, bases: r2_bases, qualities: r2_quals }),
         r1_truth,
         r2_truth: Some(r2_truth),
         r1_cigar,
         r2_cigar: Some(r2_cigar),
-    }
+    })
 }
 
 /// Compute a CIGAR from a slice of ascending reference positions, plus
@@ -401,8 +421,9 @@ mod tests {
         let mut rng = SmallRng::seed_from_u64(42);
 
         let pair = generate_read_pair(
-            &fragment, "chr1", 1, 10, true, b"ADAPTER", b"ADAPTER", &model, false, &mut rng,
-        );
+            &fragment, "chr1", 1, 10, true, b"ADAPTER", b"ADAPTER", 1.0, &model, false, &mut rng,
+        )
+        .expect("no ambiguous bases — should not reject");
 
         assert_eq!(pair.read1.bases, b"ACGTACGTAC");
         assert!(pair.read2.is_some());
@@ -419,8 +440,9 @@ mod tests {
         let mut rng = SmallRng::seed_from_u64(42);
 
         let pair = generate_read_pair(
-            &fragment, "chr1", 5, 10, false, b"ADAPTER", b"ADAPTER", &model, false, &mut rng,
-        );
+            &fragment, "chr1", 5, 10, false, b"ADAPTER", b"ADAPTER", 1.0, &model, false, &mut rng,
+        )
+        .unwrap();
 
         assert!(pair.read2.is_none());
         assert!(pair.r2_cigar.is_none());
@@ -436,8 +458,9 @@ mod tests {
         let mut rng = SmallRng::seed_from_u64(42);
 
         let pair = generate_read_pair(
-            &fragment, "chr1", 1, 5, true, b"TTTTT", b"GGGGG", &model, false, &mut rng,
-        );
+            &fragment, "chr1", 1, 5, true, b"TTTTT", b"GGGGG", 1.0, &model, false, &mut rng,
+        )
+        .unwrap();
 
         assert_eq!(cigar_to_string(&pair.r1_cigar), "2M3S");
         assert_eq!(cigar_to_string(pair.r2_cigar.as_ref().unwrap()), "3S2M");
@@ -449,8 +472,10 @@ mod tests {
         let model = IlluminaErrorModel::new(4, 0.0, 0.0);
         let mut rng = SmallRng::seed_from_u64(42);
 
-        let pair =
-            generate_read_pair(&fragment, "chr1", 42, 4, true, b"A", b"A", &model, true, &mut rng);
+        let pair = generate_read_pair(
+            &fragment, "chr1", 42, 4, true, b"A", b"A", 1.0, &model, true, &mut rng,
+        )
+        .unwrap();
 
         assert_eq!(pair.read1.name, "holodeck::42");
     }
@@ -461,10 +486,51 @@ mod tests {
         let model = IlluminaErrorModel::new(10, 0.001, 0.01);
         let mut rng = SmallRng::seed_from_u64(42);
 
-        let pair =
-            generate_read_pair(&fragment, "chr1", 1, 10, true, b"A", b"A", &model, false, &mut rng);
+        let pair = generate_read_pair(
+            &fragment, "chr1", 1, 10, true, b"A", b"A", 1.0, &model, false, &mut rng,
+        )
+        .unwrap();
 
         assert_eq!(pair.read1.qualities.len(), 10);
         assert_eq!(pair.read2.as_ref().unwrap().qualities.len(), 10);
+    }
+
+    #[test]
+    fn test_rejects_when_r1_exceeds_max_n_frac() {
+        // Fragment entirely lowercase: every base on R1 (forward) is
+        // flagged, lowercase_fraction == 1.0, which exceeds any threshold < 1.
+        let mut fragment = test_fragment(b"acgtacgtac", 100);
+        // Mark as forward so R1 is the positive-strand, genomic-bases read.
+        fragment.is_forward = true;
+        let model = IlluminaErrorModel::new(10, 0.0, 0.0);
+        let mut rng = SmallRng::seed_from_u64(42);
+
+        let pair = generate_read_pair(
+            &fragment, "chr1", 1, 10, true, b"ADAPTER", b"ADAPTER", 0.5, &model, false, &mut rng,
+        );
+
+        assert!(pair.is_none(), "all-lowercase fragment should be rejected at threshold 0.5");
+    }
+
+    #[test]
+    fn test_accepts_when_lowercase_below_threshold() {
+        // 3 lowercase out of 10 = 0.3, below threshold 0.5 — should accept
+        // and also emit uppercase bases.
+        let fragment = test_fragment(b"ACaGcTAtCA", 0);
+        let model = IlluminaErrorModel::new(10, 0.0, 0.0);
+        let mut rng = SmallRng::seed_from_u64(42);
+
+        let pair = generate_read_pair(
+            &fragment, "chr1", 1, 10, true, b"ADAPTER", b"ADAPTER", 0.5, &model, false, &mut rng,
+        )
+        .expect("0.3 < 0.5 — should accept");
+
+        // Emitted bases must be uppercase ACGT only.
+        for &b in &pair.read1.bases {
+            assert!(matches!(b, b'A' | b'C' | b'G' | b'T' | b'N'), "r1 got {b:?}");
+        }
+        for &b in &pair.read2.as_ref().unwrap().bases {
+            assert!(matches!(b, b'A' | b'C' | b'G' | b'T' | b'N'), "r2 got {b:?}");
+        }
     }
 }

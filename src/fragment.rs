@@ -3,20 +3,31 @@
 //! Handles extracting genomic fragments from haplotypes, reverse-complement
 //! operations, adapter sequence appending for short fragments, and R1/R2
 //! base extraction from fragments.
+//!
+//! # Lowercase-as-marker convention
+//!
+//! [`crate::fasta::Fasta::load_contig`] stores bases resolved from IUPAC
+//! ambiguity codes (including `N`) in lowercase, while real `A`/`C`/`G`/`T`
+//! bases remain uppercase. Reads that carry those synthesized bases through
+//! from the reference can be detected by counting lowercase bytes via
+//! [`lowercase_fraction`], and the buffers are upper-cased in place with
+//! [`uppercase_in_place`] before being emitted.
 
 use crate::haplotype::Haplotype;
 
-/// The DNA complement of a base. Handles both upper and lowercase input,
-/// always returning uppercase output.
+/// The DNA complement of a base. Preserves the case of the input so the
+/// lowercase "synthesized from ambiguity" marker (see module docs) survives
+/// reverse-complementing for R2 reads.
 #[must_use]
 fn complement(base: u8) -> u8 {
-    match base.to_ascii_uppercase() {
+    let upper = match base.to_ascii_uppercase() {
         b'A' => b'T',
         b'T' => b'A',
         b'C' => b'G',
         b'G' => b'C',
         _ => b'N',
-    }
+    };
+    if base.is_ascii_lowercase() { upper.to_ascii_lowercase() } else { upper }
 }
 
 /// Reverse-complement a DNA sequence in place.
@@ -119,6 +130,32 @@ pub fn extract_read_bases(
     }
 }
 
+/// Fraction of lowercase ASCII bytes in `bases`.
+///
+/// Lowercase bases mark positions that were synthesized from IUPAC
+/// ambiguity codes (including `N`) at reference-load time, so this is a
+/// cheap proxy for "how much of this read came from an ambiguous reference
+/// region." Returns `0.0` for an empty slice.
+#[must_use]
+pub fn lowercase_fraction(bases: &[u8]) -> f64 {
+    if bases.is_empty() {
+        return 0.0;
+    }
+    // The ASCII 0x20 bit distinguishes lowercase from uppercase letters; any
+    // non-alphabetic byte (e.g. adapter pad) has this bit clear for our
+    // valid base values (A-Z / a-z) — so counting that bit is equivalent to
+    // counting lowercase letters.
+    let lower = bases.iter().filter(|&&b| b.is_ascii_lowercase()).count();
+    lower as f64 / bases.len() as f64
+}
+
+/// Upper-case every ASCII letter in `bases` in place.
+pub fn uppercase_in_place(bases: &mut [u8]) {
+    for b in bases.iter_mut() {
+        b.make_ascii_uppercase();
+    }
+}
+
 /// Append adapter bases and pad with N to reach `target_len`.
 fn append_adapter_and_pad(bases: &mut Vec<u8>, target_len: usize, adapter: &[u8]) {
     if bases.len() < target_len {
@@ -152,6 +189,15 @@ mod tests {
         let mut seq = b"ANGC".to_vec();
         reverse_complement(&mut seq);
         assert_eq!(&seq, b"GCNT");
+    }
+
+    #[test]
+    fn test_reverse_complement_preserves_lowercase() {
+        // Lowercase bases carry an ambiguity-resolved marker that must
+        // survive reverse-complementing.
+        let mut seq = b"aCgT".to_vec();
+        reverse_complement(&mut seq);
+        assert_eq!(&seq, b"AcGt");
     }
 
     #[test]
@@ -200,6 +246,50 @@ mod tests {
         // Reverse complement of ACG is CGT (3 bytes), then 5 adapter T's.
         assert_eq!(&bases, b"CGTTTTTT"); // CGT + TTTTT = 8 bytes
         assert_eq!(bases.len(), 8);
+    }
+
+    #[test]
+    fn test_lowercase_fraction_empty() {
+        assert!(lowercase_fraction(b"").abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_lowercase_fraction_all_upper() {
+        assert!(lowercase_fraction(b"ACGTACGT").abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_lowercase_fraction_all_lower() {
+        assert!((lowercase_fraction(b"acgtacgt") - 1.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_lowercase_fraction_mixed() {
+        // 3 lowercase out of 10.
+        let f = lowercase_fraction(b"ACaGcTAtCA");
+        assert!((f - 0.3).abs() < 1e-10, "expected 0.3, got {f}");
+    }
+
+    #[test]
+    fn test_lowercase_fraction_ignores_non_letters() {
+        // N-pad and '-' are non-letter / uppercase — only 'a' should count.
+        // "A-Na" is length 4 with 1 lowercase letter.
+        let f = lowercase_fraction(b"A-Na");
+        assert!((f - 0.25).abs() < 1e-10, "expected 0.25, got {f}");
+    }
+
+    #[test]
+    fn test_uppercase_in_place() {
+        let mut bases = b"aCgTnN".to_vec();
+        uppercase_in_place(&mut bases);
+        assert_eq!(&bases, b"ACGTNN");
+    }
+
+    #[test]
+    fn test_uppercase_in_place_empty() {
+        let mut bases: Vec<u8> = Vec::new();
+        uppercase_in_place(&mut bases);
+        assert!(bases.is_empty());
     }
 
     #[test]
