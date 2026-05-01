@@ -103,7 +103,7 @@ holodeck simulate -r ref.fa -o output --fragment-mean 400 --fragment-stddev 80 -
 | `-s, --fragment-stddev` | 50 | Fragment size standard deviation |
 | `--min-error-rate` | 0.001 | Error rate at start of reads |
 | `--max-error-rate` | 0.01 | Error rate at end of reads |
-| `--max-n-frac` | 0.5 | Reject reads with >this fraction of bases from ambiguous reference positions (see [Ambiguous reference bases](#ambiguous-reference-bases)) |
+| `--max-n-frac` | 0.02 | Reject reads with >this fraction of bases from ambiguous reference positions (see [Ambiguous reference bases](#ambiguous-reference-bases)) |
 | `--golden-bam` | off | Write ground-truth BAM |
 | `--single-end` | off | Generate SE instead of PE reads |
 | `--simple-names` | off | Use `holodeck::N` names instead of encoded truth |
@@ -123,7 +123,7 @@ Real references contain a mix of `A`/`C`/`G`/`T`, large stretches of `N` (assemb
 
    The RNG used for this normalization is seeded deterministically from `--seed` plus the contig name, so two runs with the same seed produce byte-identical outputs even when the reference has ambiguous positions.
 
-2. **Read rejection at sampling time.** Each generated read counts how many of its bases are lowercase (i.e. came from ambiguous positions). If either R1 or R2 has a lowercase fraction above `--max-n-frac` (default `0.5`), the pair is rejected and resampled. Accepted reads are upper-cased in place before the error model runs, so emitted FASTQ and BAM contain only `A`/`C`/`G`/`T` (plus a rare `N` when the configured adapter is shorter than the bases needed past the insert — a separate, pre-existing behavior of the adapter-padding code).
+2. **Read rejection at sampling time.** Each generated read counts how many of its bases are lowercase (i.e. came from ambiguous positions). If either R1 or R2 has a lowercase fraction above `--max-n-frac` (default `0.02`), the pair is rejected and resampled. Accepted reads are upper-cased in place before the error model runs, so emitted FASTQ and BAM contain only `A`/`C`/`G`/`T` (plus a rare `N` when the configured adapter is shorter than the bases needed past the insert — a separate, pre-existing behavior of the adapter-padding code).
 
    Set `--max-n-frac 1.0` to disable the filter (accept reads from any region). Set `--max-n-frac 0.0` to require every base in every read to come from an unambiguous reference position.
 
