@@ -1,6 +1,6 @@
 [package]
 name = "holodeck"
-version = "0.2.0"
+version = "0.2.1"
 authors = ["Tim Fennell <tim@fulcrumgenomics.com>"]
 description = "Modern NGS read simulator"
 repository = "https://github.com/fulcrumgenomics/holodeck"
