@@ -112,7 +112,7 @@ pub struct Simulate {
     /// resampled. Setting this to `1.0` disables the filter; setting it to
     /// `0.0` requires every base to come from an unambiguous reference
     /// position. Value must be in `[0.0, 1.0]`.
-    #[arg(long, default_value_t = 0.5, value_name = "FLOAT")]
+    #[arg(long, default_value_t = 0.02, value_name = "FLOAT")]
     pub max_n_frac: f64,
 
     /// Write a ground-truth BAM file with correct alignments.
