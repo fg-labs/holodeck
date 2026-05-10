@@ -148,6 +148,32 @@ Real references contain a mix of `A`/`C`/`G`/`T`, large stretches of `N` (assemb
 
 **Known limitation:** requested `--coverage` is computed from raw contig/BED lengths, not from the non-ambiguous territory. For a reference like hs38DH (~5% N), rejection is noise and coverage lands where you'd expect. For simulations targeted at heavily-N contigs (or with `--max-n-frac 0.0` in N-dense regions), effective coverage will be slightly below the requested value; a warning is logged if the resampling budget is exhausted.
 
+### Golden BAM
+
+Pass `--golden-bam` to write a perfect-truth BAM alongside the FASTQ output. Every record carries the alignment the simulator generated it from — contig, position, strand, CIGAR — at MAPQ 60, in unsorted (generation) order. Sort downstream if a coordinate-sorted BAM is needed.
+
+The same truth coordinates are also encoded in the FASTQ read names (see [Read Name Format](#read-name-format)), so the golden BAM is optional for evaluation. It exists to plug holodeck output directly into BAM-consuming tooling (samtools, IGV, methylation extractors) without re-aligning.
+
+#### Header
+
+| Line | Fields | Notes |
+| ---  | ---    | --- |
+| `@SQ` | `SN` (contig name), `LN` (length) | One per contig in the reference, in dictionary order. |
+| `@PG` | `ID:holodeck`, `PN:holodeck`, `VN:<crate version>`, `CL:<full command line>` | Single entry. `CL` records the verbatim invocation for reproducibility. |
+| `@RG` | `ID:A`, `SM:<sample>`, `LB:<sample>`, `PL:ILLUMINA` | Single entry; every record's `RG:Z` tag points to `ID:A`. `PL` is hard-coded to `ILLUMINA` (the only error model holodeck ships). `SM` and `LB` are both set to the sample name — taken from the VCF when `--vcf` is set (use `--sample` to disambiguate multi-sample VCFs), otherwise defaulting to `holodeck-simulation`. |
+
+#### Per-record tags
+
+| Tag | Type | Description |
+| --- | ---  | --- |
+| `RG:Z` | string | Read-group identifier; always `A`. Ties the record to the single `@RG` header entry. |
+| `hp:i` | integer | 0-based haplotype index the read was sampled from. `0` for haploid contigs and the first haplotype of polyploid contigs; `1` for the second haplotype, etc. Useful for restricting evaluation to a single haplotype, or for measuring allele-specific behaviour. |
+| `ne:i` | integer | Number of substituted bases the simulator injected into the record. Holodeck's error model is substitution-only (no indels), so this is a per-base substitution count. Lets you stratify alignment-accuracy or methylation-call evaluation by per-read error load without re-running with `--max-error-rate 0`. |
+
+`SEQ` and `QUAL` are stored in reference (forward-strand) orientation, with the `REVERSE_COMPLEMENTED` flag set for reverse-strand records — i.e. the BAM convention, not the FASTQ orientation.
+
+When `--methylation-mode` is also set, an additional seven methylation tags are emitted per record. See [Methylation simulation → Interpreting the methylation-simulated golden BAM](#interpreting-the-methylation-simulated-golden-bam) for the tag set.
+
 ### Methylation simulation
 
 Holodeck models methylation biology and sequencing chemistry as two independent, composable steps.
