@@ -50,6 +50,11 @@ pub struct Fragment {
     pub ref_positions: Vec<u32>,
     /// 0-based reference start position of the fragment.
     pub ref_start: u32,
+    /// 0-based haplotype-coordinate start position of the fragment. Differs
+    /// from `ref_start` when there are upstream insertions or deletions on
+    /// this haplotype. Used by per-haplotype methylation lookups so that
+    /// indel-shifted CpG sites get the correct chemistry.
+    pub hap_start: u32,
     /// Whether the fragment is on the forward strand.
     pub is_forward: bool,
     /// Index of the haplotype this fragment came from.
@@ -75,13 +80,14 @@ pub fn extract_fragment(
     fragment_len: usize,
     is_forward: bool,
 ) -> Fragment {
-    let (bases, ref_positions, _hap_start) =
+    let (bases, ref_positions, hap_start) =
         haplotype.extract_fragment(reference, ref_start, fragment_len);
 
     Fragment {
         bases,
         ref_positions,
         ref_start,
+        hap_start,
         is_forward,
         haplotype_index: haplotype.allele_index(),
     }

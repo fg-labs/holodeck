@@ -365,6 +365,60 @@ pub fn pileup_bases(bam_path: &Path) -> Vec<Vec<PileupColumn>> {
 
 // ── Command runners ─────────────────────────────────────────────────────────
 
+/// Run `holodeck methylate --reference <ref> --methylation-rate <rate>
+/// --output <vcf> --seed <seed>` and return the path to the written VCF.
+///
+/// The returned path ends in `.vcf.gz` and is placed inside the provided
+/// [`TestEnv`]'s temporary directory under `vcf_name`.
+///
+/// # Panics
+/// Panics if the `methylate` subcommand exits with a non-zero status.
+pub fn methylate_to_vcf(
+    env: &TestEnv,
+    reference: &std::path::Path,
+    rate: f64,
+    seed: u64,
+    vcf_name: &str,
+) -> std::path::PathBuf {
+    methylate_to_vcf_with_variants(env, reference, None, rate, seed, vcf_name)
+}
+
+/// Run `holodeck methylate` with an optional variants VCF.
+///
+/// When `variants_vcf` is `Some`, passes `--vcf <path>` so that
+/// haplotype-specific CpGs created or destroyed by variants are captured.
+///
+/// # Panics
+/// Panics if the `methylate` subcommand exits with a non-zero status.
+pub fn methylate_to_vcf_with_variants(
+    env: &TestEnv,
+    reference: &std::path::Path,
+    variants_vcf: Option<&std::path::Path>,
+    rate: f64,
+    seed: u64,
+    vcf_name: &str,
+) -> std::path::PathBuf {
+    let vcf_path = env.dir.path().join(vcf_name);
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_holodeck"));
+    cmd.args([
+        "methylate",
+        "--reference",
+        reference.to_str().unwrap(),
+        "--output",
+        vcf_path.to_str().unwrap(),
+        "--methylation-rate",
+        &rate.to_string(),
+        "--seed",
+        &seed.to_string(),
+    ]);
+    if let Some(vcf) = variants_vcf {
+        cmd.args(["--vcf", vcf.to_str().unwrap()]);
+    }
+    let status = cmd.status().expect("methylate subprocess failed to launch");
+    assert!(status.success(), "holodeck methylate exited {status:?}");
+    vcf_path
+}
+
 /// Run `holodeck simulate` with the given arguments and return
 /// `(success, stdout, stderr)`.
 pub fn run_simulate(args: &[&str]) -> (bool, String, String) {

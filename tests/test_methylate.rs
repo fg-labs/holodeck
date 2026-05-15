@@ -64,6 +64,104 @@ fn methylate_produces_loadable_vcf_with_mt_mb() {
     );
 }
 
+/// End-to-end pipeline test: `methylate` → `simulate` propagates methylation
+/// truth into the golden BAM's `YM:Z` tag.
+///
+/// Reference: a 1 kb ACGT-repeat contig where every C is in a CpG context.
+/// Pipeline:
+///   1. `holodeck methylate --methylation-rate 1.0` → `meth.vcf.gz`
+///      (all CpGs unconditionally methylated on both haplotypes)
+///   2. `holodeck simulate --vcf meth.vcf.gz --methylation-mode em-seq
+///        --methylation-conversion-rate 0.0 --golden-bam`
+///      (VCF has MT/MB → loader path; zero conversion so no C→T noise)
+///   3. Parse the golden BAM. For every record, assert that every CpG C in
+///      the `YM:Z` truth tag is `'Z'` (methylated) and no non-CpG C appears
+///      as methylated.
+#[test]
+fn methylate_then_simulate_propagates_methylation_to_golden_bam() {
+    use noodles::sam::alignment::record::data::field::Tag as DataTag;
+    use noodles::sam::alignment::record_buf::data::field::Value as DataValue;
+
+    // 1. Build a 1 kb reference where every C is in CpG context.
+    let seq = b"ACGT".repeat(250); // 1000 bp
+    let env = TestEnv::new(&[("chr1", &seq)]);
+    let meth_vcf = env.dir.path().join("meth.vcf.gz");
+    let out = env.dir.path().join("sim");
+
+    // 2. Run `holodeck methylate` to produce a methylated VCF.
+    let (ok, _, stderr) = run_methylate(&[
+        "methylate",
+        "--reference",
+        env.fasta_path.to_str().unwrap(),
+        "--output",
+        meth_vcf.to_str().unwrap(),
+        "--methylation-rate",
+        "1.0",
+        "--seed",
+        "42",
+    ]);
+    assert!(ok, "methylate failed: {stderr}");
+    assert!(meth_vcf.exists(), "methylate did not produce output VCF");
+
+    // 3. Run `holodeck simulate` with the methylated VCF, using the MT/MB
+    //    loading path. Zero conversion rate keeps all CpG C's unconverted so
+    //    the YM tag directly reflects the methylation truth. Zero error rate
+    //    eliminates sequencing noise.
+    let (ok, _, stderr) = helpers::run_simulate(&[
+        "simulate",
+        "--reference",
+        env.fasta_path.to_str().unwrap(),
+        "--vcf",
+        meth_vcf.to_str().unwrap(),
+        "--output",
+        out.to_str().unwrap(),
+        "--coverage",
+        "5",
+        "--read-length",
+        "50",
+        "--fragment-mean",
+        "100",
+        "--fragment-stddev",
+        "10",
+        "--min-error-rate",
+        "0",
+        "--max-error-rate",
+        "0",
+        "--methylation-mode",
+        "em-seq",
+        "--methylation-conversion-rate",
+        "0.0",
+        "--golden-bam",
+        "--threads",
+        "1",
+    ]);
+    assert!(ok, "simulate failed: {stderr}");
+
+    // 4. Open the golden BAM and assert that every CpG in YM is 'Z'.
+    let bam_path = out.with_extension("golden.bam");
+    let records = helpers::read_bam_records(&bam_path);
+    assert!(!records.is_empty(), "golden BAM must have records");
+
+    let ym_tag = DataTag::new(b'Y', b'M');
+
+    for rec in &records {
+        let DataValue::String(ym) =
+            rec.data().get(&ym_tag).expect("YM:Z tag must be present in golden BAM record")
+        else {
+            panic!("YM must be a String value");
+        };
+        let ym_bytes: &[u8] = ym.as_ref();
+        let has_z = ym_bytes.contains(&b'Z');
+        assert!(has_z, "expected at least one methylated CpG (Z) in YM tag");
+        let has_lowercase_z = ym_bytes.contains(&b'z');
+        assert!(
+            !has_lowercase_z,
+            "unexpected unmethylated CpG (z) in YM tag under 100% methylation-rate; YM={}",
+            std::str::from_utf8(ym_bytes).unwrap_or("?")
+        );
+    }
+}
+
 #[test]
 fn methylate_writes_bedgraph_when_requested() {
     // Reference ACGTACG has two CpGs: top-C at ref positions 1 and 5.

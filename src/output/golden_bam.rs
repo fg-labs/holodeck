@@ -24,6 +24,7 @@ use noodles::sam::header::record::value::map::program::tag as pg_tag;
 use noodles::sam::header::record::value::map::read_group::tag as rg_tag;
 use noodles::sam::header::record::value::map::{Program, ReadGroup, ReferenceSequence};
 
+use crate::meth::{MethylationAnnotation, MethylationRecordTags};
 use crate::read::ReadPair;
 use crate::read_naming::TruthAlignment;
 use crate::sequence_dict::SequenceDictionary;
@@ -116,6 +117,9 @@ impl GoldenBamWriter {
         let r1_truth = &pair.r1_truth;
         let r1_contig_idx = self.resolve_contig_index(&r1_truth.contig);
 
+        let r1_tags = pair.methylation.as_ref().and_then(MethylationAnnotation::r1_tags);
+        let r2_tags = pair.methylation.as_ref().and_then(MethylationAnnotation::r2_tags);
+
         if let (Some(r2_truth), Some(r2), Some(r2_cigar)) =
             (&pair.r2_truth, &pair.read2, &pair.r2_cigar)
         {
@@ -131,6 +135,7 @@ impl GoldenBamWriter {
                 r2_contig_idx,
                 Some(r2_truth.position),
                 &pair.r1_cigar,
+                r1_tags.as_ref(),
             );
             self.writer.write_alignment_record(&self.header, &r1_record)?;
 
@@ -144,6 +149,7 @@ impl GoldenBamWriter {
                 r1_contig_idx,
                 Some(r1_truth.position),
                 r2_cigar,
+                r2_tags.as_ref(),
             );
             self.writer.write_alignment_record(&self.header, &r2_record)?;
         } else {
@@ -157,6 +163,7 @@ impl GoldenBamWriter {
                 None,
                 None,
                 &pair.r1_cigar,
+                r1_tags.as_ref(),
             );
             self.writer.write_alignment_record(&self.header, &r1_record)?;
         }
@@ -227,9 +234,11 @@ fn build_record(
     mate_contig_idx: Option<usize>,
     mate_position: Option<u32>,
     cigar: &Cigar,
+    methylation: Option<&MethylationRecordTags<'_>>,
 ) -> RecordBuf {
     // Normalise to reference orientation when the read is reverse-complemented.
-    let (seq, quals): (Vec<u8>, Vec<u8>) = if flags.is_reverse_complemented() {
+    let is_rc = flags.is_reverse_complemented();
+    let (seq, quals): (Vec<u8>, Vec<u8>) = if is_rc {
         let mut rc_bases = bases.to_vec();
         crate::fragment::reverse_complement(&mut rc_bases);
         let rev_quals: Vec<u8> = qualities.iter().rev().map(|&q| q.saturating_sub(33)).collect();
@@ -278,6 +287,57 @@ fn build_record(
     #[expect(clippy::cast_possible_wrap, reason = "error count is small")]
     let ne_val = truth.n_errors as i32;
     data.insert(DataTag::new(b'n', b'e'), DataValue::from(ne_val));
+
+    if let Some(mt) = methylation {
+        // XG:Z (Bismark) -- genome-strand indicator. `CT` for reads
+        // derived from the top genome strand (OT/CTOT in Bismark's
+        // four-strand model), `GA` for the bottom (OB/CTOB). Fragment-
+        // level: R1 and R2 of a pair share the value. Identical for
+        // em-seq and TAPS -- the chemistry's *biological* meaning of an
+        // observed C→T differs between modes, but the genome-strand
+        // indicator does not.
+        let strand_tag = mt.conversion_type.as_tag_str();
+        data.insert(DataTag::new(b'X', b'G'), DataValue::from(strand_tag));
+        // XR:Z (Bismark) -- read-conversion direction in the read's
+        // own orientation. Under a directional library the read shows
+        // a C→T conversion pattern when read 5'→3' if it is R1 (or SE),
+        // and a G→A pattern if it is R2 (which is the PCR-synthesized
+        // complement of the source strand). So `XR:Z:CT` for R1/SE and
+        // `XR:Z:GA` for R2, regardless of XG.
+        let xr_tag = if flags.is_segmented() && flags.is_last_segment() { "GA" } else { "CT" };
+        data.insert(DataTag::new(b'X', b'R'), DataValue::from(xr_tag));
+
+        // XM:Z, YM:Z, NM:i, MD:Z (Bismark-style call tags) -- emitted
+        // only when the simulator computed them (which it does when
+        // both methylation chemistry and a golden BAM are requested).
+        if let Some(call) = mt.call_tags {
+            // XM and YM are stored in genomic orientation alongside SEQ.
+            let xm_str = std::str::from_utf8(&call.xm).expect("XM is ASCII");
+            data.insert(DataTag::new(b'X', b'M'), DataValue::from(xm_str));
+            let ym_str = std::str::from_utf8(&call.ym).expect("YM is ASCII");
+            data.insert(DataTag::new(b'Y', b'M'), DataValue::from(ym_str));
+            #[expect(clippy::cast_possible_wrap, reason = "edit distance fits in i32")]
+            let edit_distance = call.nm as i32;
+            data.insert(DataTag::new(b'N', b'M'), DataValue::from(edit_distance));
+            data.insert(DataTag::new(b'M', b'D'), DataValue::from(call.md.as_str()));
+        }
+        // YS:Z must be reference-oriented to match the SEQ field. The
+        // captured pre-conversion bases are in read 5'->3' (FASTQ)
+        // orientation; reverse-complement when the record is reverse.
+        let ys_bytes: Vec<u8> = if is_rc {
+            let mut tmp = mt.pre_conversion_bases.to_vec();
+            crate::fragment::reverse_complement(&mut tmp);
+            tmp
+        } else {
+            mt.pre_conversion_bases.to_vec()
+        };
+        // Pre-conversion bases are valid ASCII (uppercased ACGTN) so the
+        // UTF-8 conversion is infallible, and DataValue::from(&str) yields
+        // a String-typed BAM tag.
+        let ys_str = std::str::from_utf8(&ys_bytes).expect("pre-conversion bases are valid ASCII");
+        data.insert(DataTag::new(b'Y', b'S'), DataValue::from(ys_str));
+    }
+
     builder = builder.set_data(data);
 
     builder.build()
