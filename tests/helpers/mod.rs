@@ -528,6 +528,17 @@ pub fn write_bam(path: &Path, contigs: &[(&str, usize)], records: &[BamRecordSpe
 
 // ── Misc helpers ────────────────────────────────────────────────────────────
 
+/// Read all alignment records from a BAM file. Used by integration tests
+/// that need to inspect record-level data (tags, flags, sequences).
+///
+/// # Panics
+/// Panics on any I/O or decode error -- appropriate for tests.
+pub fn read_bam_records(bam_path: &Path) -> Vec<RecordBuf> {
+    let mut reader = bam::io::reader::Builder.build_from_path(bam_path).unwrap();
+    let header = reader.read_header().unwrap();
+    reader.record_bufs(&header).map(|r| r.unwrap()).collect()
+}
+
 /// Read a gzipped file and return its contents as a string.
 pub fn read_gzipped(path: &Path) -> String {
     use std::io::Read;

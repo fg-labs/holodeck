@@ -1,0 +1,292 @@
+//! End-to-end tests for the `methylate` subcommand.
+
+mod helpers;
+
+use helpers::TestEnv;
+
+#[test]
+fn methylate_command_runs_on_empty_reference() {
+    // Build a tiny reference with a few CpGs (ACGT repeat gives C in CpG context).
+    let seq = b"ACGTACGT".to_vec();
+    let env = TestEnv::new(&[("chr1", &seq)]);
+    let out_path = env.dir.path().join("methylated.vcf.gz");
+
+    let (ok, _, stderr) = run_methylate(&[
+        "methylate",
+        "--reference",
+        env.fasta_path.to_str().unwrap(),
+        "--output",
+        out_path.to_str().unwrap(),
+        "--methylation-rate",
+        "1.0",
+        "--seed",
+        "42",
+    ]);
+    assert!(ok, "methylate exited with non-zero status: {stderr}");
+    assert!(out_path.exists(), "output file was not created");
+}
+
+#[test]
+fn methylate_produces_loadable_vcf_with_mt_mb() {
+    // Two CpGs at top-C positions 1 and 5 on a single contig (ACGTACG has
+    // CG at offsets 1–2 and 5–6).
+    let seq = b"ACGTACG".to_vec();
+    let env = TestEnv::new(&[("chr1", &seq)]);
+    let out_path = env.dir.path().join("methylated.vcf.gz");
+
+    let (ok, _, stderr) = run_methylate(&[
+        "methylate",
+        "--reference",
+        env.fasta_path.to_str().unwrap(),
+        "--output",
+        out_path.to_str().unwrap(),
+        "--methylation-rate",
+        "1.0",
+        "--seed",
+        "42",
+    ]);
+    assert!(ok, "methylate exited with non-zero status: {stderr}");
+
+    // Read the BGZF-compressed VCF as raw text and check the header.
+    let raw_text = helpers::read_gzipped(&out_path);
+    assert!(raw_text.contains("##FORMAT=<ID=MT,"), "missing MT FORMAT header in:\n{raw_text}");
+    assert!(raw_text.contains("##FORMAT=<ID=MB,"), "missing MB FORMAT header in:\n{raw_text}");
+
+    // Count data lines (non-header lines).
+    let data_lines: Vec<&str> = raw_text.lines().filter(|l| !l.starts_with('#')).collect();
+    // ACGTACG has CpGs at ref positions 1 and 5 → expect 2 standalone records.
+    assert_eq!(
+        data_lines.len(),
+        2,
+        "expected one record per CpG; got {} records:\n{}",
+        data_lines.len(),
+        data_lines.join("\n")
+    );
+}
+
+#[test]
+fn methylate_writes_bedgraph_when_requested() {
+    // Reference ACGTACG has two CpGs: top-C at ref positions 1 and 5.
+    // With --methylation-rate 1.0 both are fully methylated on both haplotypes.
+    let seq = b"ACGTACG".to_vec();
+    let env = TestEnv::new(&[("chr1", &seq)]);
+    let out_path = env.dir.path().join("meth.vcf.gz");
+    let bg_path = env.dir.path().join("meth.bedgraph");
+
+    let (ok, _, stderr) = run_methylate(&[
+        "methylate",
+        "--reference",
+        env.fasta_path.to_str().unwrap(),
+        "--output",
+        out_path.to_str().unwrap(),
+        "--bedgraph",
+        bg_path.to_str().unwrap(),
+        "--methylation-rate",
+        "1.0",
+        "--seed",
+        "42",
+    ]);
+    assert!(ok, "methylate exited with non-zero status: {stderr}");
+    assert!(bg_path.exists(), "bedgraph file was not created");
+
+    let contents = std::fs::read_to_string(&bg_path).unwrap();
+    assert!(contents.starts_with("track type="), "missing track header: {contents}");
+    // Two CpGs at top-C ref positions 1 and 5, both fully methylated (rate 100).
+    assert!(contents.contains("chr1\t1\t2\t100"), "missing first CpG record: {contents}");
+    assert!(contents.contains("chr1\t5\t6\t100"), "missing second CpG record: {contents}");
+}
+
+#[test]
+fn methylate_rejects_methylation_rate_above_one() {
+    let env = TestEnv::new(&[("chr1", b"ACGT")]);
+    let out_path = env.dir.path().join("meth.vcf.gz");
+    let (ok, _, stderr) = run_methylate(&[
+        "methylate",
+        "--reference",
+        env.fasta_path.to_str().unwrap(),
+        "--output",
+        out_path.to_str().unwrap(),
+        "--methylation-rate",
+        "1.5",
+    ]);
+    assert!(!ok, "methylate should reject rate > 1.0");
+    assert!(
+        stderr.contains("--methylation-rate must be in [0.0, 1.0]"),
+        "stderr did not mention rate range: {stderr}"
+    );
+}
+
+#[test]
+fn methylate_rejects_negative_methylation_rate() {
+    let env = TestEnv::new(&[("chr1", b"ACGT")]);
+    let out_path = env.dir.path().join("meth.vcf.gz");
+    let (ok, _, stderr) = run_methylate(&[
+        "methylate",
+        "--reference",
+        env.fasta_path.to_str().unwrap(),
+        "--output",
+        out_path.to_str().unwrap(),
+        // Use `--flag=value` form so clap doesn't parse `-0.1` as a flag.
+        "--methylation-rate=-0.1",
+    ]);
+    assert!(!ok, "methylate should reject negative rate");
+    assert!(
+        stderr.contains("--methylation-rate must be in [0.0, 1.0]"),
+        "stderr did not mention rate range: {stderr}"
+    );
+}
+
+#[test]
+fn methylate_rejects_sample_without_vcf() {
+    let env = TestEnv::new(&[("chr1", b"ACGT")]);
+    let out_path = env.dir.path().join("meth.vcf.gz");
+    let (ok, _, stderr) = run_methylate(&[
+        "methylate",
+        "--reference",
+        env.fasta_path.to_str().unwrap(),
+        "--output",
+        out_path.to_str().unwrap(),
+        "--sample",
+        "NA12878",
+    ]);
+    assert!(!ok, "methylate should reject --sample without --vcf");
+    assert!(
+        stderr.contains("--sample requires --vcf"),
+        "stderr did not mention --sample requires --vcf: {stderr}"
+    );
+}
+
+#[test]
+fn methylate_rejects_nonfinite_methylation_rate() {
+    let env = TestEnv::new(&[("chr1", b"ACGT")]);
+    let out_path = env.dir.path().join("meth.vcf.gz");
+    let (ok, _, stderr) = run_methylate(&[
+        "methylate",
+        "--reference",
+        env.fasta_path.to_str().unwrap(),
+        "--output",
+        out_path.to_str().unwrap(),
+        "--methylation-rate",
+        "nan",
+    ]);
+    assert!(!ok, "methylate should reject NaN rate");
+    assert!(
+        stderr.contains("--methylation-rate must be in [0.0, 1.0]"),
+        "stderr did not mention rate range: {stderr}"
+    );
+}
+
+#[test]
+fn methylate_seed_determinism() {
+    // Same --seed should produce byte-identical output across runs.
+    let seq = b"ACGTACGTACGTACGT".to_vec();
+    let env = TestEnv::new(&[("chr1", &seq)]);
+    let out_a = env.dir.path().join("a.vcf.gz");
+    let out_b = env.dir.path().join("b.vcf.gz");
+
+    for out in [&out_a, &out_b] {
+        let (ok, _, stderr) = run_methylate(&[
+            "methylate",
+            "--reference",
+            env.fasta_path.to_str().unwrap(),
+            "--output",
+            out.to_str().unwrap(),
+            "--methylation-rate",
+            "0.5",
+            "--seed",
+            "42",
+        ]);
+        assert!(ok, "methylate failed: {stderr}");
+    }
+
+    // Compare decompressed contents so any BGZF block-boundary differences
+    // (which are immaterial to VCF semantics) don't fail the test.
+    let bytes_a = decompress_vcf(&out_a);
+    let bytes_b = decompress_vcf(&out_b);
+    // Strip the ##holodeckCommand line, which embeds the output path
+    // (different across the two runs).
+    let a = strip_command_line(&bytes_a);
+    let b = strip_command_line(&bytes_b);
+    assert_eq!(a, b, "same seed produced different VCF bodies");
+}
+
+#[test]
+fn methylate_applies_variants_from_input_vcf() {
+    // Input variant VCF has one SNP. methylate's output should preserve the
+    // variant record (with GT) and emit standalone methylation records at
+    // every reference CpG outside the variant span.
+    let seq = b"ACGTACG".to_vec(); // CpGs at top-C ref pos 1 and 5
+    let env = TestEnv::new(&[("chr1", &seq)]);
+    let variants = vec![helpers::VcfVariant {
+        chrom: "chr1",
+        pos_1based: 3, // ref T -> alt A; no CpG impact
+        ref_allele: "T",
+        alt_alleles: &["A"],
+        gt: "1|0",
+    }];
+    let vcf_in = env.write_vcf("SAMPLE", &[("chr1", seq.len())], &variants);
+    let out_path = env.dir.path().join("meth.vcf.gz");
+
+    let (ok, _, stderr) = run_methylate(&[
+        "methylate",
+        "--reference",
+        env.fasta_path.to_str().unwrap(),
+        "--vcf",
+        vcf_in.to_str().unwrap(),
+        "--output",
+        out_path.to_str().unwrap(),
+        "--methylation-rate",
+        "1.0",
+        "--seed",
+        "42",
+    ]);
+    assert!(ok, "methylate failed: {stderr}");
+
+    let text = decompress_vcf(&out_path);
+    // The variant record should appear with GT:MT:MB.
+    assert!(
+        text.lines().any(|l| l.starts_with("chr1\t3\t.\tT\tA") && l.contains("GT:MT:MB")),
+        "variant record not preserved in methylate output:\n{text}"
+    );
+    // Standalone CpG records should appear at POS 2 (top-C pos 1, 0-based -> 2, 1-based)
+    // and POS 6 (top-C pos 5 -> 6, 1-based), with MT:MB (no GT).
+    assert!(
+        text.lines().any(|l| l.starts_with("chr1\t2\t.\tC\t.") && l.contains("MT:MB")),
+        "standalone CpG at POS 2 missing:\n{text}"
+    );
+    assert!(
+        text.lines().any(|l| l.starts_with("chr1\t6\t.\tC\t.") && l.contains("MT:MB")),
+        "standalone CpG at POS 6 missing:\n{text}"
+    );
+}
+
+// ── Command runner ───────────────────────────────────────────────────────────
+
+/// Run `holodeck methylate` with the given arguments and return
+/// `(success, stdout, stderr)`.
+fn run_methylate(args: &[&str]) -> (bool, String, String) {
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_holodeck"))
+        .args(args)
+        .output()
+        .expect("Failed to run holodeck");
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    (output.status.success(), stdout, stderr)
+}
+
+/// Decompress a BGZF-compressed VCF into a String. The methylate command
+/// always writes its output as BGZF; tests that need to inspect the text
+/// use this helper.
+fn decompress_vcf(path: &std::path::Path) -> String {
+    use std::io::Read as _;
+    let file = std::fs::File::open(path).expect("open VCF");
+    let mut text = String::new();
+    flate2::read::MultiGzDecoder::new(file).read_to_string(&mut text).expect("decompress VCF");
+    text
+}
+
+/// Remove the `##holodeckCommand=...` line so that two runs that differ only
+/// in their output path can be compared for content equivalence.
+fn strip_command_line(text: &str) -> String {
+    text.lines().filter(|l| !l.starts_with("##holodeckCommand=")).collect::<Vec<_>>().join("\n")
+}
