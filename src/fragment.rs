@@ -75,7 +75,8 @@ pub fn extract_fragment(
     fragment_len: usize,
     is_forward: bool,
 ) -> Fragment {
-    let (bases, ref_positions) = haplotype.extract_fragment(reference, ref_start, fragment_len);
+    let (bases, ref_positions, _hap_start) =
+        haplotype.extract_fragment(reference, ref_start, fragment_len);
 
     Fragment {
         bases,

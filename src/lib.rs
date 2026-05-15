@@ -10,6 +10,8 @@ pub mod error_model;
 pub mod fasta;
 pub mod fragment;
 pub mod haplotype;
+pub mod meth;
+pub mod methylation_tags;
 pub mod output;
 pub mod ploidy;
 pub mod read;

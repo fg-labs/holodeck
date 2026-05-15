@@ -1,5 +1,19 @@
-pub mod genotype;
+//! VCF input/output for holodeck.
+//!
+//! Reads variants from a multi-sample VCF (resolving GT against a chosen
+//! sample) for use by `simulate` and `methylate`, and houses the methylation
+//! classifier and `MT`/`MB` FORMAT reader/writer that carries per-haplotype
+//! per-strand CpG methylation truth between the two commands. Submodules:
+//! - [`genotype`] — `Genotype` and `VariantRecord` types plus GT parsing.
+//! - [`methylation`] — per-CpG classifier, `MT`/`MB` writer/reader, and
+//!   header probe.
 
+pub mod genotype;
+/// Per-CpG methylation classifier and MT/MB FORMAT VCF reader/writer used by
+/// the `methylate` subcommand and the methylation-aware `simulate` path.
+pub mod methylation;
+
+use std::collections::HashMap;
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
@@ -9,27 +23,56 @@ use noodles::vcf::variant::record::AlternateBases;
 use crate::sequence_dict::SequenceDictionary;
 use genotype::{Genotype, VariantRecord};
 
-/// Load variant records from a VCF for a given sample and contig.
+/// Result of a single-pass VCF scan: per-contig ALT-bearing variants plus
+/// the sample's ploidy resolved from *unfiltered* genotypes.
+#[derive(Debug, Default)]
+pub struct ParsedVariants {
+    /// ALT-bearing variant records, partitioned by contig name, each sorted
+    /// by position. Homozygous-reference / all-missing records are dropped
+    /// from this map (downstream haplotype construction only needs ALT
+    /// calls) but still counted toward [`Self::sample_ploidy`]. Contigs with
+    /// no ALT-bearing records do not appear; treat a missing key as "no
+    /// variants on that contig".
+    pub by_contig: HashMap<String, Vec<VariantRecord>>,
+    /// Max GT ploidy across every record with a parseable genotype for the
+    /// selected sample — **including** hom-ref / all-missing records that are
+    /// excluded from `by_contig`. Falls back to `2` only when the VCF has no
+    /// genotyped records at all. This is the authoritative MT/MB entry count:
+    /// deriving ploidy from `by_contig` alone would undercount on a sample
+    /// whose only calls on some contig are hom-ref (e.g. a haploid sample
+    /// with a hom-ref-only contig would otherwise fall back to diploid).
+    pub sample_ploidy: usize,
+}
+
+/// Read every variant from a VCF in a single pass and partition by contig.
 ///
-/// Reads all records for `contig_name`, parses the GT field for the selected
-/// sample, and returns a sorted list of [`VariantRecord`]s.  Records where the
-/// sample's genotype is homozygous reference or entirely missing are skipped.
+/// This is the one-pass replacement for the per-contig loader pattern that
+/// re-scanned the entire VCF for every contig. Mirrors
+/// [`crate::vcf::methylation::parse_methylation_vcf`]: read the file once
+/// before the contig loop, then look up per-contig records by name. Trades
+/// I/O for memory — every selected variant is held in the returned map until
+/// the caller drops it — which is the same trade-off the methylation loader
+/// already makes.
+///
+/// Ploidy is captured during this scan *before* the hom-ref/all-missing
+/// filter, so [`ParsedVariants::sample_ploidy`] reflects the true sample
+/// ploidy even on contigs (or whole samples) with no ALT calls.
 ///
 /// # Arguments
-/// * `path` — Path to the VCF file.
-/// * `contig_name` — Name of the contig to load variants for.
-/// * `sample_name` — Sample name, or `None` to use the only sample in the VCF.
-/// * `_dict` — Sequence dictionary (reserved for future validation).
+/// * `path` — Path to the VCF file (plain or BGZF; noodles autodetects).
+/// * `sample_name` — Sample to resolve genotypes for, or `None` to use the
+///   only sample in a single-sample VCF.
+/// * `_dict` — Sequence dictionary (reserved for future cross-validation
+///   against the reference).
 ///
 /// # Errors
-/// Returns an error if the VCF cannot be read, the sample is not found, or GT
-/// fields are missing or malformed.
-pub fn load_variants_for_contig(
+/// Returns an error if the VCF cannot be read, the sample is not found, or a
+/// GT field is malformed.
+pub fn parse_variants_by_contig(
     path: &Path,
-    contig_name: &str,
     sample_name: Option<&str>,
     _dict: &SequenceDictionary,
-) -> Result<Vec<VariantRecord>> {
+) -> Result<ParsedVariants> {
     let mut reader = vcf::io::reader::Builder::default()
         .build_from_path(path)
         .with_context(|| format!("Failed to open VCF: {}", path.display()))?;
@@ -37,19 +80,13 @@ pub fn load_variants_for_contig(
     let header = reader.read_header()?;
     let sample_index = resolve_sample_index(&header, sample_name)?;
 
-    let mut variants = Vec::new();
+    let mut by_contig: HashMap<String, Vec<VariantRecord>> = HashMap::new();
+    // Track ploidy across ALL genotyped records, including hom-ref ones that
+    // are filtered out of `by_contig` below.
+    let mut max_ploidy: Option<usize> = None;
 
-    // TODO: Use tabix-indexed random access to read only the target contig.
-    // Currently reads every record and filters by contig name, which is
-    // O(total_variants) per contig call.
     for result in reader.record_bufs(&header) {
         let record = result.with_context(|| "Failed to read VCF record")?;
-
-        // Filter to the target contig.
-        let chrom = record.reference_sequence_name();
-        if chrom != contig_name {
-            continue;
-        }
 
         // Parse position (VCF is 1-based, convert to 0-based).
         let Some(pos_1based) = record.variant_start() else {
@@ -72,21 +109,34 @@ pub fn load_variants_for_contig(
         let Some(gt_str) = gt_str else {
             continue;
         };
-
         let genotype = Genotype::parse(&gt_str)?;
 
-        // Skip genotypes with no alt alleles (hom-ref, all-missing, etc.).
+        // Record ploidy from the unfiltered GT, BEFORE dropping hom-ref /
+        // all-missing records — those still carry the sample's ploidy.
+        let ploidy = genotype.ploidy();
+        max_ploidy = Some(max_ploidy.map_or(ploidy, |m| m.max(ploidy)));
+
         if !genotype.has_alt() {
             continue;
         }
 
-        variants.push(VariantRecord { position, ref_allele, alt_alleles, genotype });
+        let chrom = record.reference_sequence_name().to_string();
+        by_contig.entry(chrom).or_default().push(VariantRecord {
+            position,
+            ref_allele,
+            alt_alleles,
+            genotype,
+        });
     }
 
-    // Sort by position (should already be sorted in a valid VCF, but ensure).
-    variants.sort_by_key(|v| v.position);
+    // Sort each contig's variants by position. Valid VCFs are already sorted,
+    // but a stray unsorted file would break downstream invariants
+    // (`build_haplotypes`, overlap checks, etc.) silently if we trusted it.
+    for v in by_contig.values_mut() {
+        v.sort_by_key(|vr| vr.position);
+    }
 
-    Ok(variants)
+    Ok(ParsedVariants { by_contig, sample_ploidy: max_ploidy.unwrap_or(2) })
 }
 
 /// Validate that a VCF file has the expected sample configuration and
@@ -196,4 +246,134 @@ fn format_genotype(
 
     let sep = if is_phased { "|" } else { "/" };
     parts.join(sep)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write as _;
+
+    /// Write a temporary plain-text VCF (no BGZF) and return the
+    /// `NamedTempFile` so the caller controls its lifetime.
+    fn write_temp_vcf(body: &str) -> tempfile::NamedTempFile {
+        let mut f = tempfile::Builder::new().suffix(".vcf").tempfile().unwrap();
+        f.write_all(body.as_bytes()).unwrap();
+        f.flush().unwrap();
+        f
+    }
+
+    /// Build a minimal `SequenceDictionary` covering the test contigs.
+    fn dict_for(contigs: &[(&str, usize)]) -> SequenceDictionary {
+        let entries: Vec<_> = contigs
+            .iter()
+            .enumerate()
+            .map(|(i, &(name, len))| {
+                crate::sequence_dict::SequenceMetadata::new(i, name.to_string(), len)
+            })
+            .collect();
+        SequenceDictionary::from_entries(entries)
+    }
+
+    /// Variants on two contigs must be partitioned by contig name, sorted by
+    /// position, and stripped of homozygous-reference / no-alt records. A
+    /// caller that loops over contigs should be able to look up each
+    /// contig's slice in `O(1)` after a single full-file pass.
+    #[test]
+    fn parse_variants_by_contig_partitions_and_sorts() {
+        let vcf = "\
+##fileformat=VCFv4.4
+##contig=<ID=chr1,length=100>
+##contig=<ID=chr2,length=100>
+##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\">
+#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tSAMPLE
+chr1\t30\t.\tA\tT\t.\t.\t.\tGT\t0|1
+chr2\t10\t.\tC\tG\t.\t.\t.\tGT\t1|0
+chr1\t10\t.\tG\tC\t.\t.\t.\tGT\t0|1
+chr1\t50\t.\tT\tA\t.\t.\t.\tGT\t0|0
+chr2\t20\t.\tA\tG\t.\t.\t.\tGT\t0|1
+";
+        let f = write_temp_vcf(vcf);
+        let dict = dict_for(&[("chr1", 100), ("chr2", 100)]);
+        let parsed = parse_variants_by_contig(f.path(), None, &dict).unwrap();
+        let by_contig = &parsed.by_contig;
+
+        // chr1: two records (POS 30 + POS 10), sorted by position. The
+        // hom-ref `0|0` at POS 50 must be dropped.
+        let chr1 = by_contig.get("chr1").expect("chr1 must be present");
+        assert_eq!(chr1.len(), 2, "expected 2 chr1 variants, got {chr1:?}");
+        assert_eq!(chr1[0].position, 9, "first chr1 variant should be POS 10 → 0-based 9");
+        assert_eq!(chr1[1].position, 29, "second chr1 variant should be POS 30 → 0-based 29");
+
+        // chr2: two records, sorted by position.
+        let chr2 = by_contig.get("chr2").expect("chr2 must be present");
+        assert_eq!(chr2.len(), 2, "expected 2 chr2 variants, got {chr2:?}");
+        assert_eq!(chr2[0].position, 9);
+        assert_eq!(chr2[1].position, 19);
+
+        // Diploid sample → ploidy 2 (resolved from the GTs).
+        assert_eq!(parsed.sample_ploidy, 2);
+    }
+
+    /// A VCF with no alt-bearing records on a given contig must produce no
+    /// entry for that contig — callers treat a missing key as "no variants
+    /// here", and an empty-vector value would be equally fine but wastes a
+    /// `HashMap` allocation per absent contig.
+    #[test]
+    fn parse_variants_by_contig_skips_contigs_with_no_alt_records() {
+        let vcf = "\
+##fileformat=VCFv4.4
+##contig=<ID=chr1,length=100>
+##contig=<ID=chr2,length=100>
+##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\">
+#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tSAMPLE
+chr1\t10\t.\tA\tT\t.\t.\t.\tGT\t0|0
+chr2\t10\t.\tC\tG\t.\t.\t.\tGT\t1|0
+";
+        let f = write_temp_vcf(vcf);
+        let dict = dict_for(&[("chr1", 100), ("chr2", 100)]);
+        let parsed = parse_variants_by_contig(f.path(), None, &dict).unwrap();
+        assert!(!parsed.by_contig.contains_key("chr1"), "chr1 should be absent (only hom-ref)");
+        assert_eq!(parsed.by_contig.get("chr2").map(Vec::len), Some(1));
+    }
+
+    /// Sample ploidy must be resolved from *unfiltered* genotypes. A haploid
+    /// sample whose only calls are hom-ref (dropped from `by_contig`) must
+    /// still report ploidy 1 — not the diploid fallback. Before this fix,
+    /// deriving ploidy from the filtered map gave `2` and mis-shaped every
+    /// downstream MT/MB string.
+    #[test]
+    fn parse_variants_by_contig_resolves_haploid_ploidy_from_homref_only_records() {
+        let vcf = "\
+##fileformat=VCFv4.4
+##contig=<ID=chr1,length=100>
+##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\">
+#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tSAMPLE
+chr1\t10\t.\tA\tT\t.\t.\t.\tGT\t0
+chr1\t20\t.\tC\tG\t.\t.\t.\tGT\t0
+";
+        let f = write_temp_vcf(vcf);
+        let dict = dict_for(&[("chr1", 100)]);
+        let parsed = parse_variants_by_contig(f.path(), None, &dict).unwrap();
+        // All records are hom-ref haploid → no ALT-bearing variants…
+        assert!(parsed.by_contig.is_empty(), "no ALT calls → empty map");
+        // …but the sample is unambiguously haploid.
+        assert_eq!(parsed.sample_ploidy, 1, "ploidy must come from unfiltered GTs");
+    }
+
+    /// A genotyped triploid ALT call resolves ploidy 3.
+    #[test]
+    fn parse_variants_by_contig_resolves_triploid_ploidy() {
+        let vcf = "\
+##fileformat=VCFv4.4
+##contig=<ID=chr1,length=100>
+##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\">
+#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tSAMPLE
+chr1\t10\t.\tA\tT\t.\t.\t.\tGT\t0|0|1
+";
+        let f = write_temp_vcf(vcf);
+        let dict = dict_for(&[("chr1", 100)]);
+        let parsed = parse_variants_by_contig(f.path(), None, &dict).unwrap();
+        assert_eq!(parsed.sample_ploidy, 3);
+        assert_eq!(parsed.by_contig.get("chr1").map(Vec::len), Some(1));
+    }
 }
