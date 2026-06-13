@@ -80,7 +80,7 @@ fn main() -> Result<()> {
         .init();
 
     let cmdline = std::env::args().collect::<Vec<_>>().join(" ");
-    log::info!("Holodeck by Fulcrum Genomics - https://www.github.com/fulcrumgenomics/holodeck");
+    log::info!("Holodeck by Fulcrum Genomics - https://github.com/fg-labs/holodeck");
     log::info!("Executing: {cmdline}");
 
     let start = Instant::now();

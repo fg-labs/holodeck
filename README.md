@@ -36,7 +36,7 @@ Simulated reads include ground-truth information encoded in read names, and opti
 Requires Rust 1.94.0 or later.
 
 ```bash
-git clone https://github.com/fulcrumgenomics/holodeck.git
+git clone https://github.com/fg-labs/holodeck.git
 cd holodeck
 cargo build --release
 # Binary is at target/release/holodeck

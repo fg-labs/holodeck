@@ -3,7 +3,7 @@
 ## Getting Started
 
 ```bash
-git clone https://github.com/fulcrumgenomics/holodeck.git
+git clone https://github.com/fg-labs/holodeck.git
 cd holodeck
 cargo build
 cargo ci-test
