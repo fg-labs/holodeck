@@ -365,8 +365,9 @@ pub fn pileup_bases(bam_path: &Path) -> Vec<Vec<PileupColumn>> {
 
 // ── Command runners ─────────────────────────────────────────────────────────
 
-/// Run `holodeck methylate --reference <ref> --methylation-rate <rate>
-/// --output <vcf> --seed <seed>` and return the path to the written VCF.
+/// Run `holodeck methylate` at a uniform methylation `rate` (all three CpG
+/// contexts set equal, no hemimethylation) and return the path to the written
+/// VCF. At rate 1.0/0.0 the output is fully deterministic.
 ///
 /// The returned path ends in `.vcf.gz` and is placed inside the provided
 /// [`TestEnv`]'s temporary directory under `vcf_name`.
@@ -399,6 +400,11 @@ pub fn methylate_to_vcf_with_variants(
     vcf_name: &str,
 ) -> std::path::PathBuf {
     let vcf_path = env.dir.path().join(vcf_name);
+    // Express the test's single `rate` as a uniform model: all three context
+    // rates equal, no hemimethylation. At rate 1.0/0.0 this is fully
+    // deterministic (every / no CpG methylated, symmetric), preserving the
+    // exact assertions of the callers that previously passed --methylation-rate.
+    let rate_str = rate.to_string();
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_holodeck"));
     cmd.args([
         "methylate",
@@ -406,8 +412,23 @@ pub fn methylate_to_vcf_with_variants(
         reference.to_str().unwrap(),
         "--output",
         vcf_path.to_str().unwrap(),
-        "--methylation-rate",
-        &rate.to_string(),
+        "--methylation-rate-island",
+        &rate_str,
+        "--methylation-rate-shore",
+        &rate_str,
+        "--methylation-rate-open-sea",
+        &rate_str,
+        // Tiny correlation lengths make the per-CpG draws effectively
+        // independent, so a uniform `rate` reproduces the old i.i.d. model
+        // these chemistry/truth tests were written against (no spatial runs).
+        "--methylation-correlation-length-island",
+        "1",
+        "--methylation-correlation-length-shore",
+        "1",
+        "--methylation-correlation-length-open-sea",
+        "1",
+        "--hemimethylation-rate",
+        "0",
         "--seed",
         &seed.to_string(),
     ]);

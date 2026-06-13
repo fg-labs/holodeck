@@ -61,7 +61,7 @@ samtools faidx ref.fa
 holodeck mutate -r ref.fa -o mutations.vcf --snp-rate 0.001
 
 # Annotate the VCF with per-haplotype CpG methylation truth
-holodeck methylate -r ref.fa -v mutations.vcf -o methylated.vcf.gz --methylation-rate 0.7 --seed 42
+holodeck methylate -r ref.fa -v mutations.vcf -o methylated.vcf.gz --seed 42
 
 # Simulate 30x paired-end reads with ground-truth BAM
 # (methylation chemistry applies because the input VCF has MT/MB fields from holodeck methylate;
@@ -96,8 +96,9 @@ holodeck simulate -r ref.fa -o output --single-end --min-error-rate 0 --max-erro
 # Custom fragment size distribution and compression threads
 holodeck simulate -r ref.fa -o output --fragment-mean 400 --fragment-stddev 80 -t 8
 
-# Bisulfite/em-seq with 80% methylation (two-step: methylate + simulate)
-holodeck methylate -r ref.fa -o methylated.vcf.gz --methylation-rate 0.8 --seed 42
+# Bisulfite/em-seq (two-step: methylate + simulate). Methylate uses
+# context-aware defaults (islands hypo-, open-sea hyper-methylated).
+holodeck methylate -r ref.fa -o methylated.vcf.gz --seed 42
 holodeck simulate -r ref.fa -v methylated.vcf.gz -o output \
     --methylation-mode em-seq --methylation-conversion-rate 0.99 --golden-bam
 
@@ -174,10 +175,18 @@ Separating biology from chemistry lets you methylate a genome once and then re-s
 | `-r, --reference` | required | Indexed FASTA reference |
 | `-v, --vcf` | none | Input VCF with variants to methylate; methylates the unmodified reference if omitted |
 | `--sample` | none | Sample name to select from a multi-sample input VCF (requires `--vcf`); the selected name is also used for the output sample column. When no VCF sample is in play, the output column is named `METHYLATE` |
-| `--methylation-rate` | 1.0 | Per-CpG per-strand per-haplotype Bernoulli probability of methylation |
+| `--methylation-rate-island` | 0.1 | Target methylation fraction for CpG-island-interior CpGs (hypomethylated) |
+| `--methylation-rate-shore` | 0.5 | Target methylation fraction for island-shore CpGs (within 2 kb of an island) |
+| `--methylation-rate-open-sea` | 0.85 | Target methylation fraction for open-sea CpGs (the hypermethylated bulk) |
+| `--methylation-correlation-length-island` | 1000 | Spatial correlation length (bp) for island CpGs; larger → longer like-methylated runs |
+| `--methylation-correlation-length-shore` | 1000 | Spatial correlation length (bp) for shore CpGs |
+| `--methylation-correlation-length-open-sea` | 1000 | Spatial correlation length (bp) for open-sea CpGs |
+| `--hemimethylation-rate` | 0.01 | Probability a methylated CpG is made hemimethylated (one strand left unmethylated) |
 | `--seed` | auto | Random seed for deterministic methylation draws |
 | `-o, --output` | required | Output BGZF-compressed VCF path |
 | `--bedgraph` | none | Write a MethylDackel-format population-fraction bedGraph from the methylation bitmap |
+
+Methylation is assigned with a context-aware Markov model rather than an independent per-CpG coin flip: each CpG is classified into island / shore / open-sea (detected de novo from the sequence via Gardiner-Garden criteria), and a two-state chain walks the CpG list so that each context's mean methylation matches its target rate while neighbouring CpGs are spatially correlated (runs whose length scales with the correlation length). Methylation is symmetric across strands by default, with a low sporadic hemimethylation rate. For **uniform** methylation with no island structure (e.g. for controlled tests), set the three `--methylation-rate-*` flags equal. Note the no-flags default is now biologically realistic (islands hypo-, open-sea hyper-methylated), **not** fully methylated.
 
 #### MT/MB FORMAT schema
 
@@ -214,7 +223,7 @@ There are two record kinds:
 | `--methylation-failure-rate` | 0.01 | Fraction of molecules that are whole-molecule conversion failures. Requires `--methylation-mode` |
 | `--cpg-truth-bedgraph` | none | Write per-CpG ground-truth methylation tally in MethylDackel `extract` bedGraph format. Requires `--methylation-mode` |
 
-Note: `--methylation-rate` is **not** a `simulate` flag. Methylation truth comes exclusively from the `MT`/`MB` fields in the input VCF produced by `holodeck methylate`.
+Note: the methylation-*rate* flags are **not** `simulate` flags — they live on `holodeck methylate`. At `simulate` time the methylation truth comes exclusively from the `MT`/`MB` fields in the input VCF produced by `holodeck methylate`.
 
 #### Methylation chemistry modes
 
@@ -268,7 +277,7 @@ Both outputs have value: `methylate --bedgraph` validates the methylation assign
 holodeck methylate \
   --reference ref.fa \
   --vcf variants.vcf.gz --sample HG00100 \
-  --methylation-rate 0.7 \
+  --methylation-rate-open-sea 0.7 \
   --seed 42 \
   --output methylated.vcf.gz
 
@@ -367,7 +376,7 @@ Note: `samtools calmd` is **not** a valid validator for the methylation-tagged g
 - **Directional libraries only** — TruSeq Methyl, NEBNext EM-seq, Twist Methyl, KAPA HyperMeth. R2 is simulated as the PCR-synthesized complement of the converted source strand (`revcomp(c2t(top))` for top-strand-derived fragments), matching what bwameth/Bismark expect from `--directional` libraries. Non-directional / PBAT protocols (scBS-seq, sci-MET, single-cell methods) have different strand semantics and are not supported; use Bismark's `--pbat`/`--non_directional` modes for those.
 - **TAPS downstream tooling is non-standard** — Bismark and MethylDackel assume bisulfite chemistry and re-derive methylation calls by treating preserved cytosines as methylated; on a TAPS BAM they will report every CpG with the methylated/unmethylated call inverted. Holodeck's `XM:Z` and `YM:Z` are biology-faithful under both chemistries, but downstream extraction tools must be TAPS-aware (e.g. `asTair`, custom pipelines from the TAPS authors) for the bedGraph output to mean what it says. The Bismark/MethylDackel parity invariants in the previous section apply to em-seq only.
 - **CpG context only** — Non-CpG cytosines (CHG, CHH) are always treated as unmethylated in holodeck's truth model, so `YM:Z` emits lowercase `x` and `h` for CHG/CHH calls. `XM:Z` is observation-derived and may still show uppercase `X`/`H` when the sequenced base remains unconverted. If you need realistic non-CpG methylation (plant genomes, embryonic stem cells), holodeck's truth model does not represent it.
-- **Uniform CpG methylation rate** — `holodeck methylate --methylation-rate` applies to every CpG site equally. Per-position rates (e.g. from a methylation BED) are not supported. Allele- and strand-specific methylation are still possible because the per-haplotype × per-strand draws are independent.
+- **Context-class methylation, not per-position** — `holodeck methylate` assigns methylation from three CpG context classes (island / shore / open-sea) with a spatial-correlation model, not from per-position rates (e.g. an imported methylation BED or beta values). Methylation is symmetric across strands by default with only sporadic hemimethylation; the strands are not modelled as independent. Allele-specific methylation arises because each haplotype is drawn independently.
 - **Variant-driven CpG changes are correctly handled** — SNPs and indels in `--vcf` haplotypes pass through the per-haplotype methylation table by construction. SNPs that create or destroy a CpG, and indels that shift CpG positions, all get the correct chemistry on the appropriate haplotype. (This is a feature, listed here for completeness.)
 - **`MD:Z` and `NM:i` are emitted only with `--methylation-mode`** — Without methylation chemistry, holodeck's golden BAM does not emit `NM`/`MD` at all. `samtools calmd` will fill them in with standard semantics if you need them on a non-methylation run.
 
