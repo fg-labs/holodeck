@@ -173,12 +173,12 @@ The same truth coordinates are also encoded in the FASTQ read names (see [Read N
 | Tag | Type | Description |
 | --- | ---  | --- |
 | `RG:Z` | string | Read-group identifier; always `A`. Ties the record to the single `@RG` header entry. |
-| `hp:i` | integer | 0-based haplotype index the read was sampled from. `0` for haploid contigs and the first haplotype of polyploid contigs; `1` for the second haplotype, etc. Useful for restricting evaluation to a single haplotype, or for measuring allele-specific behaviour. |
+| `hp:i` | integer | 0-based haplotype index the read was sampled from. `0` for haploid contigs and the first haplotype of polyploid contigs; `1` for the second haplotype, etc. Useful for restricting evaluation to a single haplotype, or for measuring allele-specific behavior. |
 | `ne:i` | integer | Number of substituted bases the simulator injected into the record. Holodeck's error model is substitution-only (no indels), so this is a per-base substitution count. Lets you stratify alignment-accuracy or methylation-call evaluation by per-read error load without re-running with `--max-error-rate 0`. |
 
 `SEQ` and `QUAL` are stored in reference (forward-strand) orientation, with the `REVERSE_COMPLEMENTED` flag set for reverse-strand records — i.e. the BAM convention, not the FASTQ orientation.
 
-When `--methylation-mode` is also set, an additional seven methylation tags are emitted per record. See [Methylation simulation → Interpreting the methylation-simulated golden BAM](#interpreting-the-methylation-simulated-golden-bam) for the tag set.
+When `--methylation-mode` is also set, an additional eight methylation tags are emitted per record. See [Methylation simulation → Interpreting the methylation-simulated golden BAM](#interpreting-the-methylation-simulated-golden-bam) for the tag set.
 
 ### Methylation simulation
 
