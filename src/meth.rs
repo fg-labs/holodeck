@@ -48,24 +48,24 @@ use bitvec::vec::BitVec;
 
 /// Default target methylation fraction for CpG-island-interior CpGs.
 /// Islands are characteristically hypomethylated. See [`MethylationModel`].
-pub const DEFAULT_ISLAND_RATE: f64 = 0.1;
+pub(crate) const DEFAULT_ISLAND_RATE: f64 = 0.1;
 
 /// Default target methylation fraction for CpG-island-shore CpGs
 /// (intermediate). See [`MethylationModel`].
-pub const DEFAULT_SHORE_RATE: f64 = 0.5;
+pub(crate) const DEFAULT_SHORE_RATE: f64 = 0.5;
 
 /// Default target methylation fraction for open-sea CpGs (hypermethylated;
 /// the bulk genomic default). See [`MethylationModel`].
-pub const DEFAULT_OPEN_SEA_RATE: f64 = 0.85;
+pub(crate) const DEFAULT_OPEN_SEA_RATE: f64 = 0.85;
 
 /// Default spatial correlation length (bp) for every context. Sets how far
 /// methylation state persists between consecutive CpGs. See
 /// [`ContextParams::correlation_length_bp`].
-pub const DEFAULT_CORRELATION_LENGTH_BP: f64 = 1000.0;
+pub(crate) const DEFAULT_CORRELATION_LENGTH_BP: f64 = 1000.0;
 
 /// Default sporadic hemimethylation probability. See
 /// [`MethylationModel::hemi_rate`].
-pub const DEFAULT_HEMI_RATE: f64 = 0.01;
+pub(crate) const DEFAULT_HEMI_RATE: f64 = 0.01;
 
 // CpG-island detector thresholds (Gardiner-Garden & Frommer, 1987). Internal
 // constants, not CLI flags: these are the canonical island-calling criteria,
@@ -101,16 +101,16 @@ pub(crate) enum CpgContext {
 /// Per-context methylation parameters: the stationary target rate and the
 /// spatial correlation length.
 #[derive(Debug, Clone, Copy)]
-pub struct ContextParams {
+pub(crate) struct ContextParams {
     /// Stationary target methylation fraction in `[0.0, 1.0]`. Over any large
     /// region of this context the mean methylation converges to this value.
-    pub rate: f64,
+    pub(crate) rate: f64,
     /// Spatial correlation length L (bp). For two consecutive CpGs separated
     /// by `d` bp the second keeps the first's methylation state with
     /// probability `exp(-d / L)`, otherwise it is redrawn from
     /// `Bernoulli(rate)`. Larger L → longer runs of like-methylated CpGs.
     /// Must be finite and `> 0`.
-    pub correlation_length_bp: f64,
+    pub(crate) correlation_length_bp: f64,
 }
 
 /// Resolved per-context methylation model used by the `methylate` generator.
@@ -125,16 +125,16 @@ pub struct ContextParams {
 /// the correlation length. Methylation is symmetric (both strands) by
 /// default; [`Self::hemi_rate`] introduces sporadic per-CpG hemimethylation.
 #[derive(Debug, Clone, Copy)]
-pub struct MethylationModel {
+pub(crate) struct MethylationModel {
     /// Parameters for CpG-island-interior CpGs.
-    pub island: ContextParams,
+    pub(crate) island: ContextParams,
     /// Parameters for island-shore CpGs.
-    pub shore: ContextParams,
+    pub(crate) shore: ContextParams,
     /// Parameters for open-sea CpGs.
-    pub open_sea: ContextParams,
+    pub(crate) open_sea: ContextParams,
     /// Probability that a methylated CpG is made hemimethylated — exactly one
     /// randomly chosen strand is left unmethylated. In `[0.0, 1.0]`.
-    pub hemi_rate: f64,
+    pub(crate) hemi_rate: f64,
 }
 
 impl MethylationModel {
@@ -147,7 +147,7 @@ impl MethylationModel {
     /// # Errors
     ///
     /// Returns an error naming the offending flag if any bound is violated.
-    pub fn validate(&self) -> anyhow::Result<()> {
+    pub(crate) fn validate(&self) -> anyhow::Result<()> {
         for (name, p) in
             [("island", &self.island), ("shore", &self.shore), ("open-sea", &self.open_sea)]
         {
@@ -245,7 +245,7 @@ impl MethylationTable {
     /// rate or non-positive correlation length). The `methylate` CLI validates
     /// the model at startup, but this is a `pub` constructor reachable from
     /// library code, so the invariant is asserted here as defense-in-depth.
-    pub fn from_haplotype(
+    pub(crate) fn from_haplotype(
         haplotype: &crate::haplotype::Haplotype,
         reference: &[u8],
         model: &MethylationModel,
@@ -373,7 +373,7 @@ impl ContigMethylation {
     /// walked independently with the shared `rng`, so allele-specific
     /// methylation arises naturally and the per-contig draw order is
     /// deterministic for a fixed seed.
-    pub fn from_haplotypes(
+    pub(crate) fn from_haplotypes(
         haplotypes: &[crate::haplotype::Haplotype],
         reference: &[u8],
         model: &MethylationModel,
