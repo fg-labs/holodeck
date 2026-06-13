@@ -49,6 +49,13 @@ use bitvec::vec::BitVec;
 /// Per-haplotype methylation state, one bitmap per strand. Bitmaps are
 /// indexed by **haplotype position** (which may differ from reference
 /// position when the haplotype contains indels).
+///
+/// The strand state is stored in [`bitvec::vec::BitVec`] rather than
+/// `Vec<bool>` because the bitmaps are sized to the full materialized
+/// haplotype length — one bit per base, per strand, per haplotype. At
+/// whole-chromosome scale (e.g. ~250 Mb × 2 strands × ploidy) `Vec<bool>`
+/// would cost 8× the memory for the same information; `bitvec` packs it to
+/// one bit each. That density justifies the extra direct dependency.
 #[derive(Debug, Clone)]
 pub struct MethylationTable {
     /// Top-strand methylation bitmap.
@@ -297,6 +304,29 @@ pub struct MethylationConfig<'a> {
     pub failure_rate: f64,
 }
 
+/// Reference CpG positions: the 0-based position of the top-strand `C` in
+/// each `CG` dinucleotide (case-insensitive), returned in ascending order.
+///
+/// Shared by the CpG-truth tally ([`crate::output::cpg_truth`]) and the
+/// MT/MB classifier ([`crate::vcf::methylation`]); both need the identical
+/// scan over an unmodified reference.
+#[must_use]
+pub(crate) fn find_reference_cpgs(reference: &[u8]) -> Vec<u32> {
+    let mut out = Vec::new();
+    if reference.len() < 2 {
+        return out;
+    }
+    for i in 0..reference.len() - 1 {
+        let c0 = reference[i].to_ascii_uppercase();
+        let c1 = reference[i + 1].to_ascii_uppercase();
+        if c0 == b'C' && c1 == b'G' {
+            #[expect(clippy::cast_possible_truncation, reason = "ref position fits u32")]
+            out.push(i as u32);
+        }
+    }
+    out
+}
+
 /// Apply per-base methylation chemistry conversion to read bases in place.
 ///
 /// `bases` are in read 5'->3' orientation (FASTQ orientation). `n_genomic`
@@ -510,6 +540,25 @@ mod tests {
     use super::*;
     use crate::haplotype::build_haplotypes;
     use crate::vcf::genotype::{Genotype, VariantRecord};
+
+    #[test]
+    fn test_find_reference_cpgs_basic() {
+        // Reference "ACGTACG" → CpGs at positions 1 and 5.
+        assert_eq!(find_reference_cpgs(b"ACGTACG"), vec![1, 5]);
+    }
+
+    #[test]
+    fn test_find_reference_cpgs_case_insensitive() {
+        assert_eq!(find_reference_cpgs(b"acgTaCg"), vec![1, 5]);
+    }
+
+    #[test]
+    fn test_find_reference_cpgs_empty_and_short() {
+        assert!(find_reference_cpgs(b"").is_empty());
+        assert!(find_reference_cpgs(b"C").is_empty());
+        assert!(find_reference_cpgs(b"AT").is_empty());
+        assert_eq!(find_reference_cpgs(b"CG"), vec![0]);
+    }
 
     /// Build a [`MethylationConfig`] wrapping a single-haplotype
     /// [`ContigMethylation`] for chemistry-only invocation tests. Returns
@@ -1003,6 +1052,29 @@ mod tests {
 
         assert!(!failed, "failure_rate 0.0 must never flag a failure");
         assert_eq!(&bases, b"ATGTATGT", "non-failed molecule at rate 1.0 converts every C");
+    }
+
+    #[test]
+    fn test_zero_genomic_bases_is_noop_but_still_draws_failure() {
+        // A fully-adapter read (n_genomic = 0) must touch no bases. The
+        // negative-strand index math `n_genomic - 1 - i` would underflow if
+        // the per-base loop ran, so this guards that `.take(0)` keeps it out
+        // of the loop. The per-molecule failure draw still happens (it is
+        // independent of base count), so the flag is still reported.
+        let cm = single_hap_cm(MethylationTable::empty(20));
+        let mut bases = b"CCCCCCCC".to_vec();
+        let mut rng = SmallRng::seed_from_u64(42);
+
+        let c = MethylationConfig {
+            contig_methylation: &cm,
+            mode: MethylationMode::EmSeq,
+            conversion_rate: 1.0,
+            failure_rate: 1.0,
+        };
+        let failed = apply_methylation_conversion(&mut bases, 0, true, 10, 0, &c, &mut rng);
+
+        assert!(failed, "failure draw is independent of genomic base count");
+        assert_eq!(&bases, b"CCCCCCCC", "zero genomic bases must leave the buffer untouched");
     }
 
     #[test]

@@ -1440,6 +1440,136 @@ fn test_em_seq_with_vcf_handles_haplotype_specific_cpgs() {
     );
 }
 
+/// True if a `hp:i` tag value (any BAM integer width) equals 1, i.e. the
+/// record was sampled from the variant (second) haplotype.
+fn hp_tag_is_one(value: Option<&DataValue>) -> bool {
+    matches!(
+        value,
+        Some(
+            DataValue::Int8(1)
+                | DataValue::UInt8(1)
+                | DataValue::Int16(1)
+                | DataValue::UInt16(1)
+                | DataValue::Int32(1)
+                | DataValue::UInt32(1)
+        )
+    )
+}
+
+/// TAPS counterpart to `test_em_seq_with_vcf_handles_haplotype_specific_cpgs`:
+/// the same SNP-created CpG, but under TAPS chemistry the methylated C is the
+/// converting class, so at full methylation + full conversion the variant
+/// haplotype's CpG C must be *converted to T* (the inverse of em-seq, which
+/// preserves it). Exercises inverse chemistry through a variant-created CpG —
+/// a path covered for em-seq but not previously for TAPS.
+#[test]
+fn test_taps_with_vcf_converts_methylated_haplotype_specific_cpg() {
+    // Length-200 A/T tract with no CpG; SNP A→C at position 5 (0-based)
+    // creates a CG (reference base at 6 is G) on the variant haplotype only.
+    let mut seq = vec![b'A'; 200];
+    seq[6] = b'G';
+    let env = TestEnv::new(&[("chr1", &seq)]);
+
+    let variants_vcf = env.write_vcf(
+        "sample1",
+        &[("chr1", 200)],
+        &[VcfVariant {
+            chrom: "chr1",
+            pos_1based: 6,
+            ref_allele: "A",
+            alt_alleles: &["C"],
+            gt: "0|1",
+        }],
+    );
+
+    let meth_vcf = methylate_to_vcf_with_variants(
+        &env,
+        &env.fasta_path,
+        Some(&variants_vcf),
+        1.0,
+        42,
+        "meth.vcf.gz",
+    );
+
+    let out = env.output_prefix();
+    let (ok, _, stderr) = run_simulate(&[
+        "simulate",
+        "-r",
+        env.fasta_path.to_str().unwrap(),
+        "-v",
+        meth_vcf.to_str().unwrap(),
+        "-o",
+        out.to_str().unwrap(),
+        "--coverage",
+        "200",
+        "--read-length",
+        "50",
+        "--fragment-mean",
+        "100",
+        "--fragment-stddev",
+        "10",
+        "--min-error-rate",
+        "0",
+        "--max-error-rate",
+        "0",
+        "--methylation-mode",
+        "taps",
+        "--methylation-conversion-rate",
+        "1.0",
+        "--methylation-failure-rate",
+        "0.0",
+        "--golden-bam",
+        "--seed",
+        "42",
+        "--threads",
+        "1",
+    ]);
+    assert!(ok, "simulate failed: {stderr}");
+
+    let records = read_bam_records(&out.with_extension("golden.bam"));
+    assert!(!records.is_empty(), "expected non-empty golden BAM with VCF + methylation");
+
+    let hp_tag = DataTag::new(b'h', b'p');
+    let ys_tag = DataTag::new(b'Y', b'S');
+
+    // Restrict to forward (top-strand) variant-haplotype records covering
+    // position 5 so reference-oriented SEQ maps the top-strand C directly.
+    // Pre-conversion YS must show C (CpG detected); post-conversion SEQ must
+    // show T (the methylated C converted under TAPS).
+    let mut saw_variant_hap_cpg_converted = false;
+    for rec in &records {
+        if rec.flags().is_reverse_complemented() || !hp_tag_is_one(rec.data().get(&hp_tag)) {
+            continue;
+        }
+
+        let Some(start_1based) = rec.alignment_start() else { continue };
+        let start_0based = usize::from(start_1based) - 1;
+        let seq_bytes: Vec<u8> = rec.sequence().as_ref().to_vec();
+        if start_0based > 5 || start_0based + seq_bytes.len() <= 5 {
+            continue;
+        }
+        let offset = 5 - start_0based;
+
+        let DataValue::String(ys) = rec.data().get(&ys_tag).expect("YS:Z must be present") else {
+            panic!("YS must be a String tag");
+        };
+        let ys_slice: &[u8] = ys.as_ref();
+        assert_eq!(
+            ys_slice[offset], b'C',
+            "pre-conversion YS must show the SNP-created CpG C on the variant haplotype"
+        );
+        if seq_bytes[offset] == b'T' {
+            saw_variant_hap_cpg_converted = true;
+            break;
+        }
+    }
+    assert!(
+        saw_variant_hap_cpg_converted,
+        "expected a forward variant-haplotype record where the methylated CpG C was converted to T \
+         under TAPS; inverse-chemistry regression"
+    );
+}
+
 // ── CpG truth bedGraph integration tests ───────────────────────────────────
 
 #[test]

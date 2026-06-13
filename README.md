@@ -118,6 +118,9 @@ holodeck simulate -r ref.fa -v methylated.vcf.gz -o output_taps \
 | `-l, --read-length` | 150 | Read length in bases |
 | `-d, --fragment-mean` | 300 | Mean fragment size |
 | `-s, --fragment-stddev` | 50 | Fragment size standard deviation |
+| `--min-fragment-length` | 20 | Minimum fragment length; sampled lengths below this are clamped up. Must be ≥1 |
+| `--adapter-r1` | TruSeq R1 | Adapter appended to read 1 when the fragment is shorter than the read length |
+| `--adapter-r2` | TruSeq R2 | Adapter appended to read 2 when the fragment is shorter than the read length |
 | `--min-error-rate` | 0.001 | Error rate at start of reads |
 | `--max-error-rate` | 0.01 | Error rate at end of reads |
 | `--max-n-frac` | 0.02 | Reject reads with >this fraction of bases from ambiguous reference positions (see [Ambiguous reference bases](#ambiguous-reference-bases)) |
@@ -126,6 +129,7 @@ holodeck simulate -r ref.fa -v methylated.vcf.gz -o output_taps \
 | `--methylation-failure-rate` | 0.01 | Fraction of molecules that are whole-molecule conversion failures (convert at `1 − conversion-rate`). Requires `--methylation-mode` |
 | `--cpg-truth-bedgraph` | none | Write per-CpG ground-truth methylation tally in MethylDackel `extract` bedGraph format. Requires `--methylation-mode` |
 | `--golden-bam` | off | Write ground-truth BAM |
+| `--golden-vcf` | off | Reserved for a coverage-annotated ground-truth VCF; **not yet implemented** (logs a warning and is otherwise a no-op) |
 | `--single-end` | off | Generate SE instead of PE reads |
 | `--simple-names` | off | Use `holodeck::N` names instead of encoded truth |
 | `--compression` | 1 | BGZF compression level (0-12) |
@@ -169,7 +173,7 @@ Separating biology from chemistry lets you methylate a genome once and then re-s
 |--------|---------|-------------|
 | `-r, --reference` | required | Indexed FASTA reference |
 | `-v, --vcf` | none | Input VCF with variants to methylate; methylates the unmodified reference if omitted |
-| `--sample` | none | Sample name to select from a multi-sample VCF |
+| `--sample` | none | Sample name to select from a multi-sample input VCF (requires `--vcf`); the selected name is also used for the output sample column. When no VCF sample is in play, the output column is named `METHYLATE` |
 | `--methylation-rate` | 1.0 | Per-CpG per-strand per-haplotype Bernoulli probability of methylation |
 | `--seed` | auto | Random seed for deterministic methylation draws |
 | `-o, --output` | required | Output BGZF-compressed VCF path |

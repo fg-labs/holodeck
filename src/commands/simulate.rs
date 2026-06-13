@@ -33,6 +33,14 @@ const DEFAULT_ADAPTER_R1: &str = "AGATCGGAAGAGCACACGTCTGAACTCCAGTCA";
 /// Default Illumina TruSeq adapter sequence for read 2.
 const DEFAULT_ADAPTER_R2: &str = "AGATCGGAAGAGCGTCGTGTAGGGAAAGAGTGT";
 
+/// Default per-cytosine conversion rate for molecules in the converted camp
+/// when `--methylation-mode` is set without `--methylation-conversion-rate`.
+const DEFAULT_CONVERSION_RATE: f64 = 0.999;
+
+/// Default fraction of whole-molecule conversion failures when
+/// `--methylation-mode` is set without `--methylation-failure-rate`.
+const DEFAULT_FAILURE_RATE: f64 = 0.01;
+
 /// Simulate sequencing reads from a reference genome.
 ///
 /// Generates paired-end or single-end FASTQ files with optional ground-truth
@@ -544,9 +552,13 @@ impl Simulate {
             seed_desc.push(':');
             seed_desc.push_str(mode.as_seed_str());
             seed_desc.push(':');
-            seed_desc.push_str(&self.methylation_conversion_rate.unwrap_or(0.999).to_string());
+            seed_desc.push_str(
+                &self.methylation_conversion_rate.unwrap_or(DEFAULT_CONVERSION_RATE).to_string(),
+            );
             seed_desc.push(':');
-            seed_desc.push_str(&self.methylation_failure_rate.unwrap_or(0.01).to_string());
+            seed_desc.push_str(
+                &self.methylation_failure_rate.unwrap_or(DEFAULT_FAILURE_RATE).to_string(),
+            );
         }
         resolve_seed(self.seed.seed, &seed_desc)
     }
@@ -706,15 +718,17 @@ impl Simulate {
             methylation.as_ref().map(|(cm, mode)| crate::meth::MethylationConfig {
                 contig_methylation: cm,
                 mode: *mode,
-                conversion_rate: self.methylation_conversion_rate.unwrap_or(0.999),
-                failure_rate: self.methylation_failure_rate.unwrap_or(0.01),
+                conversion_rate: self
+                    .methylation_conversion_rate
+                    .unwrap_or(DEFAULT_CONVERSION_RATE),
+                failure_rate: self.methylation_failure_rate.unwrap_or(DEFAULT_FAILURE_RATE),
             });
 
         // Precompute reference CpG positions once per contig (only when the
         // CpG truth bedGraph is requested — otherwise we'd waste a scan).
         // The list is reused for every fragment's per-mate tally.
         let ref_cpgs: Vec<u32> = if cpg_truth.is_some() {
-            crate::output::cpg_truth::find_reference_cpgs(&reference)
+            crate::meth::find_reference_cpgs(&reference)
         } else {
             Vec::new()
         };
@@ -1056,6 +1070,38 @@ mod tests {
         assert!(
             msg.contains("--methylation-failure-rate must be in [0.0, 1.0]"),
             "error must mention the valid range, got: {msg}"
+        );
+    }
+
+    /// `--methylation-conversion-rate` outside `[0, 1]` must be rejected with
+    /// the mode set (mirrors the failure-rate guard, which is tested above).
+    #[test]
+    fn test_methylation_conversion_rate_out_of_range_rejected() {
+        let mut sim = make_default_simulate();
+        sim.methylation_mode = Some(crate::meth::MethylationMode::EmSeq);
+        sim.methylation_conversion_rate = Some(1.5);
+        let err = sim
+            .validate()
+            .expect_err("validate must reject --methylation-conversion-rate outside [0, 1]");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("--methylation-conversion-rate must be in [0.0, 1.0]"),
+            "error must mention the valid range, got: {msg}"
+        );
+    }
+
+    /// A non-finite (NaN) `--methylation-conversion-rate` must also be rejected
+    /// by the same range guard — `(0.0..=1.0).contains(&NaN)` is `false`.
+    #[test]
+    fn test_methylation_conversion_rate_nan_rejected() {
+        let mut sim = make_default_simulate();
+        sim.methylation_mode = Some(crate::meth::MethylationMode::EmSeq);
+        sim.methylation_conversion_rate = Some(f64::NAN);
+        let err =
+            sim.validate().expect_err("validate must reject a NaN --methylation-conversion-rate");
+        assert!(
+            format!("{err}").contains("--methylation-conversion-rate must be in [0.0, 1.0]"),
+            "error must mention the valid range"
         );
     }
 

@@ -54,25 +54,6 @@ use crate::haplotype::Haplotype;
 use crate::meth::ContigMethylation;
 use crate::sequence_dict::SequenceDictionary;
 
-/// Reference CpG positions (top-strand C positions where `ref[p..p+2] = CG`,
-/// case-insensitive). Returned sorted ascending.
-#[must_use]
-pub fn find_reference_cpgs(reference: &[u8]) -> Vec<u32> {
-    let mut out = Vec::new();
-    if reference.len() < 2 {
-        return out;
-    }
-    for i in 0..reference.len() - 1 {
-        let c0 = reference[i].to_ascii_uppercase();
-        let c1 = reference[i + 1].to_ascii_uppercase();
-        if c0 == b'C' && c1 == b'G' {
-            #[expect(clippy::cast_possible_truncation, reason = "ref position fits u32")]
-            out.push(i as u32);
-        }
-    }
-    out
-}
-
 /// Per-(contig, top-C reference position) tally of methylated vs unmethylated
 /// calls. Indexed by `(contig_index, ref_pos_of_top_C)`; the implied bedGraph
 /// `end` is `ref_pos + 1` (matches MethylDackel).
@@ -254,25 +235,6 @@ mod tests {
     fn ref_haplotype() -> crate::haplotype::Haplotype {
         let haps = build_haplotypes(&[], 1, &mut SmallRng::seed_from_u64(0));
         haps.into_iter().next().unwrap()
-    }
-
-    #[test]
-    fn test_find_reference_cpgs_basic() {
-        // Reference "ACGTACG" → CpGs at positions 1 and 5.
-        assert_eq!(find_reference_cpgs(b"ACGTACG"), vec![1, 5]);
-    }
-
-    #[test]
-    fn test_find_reference_cpgs_case_insensitive() {
-        assert_eq!(find_reference_cpgs(b"acgTaCg"), vec![1, 5]);
-    }
-
-    #[test]
-    fn test_find_reference_cpgs_empty_and_short() {
-        assert!(find_reference_cpgs(b"").is_empty());
-        assert!(find_reference_cpgs(b"C").is_empty());
-        assert!(find_reference_cpgs(b"AT").is_empty());
-        assert_eq!(find_reference_cpgs(b"CG"), vec![0]);
     }
 
     #[test]

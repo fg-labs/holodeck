@@ -126,7 +126,7 @@ fn classify_cpgs_with_haplotypes(
     // This is O(L) with zero allocations; the haplotype-aware path below
     // allocates per-variant range tables and materializes each haplotype.
     if variants.is_empty() {
-        return Ok(scan_reference_cpgs(reference)
+        return Ok(crate::meth::find_reference_cpgs(reference)
             .into_iter()
             .map(|ref_pos| CpgPlacement::Standalone { ref_pos })
             .collect());
@@ -1449,25 +1449,6 @@ pub fn load_contig_methylation_from_records(
     Ok(Some(cm))
 }
 
-/// Find all reference CpG dinucleotides (case-insensitive) on the top strand.
-/// Returns the 0-indexed position of the top-strand C in each CG pair,
-/// in ascending order.
-fn scan_reference_cpgs(reference: &[u8]) -> Vec<u32> {
-    let mut out = Vec::new();
-    if reference.len() < 2 {
-        return out;
-    }
-    for i in 0..reference.len() - 1 {
-        let c0 = reference[i].to_ascii_uppercase();
-        let c1 = reference[i + 1].to_ascii_uppercase();
-        if c0 == b'C' && c1 == b'G' {
-            #[expect(clippy::cast_possible_truncation, reason = "ref pos fits u32")]
-            out.push(i as u32);
-        }
-    }
-    out
-}
-
 #[cfg(test)]
 mod roundtrip_tests {
     use super::*;
@@ -1690,6 +1671,78 @@ mod fuzz_tests {
         write_contig(&mut std::io::Cursor::new(&mut buf), "chr1", &reference, &variants, &cm_in, 2)
             .unwrap();
         let cm_out = read_contig_methylation(&buf, "chr1", &reference, &variants, 2).unwrap();
+
+        assert_methylation_eq(&cm_in, &cm_out, &hap_lengths);
+    }
+
+    #[test]
+    fn roundtrip_triploid_with_phased_variants() {
+        // Ploidy 3 exercises the per-haplotype index path beyond the diploid
+        // cases above: three distinct bitmaps, phased GTs that put ALT on
+        // different subsets of the three haplotypes, and an insertion that
+        // shifts downstream coordinates on only the haplotypes carrying it.
+        let reference: Vec<u8> = b"ACGTCGATCGATCGCGATCGACGT\
+              ACGTCGATCGATCGCGATCGACGT\
+              ACGTCGATCGATCGCGATCGACGT\
+              ACGTCGATCGATCGCGATCGACGT\
+              ACGTCGATCGATCGCGATCGACGT"
+            .to_vec();
+
+        // "1|0|1" → haps 0 and 2 carry ALT; "0|1|0" → only hap 1; the
+        // insertion "0|0|1" shifts downstream coordinates on hap 2 alone.
+        let variants: Vec<VariantRecord> = vec![
+            VariantRecord {
+                position: 12,
+                ref_allele: b"A".to_vec(),
+                alt_alleles: vec![b"T".to_vec()],
+                genotype: Genotype::parse("1|0|1").unwrap(),
+            },
+            VariantRecord {
+                position: 40,
+                ref_allele: b"T".to_vec(),
+                alt_alleles: vec![b"A".to_vec()],
+                genotype: Genotype::parse("0|1|0").unwrap(),
+            },
+            VariantRecord {
+                position: 70,
+                ref_allele: b"A".to_vec(),
+                alt_alleles: vec![b"AGGG".to_vec()],
+                genotype: Genotype::parse("0|0|1").unwrap(),
+            },
+        ];
+
+        let haplotypes = build_haplotypes(&variants, 3, &mut SmallRng::seed_from_u64(0));
+        #[expect(clippy::cast_possible_truncation, reason = "reference length fits u32")]
+        let ref_len_u32 = reference.len() as u32;
+        let hap_lengths: Vec<usize> =
+            haplotypes.iter().map(|h| h.hap_position_for(ref_len_u32) as usize).collect();
+
+        let mut rng = SmallRng::seed_from_u64(11);
+        let tables: Vec<MethylationTable> = haplotypes
+            .iter()
+            .zip(hap_lengths.iter())
+            .map(|(hap, &len)| {
+                let (hap_bases, _ref_positions, _hap_start) =
+                    hap.extract_fragment(&reference, 0, len);
+                let mut table = MethylationTable::with_len(len);
+                for i in 0..hap_bases.len().saturating_sub(1) {
+                    if hap_bases[i].eq_ignore_ascii_case(&b'C')
+                        && hap_bases[i + 1].eq_ignore_ascii_case(&b'G')
+                    {
+                        table.set_top(i, rng.random_bool(0.6));
+                        table.set_bottom(i + 1, rng.random_bool(0.6));
+                    }
+                }
+                table
+            })
+            .collect();
+        let cm_in = ContigMethylation::from_tables(tables);
+        assert_eq!(cm_in.len(), 3, "fixture must be triploid");
+
+        let mut buf = Vec::new();
+        write_contig(&mut std::io::Cursor::new(&mut buf), "chr1", &reference, &variants, &cm_in, 3)
+            .unwrap();
+        let cm_out = read_contig_methylation(&buf, "chr1", &reference, &variants, 3).unwrap();
 
         assert_methylation_eq(&cm_in, &cm_out, &hap_lengths);
     }

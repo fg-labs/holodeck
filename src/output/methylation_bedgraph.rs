@@ -3,7 +3,8 @@
 //! Derived closed-form from the per-haplotype methylation bitmap — no
 //! simulated reads. For each reference CpG, aggregates over
 //! (haplotype × strand) presence/absence and emits
-//! `rate = 100 * n_methylated / (n_methylated + n_unmethylated)`.
+//! `rate = round(100 * n_methylated / (n_methylated + n_unmethylated))`
+//! as an integer percentage (matching MethylDackel `extract`).
 //!
 //! This is intentionally distinct from `simulate`'s `--cpg-truth-bedgraph`,
 //! which is coverage-weighted (depends on simulated read counts).
@@ -42,7 +43,8 @@ pub fn write_bedgraph_header<W: Write>(writer: &mut W) -> Result<()> {
 /// - `n_methylated` — count of (haplotype, strand) entries whose methylation
 ///   bit is set at this site.
 /// - `n_unmethylated` — preserving haplotype entries that are not methylated.
-/// - `rate` — `100 * n_methylated / (n_methylated + n_unmethylated)`.
+/// - `rate` — `round(100 * n_methylated / (n_methylated + n_unmethylated))`,
+///   an integer percentage matching MethylDackel `extract`.
 ///
 /// Reference CpGs destroyed on every haplotype (SNP at the C or G, indel
 /// straddling either base) are omitted entirely — `n_meth = n_unmeth = 0`
@@ -178,7 +180,14 @@ pub fn write_bedgraph_records<W: Write>(
         if denom == 0 {
             continue;
         }
-        let rate = f64::from(n_meth) / f64::from(denom) * 100.0;
+        // MethylDackel's `extract` reports the rate as an integer percentage;
+        // round to match so this output and `simulate --cpg-truth-bedgraph`
+        // (which rounds identically) can be compared by the same downstream
+        // tooling.
+        let rate = (f64::from(n_meth) / f64::from(denom) * 100.0).round();
+        #[expect(clippy::cast_possible_truncation, reason = "rate is in [0, 100]")]
+        #[expect(clippy::cast_sign_loss, reason = "rate is non-negative")]
+        let rate = rate as u32;
         writeln!(writer, "{chrom}\t{top_c}\t{}\t{rate}\t{n_meth}\t{n_unmeth}", top_c + 1)?;
     }
     Ok(())
@@ -334,6 +343,29 @@ mod tests {
         let s = String::from_utf8(buf).unwrap();
         assert!(s.contains("chr1\t1\t2\t100"), "missing first CpG: {s}");
         assert!(s.contains("chr1\t5\t6\t100"), "missing second CpG: {s}");
+    }
+
+    #[test]
+    fn population_fraction_bedgraph_rounds_non_integer_rate() {
+        // Triploid reference ACGT (one CpG, top-C at 1, bottom-C at 2) gives
+        // 6 (haplotype × strand) entries. Set 2 of them methylated → 2/6 =
+        // 33.33%, which MethylDackel reports as the integer `33`. This pins
+        // the rounding: an unrounded f64 would print `33.33333333333333`.
+        let reference = b"ACGT".to_vec();
+        let mut h0 = MethylationTable::with_len(4);
+        h0.set_top(1, true);
+        let mut h1 = MethylationTable::with_len(4);
+        h1.set_top(1, true);
+        let h2 = MethylationTable::with_len(4);
+        let cm = ContigMethylation::from_tables(vec![h0, h1, h2]);
+        let dict = single_contig_dict("chr1", reference.len());
+        let mut buf = Vec::new();
+        write_bedgraph(&mut buf, &dict, &[("chr1".to_string(), cm, reference, Vec::new())])
+            .unwrap();
+        let s = String::from_utf8(buf).unwrap();
+        // rate = round(100 * 2/6) = 33; n_meth=2, n_unmeth=4.
+        assert!(s.contains("chr1\t1\t2\t33\t2\t4"), "expected rounded rate 33: {s}");
+        assert!(!s.contains("33.3"), "rate must be an integer, not a float: {s}");
     }
 
     #[test]
