@@ -1,4 +1,5 @@
 //! End-to-end tests for the `methylate` subcommand.
+#![allow(clippy::cast_precision_loss)]
 
 mod helpers;
 
@@ -17,8 +18,14 @@ fn methylate_command_runs_on_empty_reference() {
         env.fasta_path.to_str().unwrap(),
         "--output",
         out_path.to_str().unwrap(),
-        "--methylation-rate",
+        "--methylation-rate-island",
         "1.0",
+        "--methylation-rate-shore",
+        "1.0",
+        "--methylation-rate-open-sea",
+        "1.0",
+        "--hemimethylation-rate",
+        "0",
         "--seed",
         "42",
     ]);
@@ -40,8 +47,14 @@ fn methylate_produces_loadable_vcf_with_mt_mb() {
         env.fasta_path.to_str().unwrap(),
         "--output",
         out_path.to_str().unwrap(),
-        "--methylation-rate",
+        "--methylation-rate-island",
         "1.0",
+        "--methylation-rate-shore",
+        "1.0",
+        "--methylation-rate-open-sea",
+        "1.0",
+        "--hemimethylation-rate",
+        "0",
         "--seed",
         "42",
     ]);
@@ -69,7 +82,7 @@ fn methylate_produces_loadable_vcf_with_mt_mb() {
 ///
 /// Reference: a 1 kb ACGT-repeat contig where every C is in a CpG context.
 /// Pipeline:
-///   1. `holodeck methylate --methylation-rate 1.0` → `meth.vcf.gz`
+///   1. `holodeck methylate` with all context rates 1.0 → `meth.vcf.gz`
 ///      (all CpGs unconditionally methylated on both haplotypes)
 ///   2. `holodeck simulate --vcf meth.vcf.gz --methylation-mode em-seq
 ///        --methylation-conversion-rate 0.0 --golden-bam`
@@ -95,8 +108,14 @@ fn methylate_then_simulate_propagates_methylation_to_golden_bam() {
         env.fasta_path.to_str().unwrap(),
         "--output",
         meth_vcf.to_str().unwrap(),
-        "--methylation-rate",
+        "--methylation-rate-island",
         "1.0",
+        "--methylation-rate-shore",
+        "1.0",
+        "--methylation-rate-open-sea",
+        "1.0",
+        "--hemimethylation-rate",
+        "0",
         "--seed",
         "42",
     ]);
@@ -167,7 +186,7 @@ fn methylate_then_simulate_propagates_methylation_to_golden_bam() {
 #[test]
 fn methylate_writes_bedgraph_when_requested() {
     // Reference ACGTACG has two CpGs: top-C at ref positions 1 and 5.
-    // With --methylation-rate 1.0 both are fully methylated on both haplotypes.
+    // With all context rates 1.0 both are fully methylated on both haplotypes.
     let seq = b"ACGTACG".to_vec();
     let env = TestEnv::new(&[("chr1", &seq)]);
     let out_path = env.dir.path().join("meth.vcf.gz");
@@ -181,8 +200,14 @@ fn methylate_writes_bedgraph_when_requested() {
         out_path.to_str().unwrap(),
         "--bedgraph",
         bg_path.to_str().unwrap(),
-        "--methylation-rate",
+        "--methylation-rate-island",
         "1.0",
+        "--methylation-rate-shore",
+        "1.0",
+        "--methylation-rate-open-sea",
+        "1.0",
+        "--hemimethylation-rate",
+        "0",
         "--seed",
         "42",
     ]);
@@ -196,6 +221,117 @@ fn methylate_writes_bedgraph_when_requested() {
     assert!(contents.contains("chr1\t5\t6\t100"), "missing second CpG record: {contents}");
 }
 
+/// Parse a population-fraction bedGraph into `(start, rate)` pairs, skipping
+/// the track header line.
+fn parse_bedgraph(contents: &str) -> Vec<(usize, u32)> {
+    contents
+        .lines()
+        .filter(|l| !l.starts_with("track"))
+        .filter_map(|l| {
+            let cols: Vec<&str> = l.split('\t').collect();
+            Some((cols.get(1)?.parse().ok()?, cols.get(3)?.parse().ok()?))
+        })
+        .collect()
+}
+
+#[test]
+fn methylate_default_is_no_longer_fully_methylated() {
+    // The no-flags default is now context-aware (open-sea ~0.85), NOT 100%
+    // methylated. Over a long open-sea reference the MEAN per-CpG rate should
+    // sit near the open-sea target and clearly below 100 — a structural check,
+    // not "at least one happens to be unmethylated". Guards against a
+    // regression to the old flat-1.0 default. Seed-pinned (measured ~81.5 at
+    // this seed; ~81–91 across seeds), so the band is tight enough to catch a
+    // flat-default regression yet leaves headroom for the SmallRng-on-rand-0.9
+    // caveat; widen if the RNG stream changes.
+    let seq = b"ACGT".repeat(25_000); // 100 kb, CpG every 4 bp → all open-sea
+    let env = TestEnv::new(&[("chr1", &seq)]);
+    let out_path = env.dir.path().join("meth.vcf.gz");
+    let bg_path = env.dir.path().join("meth.bedgraph");
+    let (ok, _, stderr) = run_methylate(&[
+        "methylate",
+        "--reference",
+        env.fasta_path.to_str().unwrap(),
+        "--output",
+        out_path.to_str().unwrap(),
+        "--bedgraph",
+        bg_path.to_str().unwrap(),
+        "--seed",
+        "7",
+    ]);
+    assert!(ok, "methylate failed: {stderr}");
+    let rates = parse_bedgraph(&std::fs::read_to_string(&bg_path).unwrap());
+    assert!(!rates.is_empty(), "expected bedgraph records");
+    let mean = rates.iter().map(|&(_, r)| f64::from(r)).sum::<f64>() / rates.len() as f64;
+    assert!(
+        (70.0..=95.0).contains(&mean),
+        "default open-sea mean rate {mean} should be near ~85 and clearly below the old flat 100"
+    );
+}
+
+#[test]
+fn methylate_context_flags_produce_island_hypomethylation() {
+    // A CpG island ("CG" repeats) embedded in AT-rich open-sea. With island
+    // rate low, open-sea rate high, and short correlation lengths (so each
+    // region's mean converges), the island region's bedGraph rates should be
+    // markedly lower than the far open-sea rates. Validates the full
+    // CLI → context-classification → bedGraph wiring.
+    let os_unit = b"AATTCGAATT"; // CG at offset 4, 20% GC → open-sea
+    let os_units = 2000usize; // 20 kb flanks
+    let island_units = 1500usize; // 3 kb island
+    let mut seq = Vec::new();
+    for _ in 0..os_units {
+        seq.extend_from_slice(os_unit);
+    }
+    let island_start = seq.len();
+    for _ in 0..island_units {
+        seq.extend_from_slice(b"CG");
+    }
+    let island_end = seq.len();
+    for _ in 0..os_units {
+        seq.extend_from_slice(os_unit);
+    }
+    let env = TestEnv::new(&[("chr1", &seq)]);
+    let out_path = env.dir.path().join("meth.vcf.gz");
+    let bg_path = env.dir.path().join("meth.bedgraph");
+    let (ok, _, stderr) = run_methylate(&[
+        "methylate",
+        "--reference",
+        env.fasta_path.to_str().unwrap(),
+        "--output",
+        out_path.to_str().unwrap(),
+        "--bedgraph",
+        bg_path.to_str().unwrap(),
+        "--methylation-rate-island",
+        "0.05",
+        "--methylation-rate-open-sea",
+        "0.9",
+        "--methylation-correlation-length-island",
+        "20",
+        "--methylation-correlation-length-shore",
+        "20",
+        "--methylation-correlation-length-open-sea",
+        "20",
+        "--hemimethylation-rate",
+        "0",
+        "--seed",
+        "7",
+    ]);
+    assert!(ok, "methylate failed: {stderr}");
+    let rates = parse_bedgraph(&std::fs::read_to_string(&bg_path).unwrap());
+
+    let mean = |sel: &dyn Fn(usize) -> bool| {
+        let vals: Vec<u32> = rates.iter().filter(|&&(s, _)| sel(s)).map(|&(_, r)| r).collect();
+        assert!(!vals.is_empty(), "no CpGs selected");
+        f64::from(vals.iter().sum::<u32>()) / vals.len() as f64
+    };
+    let island_mean = mean(&|s| s >= island_start + 200 && s < island_end - 200);
+    let open_sea_mean = mean(&|s| s + 6000 < island_start || s > island_end + 6000);
+    assert!(island_mean < 40.0, "island region should be hypomethylated, got {island_mean}");
+    assert!(open_sea_mean > 60.0, "open-sea region should be hypermethylated, got {open_sea_mean}");
+    assert!(island_mean < open_sea_mean, "island must be less methylated than open sea");
+}
+
 #[test]
 fn methylate_rejects_methylation_rate_above_one() {
     let env = TestEnv::new(&[("chr1", b"ACGT")]);
@@ -206,12 +342,12 @@ fn methylate_rejects_methylation_rate_above_one() {
         env.fasta_path.to_str().unwrap(),
         "--output",
         out_path.to_str().unwrap(),
-        "--methylation-rate",
+        "--methylation-rate-island",
         "1.5",
     ]);
     assert!(!ok, "methylate should reject rate > 1.0");
     assert!(
-        stderr.contains("--methylation-rate must be in [0.0, 1.0]"),
+        stderr.contains("--methylation-rate-island must be in [0.0, 1.0]"),
         "stderr did not mention rate range: {stderr}"
     );
 }
@@ -227,12 +363,32 @@ fn methylate_rejects_negative_methylation_rate() {
         "--output",
         out_path.to_str().unwrap(),
         // Use `--flag=value` form so clap doesn't parse `-0.1` as a flag.
-        "--methylation-rate=-0.1",
+        "--methylation-rate-open-sea=-0.1",
     ]);
     assert!(!ok, "methylate should reject negative rate");
     assert!(
-        stderr.contains("--methylation-rate must be in [0.0, 1.0]"),
+        stderr.contains("--methylation-rate-open-sea must be in [0.0, 1.0]"),
         "stderr did not mention rate range: {stderr}"
+    );
+}
+
+#[test]
+fn methylate_rejects_nonpositive_correlation_length() {
+    let env = TestEnv::new(&[("chr1", b"ACGT")]);
+    let out_path = env.dir.path().join("meth.vcf.gz");
+    let (ok, _, stderr) = run_methylate(&[
+        "methylate",
+        "--reference",
+        env.fasta_path.to_str().unwrap(),
+        "--output",
+        out_path.to_str().unwrap(),
+        "--methylation-correlation-length-shore",
+        "0",
+    ]);
+    assert!(!ok, "methylate should reject a non-positive correlation length");
+    assert!(
+        stderr.contains("--methylation-correlation-length-shore must be a finite value > 0"),
+        "stderr did not mention correlation-length constraint: {stderr}"
     );
 }
 
@@ -266,12 +422,12 @@ fn methylate_rejects_nonfinite_methylation_rate() {
         env.fasta_path.to_str().unwrap(),
         "--output",
         out_path.to_str().unwrap(),
-        "--methylation-rate",
+        "--methylation-rate-island",
         "nan",
     ]);
     assert!(!ok, "methylate should reject NaN rate");
     assert!(
-        stderr.contains("--methylation-rate must be in [0.0, 1.0]"),
+        stderr.contains("--methylation-rate-island must be in [0.0, 1.0]"),
         "stderr did not mention rate range: {stderr}"
     );
 }
@@ -291,8 +447,14 @@ fn methylate_seed_determinism() {
             env.fasta_path.to_str().unwrap(),
             "--output",
             out.to_str().unwrap(),
-            "--methylation-rate",
+            "--methylation-rate-island",
             "0.5",
+            "--methylation-rate-shore",
+            "0.5",
+            "--methylation-rate-open-sea",
+            "0.5",
+            "--hemimethylation-rate",
+            "0",
             "--seed",
             "42",
         ]);
@@ -335,8 +497,14 @@ fn methylate_applies_variants_from_input_vcf() {
         vcf_in.to_str().unwrap(),
         "--output",
         out_path.to_str().unwrap(),
-        "--methylation-rate",
+        "--methylation-rate-island",
         "1.0",
+        "--methylation-rate-shore",
+        "1.0",
+        "--methylation-rate-open-sea",
+        "1.0",
+        "--hemimethylation-rate",
+        "0",
         "--seed",
         "42",
     ]);

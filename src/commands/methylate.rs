@@ -17,12 +17,19 @@ use super::common::{ReferenceOptions, SeedOptions, VcfOptions};
 ///
 /// Scans every CpG dinucleotide in the reference (optionally after applying
 /// variants from a VCF) and records per-haplotype, per-strand methylation
-/// state for each site.  Independent draws per strand allow hemimethylation;
-/// independent draws per haplotype allow allele-specific methylation.
+/// state for each site. Methylation is assigned with a context-aware Markov
+/// model: CpGs are classified into island / shore / open-sea (detected de
+/// novo from the sequence), each with its own target rate and spatial
+/// correlation length, so islands come out hypomethylated, open-sea
+/// hypermethylated, with autocorrelated runs in between. Methylation is
+/// symmetric by default with a low sporadic hemimethylation rate. Per-haplotype
+/// draws give allele-specific methylation. All draws are deterministic from
+/// `--seed`.
 #[derive(Parser, Debug)]
 #[command(after_long_help = "EXAMPLES:\n  \
-    holodeck methylate -r ref.fa -o meth.vcf.gz --methylation-rate 0.8\n  \
-    holodeck methylate -r ref.fa -v variants.vcf -o meth.vcf.gz --seed 42")]
+    holodeck methylate -r ref.fa -o meth.vcf.gz\n  \
+    holodeck methylate -r ref.fa -v variants.vcf -o meth.vcf.gz --seed 42\n  \
+    holodeck methylate -r ref.fa -o meth.vcf.gz --methylation-rate-open-sea 0.9")]
 pub struct Methylate {
     #[command(flatten)]
     pub reference: ReferenceOptions,
@@ -33,13 +40,41 @@ pub struct Methylate {
     #[command(flatten)]
     pub seed: SeedOptions,
 
-    /// Per-CpG, per-strand, per-haplotype methylation probability. Drawn once
-    /// per (haplotype, strand, CpG site) at simulation start, deterministic
-    /// from `--seed`. Independent draws per strand allow hemimethylation;
-    /// independent draws per haplotype allow allele-specific methylation.
-    /// Must be in `[0.0, 1.0]`.
-    #[arg(long, default_value_t = 1.0, value_name = "FLOAT")]
-    pub methylation_rate: f64,
+    /// Target methylation fraction for CpG-island-interior CpGs. Islands are
+    /// characteristically hypomethylated, so this defaults low. Must be in
+    /// `[0.0, 1.0]`. To methylate uniformly (no island structure), set the
+    /// three context rates equal.
+    #[arg(long, default_value_t = crate::meth::DEFAULT_ISLAND_RATE, value_name = "FLOAT")]
+    pub methylation_rate_island: f64,
+
+    /// Target methylation fraction for island-shore CpGs (within 2 kb of an
+    /// island; intermediate methylation). Must be in `[0.0, 1.0]`.
+    #[arg(long, default_value_t = crate::meth::DEFAULT_SHORE_RATE, value_name = "FLOAT")]
+    pub methylation_rate_shore: f64,
+
+    /// Target methylation fraction for open-sea CpGs (the hypermethylated bulk
+    /// of the genome, away from islands). Must be in `[0.0, 1.0]`.
+    #[arg(long, default_value_t = crate::meth::DEFAULT_OPEN_SEA_RATE, value_name = "FLOAT")]
+    pub methylation_rate_open_sea: f64,
+
+    /// Spatial correlation length (bp) for island-interior CpGs: larger values
+    /// give longer runs of like-methylated CpGs. Must be `> 0`.
+    #[arg(long, default_value_t = crate::meth::DEFAULT_CORRELATION_LENGTH_BP, value_name = "BP")]
+    pub methylation_correlation_length_island: f64,
+
+    /// Spatial correlation length (bp) for shore CpGs. Must be `> 0`.
+    #[arg(long, default_value_t = crate::meth::DEFAULT_CORRELATION_LENGTH_BP, value_name = "BP")]
+    pub methylation_correlation_length_shore: f64,
+
+    /// Spatial correlation length (bp) for open-sea CpGs. Must be `> 0`.
+    #[arg(long, default_value_t = crate::meth::DEFAULT_CORRELATION_LENGTH_BP, value_name = "BP")]
+    pub methylation_correlation_length_open_sea: f64,
+
+    /// Probability that a methylated CpG is made hemimethylated — exactly one
+    /// strand left unmethylated. Real hemimethylation is sporadic and rare, so
+    /// this defaults low. Must be in `[0.0, 1.0]`.
+    #[arg(long, default_value_t = crate::meth::DEFAULT_HEMI_RATE, value_name = "FLOAT")]
+    pub hemimethylation_rate: f64,
 
     /// Output methylation-annotated VCF (BGZF-compressed).
     #[arg(long, short = 'o', value_name = "PATH")]
@@ -49,6 +84,28 @@ pub struct Methylate {
     /// closed-form from the genome model. Independent of any read coverage.
     #[arg(long, value_name = "PATH")]
     pub bedgraph: Option<PathBuf>,
+}
+
+impl Methylate {
+    /// Assemble the per-context methylation model from the CLI flags.
+    fn methylation_model(&self) -> crate::meth::MethylationModel {
+        use crate::meth::{ContextParams, MethylationModel};
+        MethylationModel {
+            island: ContextParams {
+                rate: self.methylation_rate_island,
+                correlation_length_bp: self.methylation_correlation_length_island,
+            },
+            shore: ContextParams {
+                rate: self.methylation_rate_shore,
+                correlation_length_bp: self.methylation_correlation_length_shore,
+            },
+            open_sea: ContextParams {
+                rate: self.methylation_rate_open_sea,
+                correlation_length_bp: self.methylation_correlation_length_open_sea,
+            },
+            hemi_rate: self.hemimethylation_rate,
+        }
+    }
 }
 
 impl Command for Methylate {
@@ -63,14 +120,24 @@ impl Command for Methylate {
         use crate::vcf::methylation::write_vcf_header;
         use crate::version::VERSION;
 
-        // 1. Validate args.
-        if !(0.0..=1.0).contains(&self.methylation_rate) || !self.methylation_rate.is_finite() {
-            anyhow::bail!("--methylation-rate must be in [0.0, 1.0]");
-        }
+        // 1. Build and validate the methylation model from the per-context flags.
+        let model = self.methylation_model();
+        model.validate()?;
 
-        // 2. Resolve seed deterministically from args if not explicit.
-        let seed_desc =
-            format!("{}:methylate:{}", self.reference.reference.display(), self.methylation_rate,);
+        // 2. Resolve seed deterministically from args if not explicit. Fold
+        //    every model parameter into the description so default-seed runs
+        //    with different parameters get distinct streams.
+        let seed_desc = format!(
+            "{}:methylate:{}:{}:{}:{}:{}:{}:{}",
+            self.reference.reference.display(),
+            self.methylation_rate_island,
+            self.methylation_rate_shore,
+            self.methylation_rate_open_sea,
+            self.methylation_correlation_length_island,
+            self.methylation_correlation_length_shore,
+            self.methylation_correlation_length_open_sea,
+            self.hemimethylation_rate,
+        );
         let seed = resolve_seed(self.seed.seed, &seed_desc);
         log::info!("Using random seed: {seed}");
 
@@ -153,12 +220,8 @@ impl Command for Methylate {
             // Draw per-haplotype methylation with another deterministic sub-seed.
             let meth_seed = derive_seed(seed, &format!("meth@{contig_name}"));
             let mut meth_rng = rand::rngs::SmallRng::seed_from_u64(meth_seed);
-            let methylation = ContigMethylation::from_haplotypes(
-                &haplotypes,
-                &reference,
-                self.methylation_rate,
-                &mut meth_rng,
-            );
+            let methylation =
+                ContigMethylation::from_haplotypes(&haplotypes, &reference, &model, &mut meth_rng);
 
             write_contig(
                 &mut bgzf,
