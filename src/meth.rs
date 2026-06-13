@@ -8,9 +8,7 @@
 //! # Per-haplotype CpG detection and per-strand bitmaps
 //!
 //! Each haplotype gets its own pair of [`BitVec`]s indexed by haplotype
-//! position (0..haplotype_length). For every `CG` dinucleotide on that
-//! haplotype's materialized sequence (case-insensitive), two independent
-//! Bernoulli draws decide whether each strand's C is methylated:
+//! position (0..haplotype_length):
 //!
 //! - `top[h]` = "the top-strand C at haplotype position `h` is methylated."
 //! - `bottom[h + 1]` = "the bottom-strand C at haplotype position `h + 1` is
@@ -19,15 +17,28 @@
 //! Indexing by haplotype position rather than reference position naturally
 //! handles SNPs, insertions, and deletions that create or destroy CpG sites
 //! on a particular haplotype: each haplotype's bitmap reflects the CpG
-//! context that actually exists on that haplotype.
-//!
-//! Both bitmaps for a haplotype have length equal to the haplotype's
-//! materialized length; positions that don't host a strand-specific C (or
-//! that host a non-CpG cytosine) always read `false`. Hemimethylation is
-//! allowed because the two strands' draws are independent. Allele-specific
-//! methylation falls out naturally because each haplotype draws independently.
-//!
+//! context that actually exists on that haplotype. Both bitmaps have length
+//! equal to the haplotype's materialized length; positions that don't host a
+//! strand-specific C (or that host a non-CpG cytosine) always read `false`.
 //! Non-CpG cytosines are always treated as unmethylated.
+//!
+//! # Methylation model (the `methylate` generator)
+//!
+//! [`MethylationTable::from_haplotype`] fills these bitmaps with a
+//! context-aware, spatially-correlated model rather than independent per-CpG
+//! coin flips. Each CpG is classified ([`CpgContext`]) into island / shore /
+//! open-sea from the haplotype sequence; a two-state (methylated/unmethylated)
+//! Markov chain then walks the CpG list using that context's [`ContextParams`]
+//! (target rate + correlation length, bundled per-context in
+//! [`MethylationModel`]). The chain's stationary mean equals the context's
+//! target rate while neighbouring CpGs are spatially correlated, so islands
+//! come out hypomethylated, open-sea hypermethylated, with shore gradients in
+//! between. Methylation is **symmetric** across strands by default; sporadic
+//! hemimethylation is introduced per-CpG via [`MethylationModel::hemi_rate`].
+//! Allele-specific methylation falls out naturally because each haplotype is
+//! walked as an independent chain. The model is built once (from CLI flags)
+//! and threaded through [`ContigMethylation::from_haplotypes`] →
+//! [`MethylationTable::from_haplotype`].
 //!
 //! # Chemistry modes
 //!
