@@ -17,8 +17,9 @@ Holodeck is a single-crate Rust project with a binary (`holodeck`) and library (
 
 ### Subcommands
 
-- **simulate** -- Generate reads from reference + optional VCF. Core simulation engine.
+- **simulate** -- Generate reads from reference + optional VCF. Core simulation engine. Optional methylation chemistry via `--methylation-mode`.
 - **mutate** -- Generate a random VCF from a reference. Independent of simulator.
+- **methylate** -- Annotate a VCF with per-CpG methylation truth (MT/MB FORMAT fields) for downstream `simulate --vcf` consumption.
 - **eval** -- Evaluate alignment accuracy by comparing truth vs mapped positions.
 
 ### Module Overview
@@ -27,12 +28,18 @@ Holodeck is a single-crate Rust project with a binary (`holodeck`) and library (
 |--------|---------|
 | `commands/simulate.rs` | Full simulation pipeline: load ref/VCF/BED, build haplotypes, sample fragments, generate reads |
 | `commands/mutate.rs` | Random VCF generation with SNP/indel/MNP rates and ploidy overrides |
+| `commands/methylate.rs` | Annotate a VCF with per-CpG MT/MB methylation truth |
 | `commands/eval.rs` | Alignment accuracy evaluation from encoded read names |
 | `commands/common.rs` | Shared CLI option groups (reference, output, VCF, BED, seed) |
 | `bed.rs` | BED file loading with `coitrees` for overlap queries |
 | `vcf/mod.rs` | VCF reading with noodles, sample selection |
 | `vcf/genotype.rs` | GT field parsing supporting arbitrary ploidy and phasing |
 | `haplotype.rs` | Sparse haplotype variant overlay (reference + COITree of variants) |
+| `meth.rs` | Methylation primitives: per-haplotype/per-strand bitmaps, chemistry conversion, conversion-failure model, reference CpG scanning |
+| `methylation_tags.rs` | Bismark-style methylation call tags (XM/YM/NM/MD) for the golden BAM |
+| `vcf/methylation.rs` | MT/MB FORMAT field read/write; CpG classification across haplotypes |
+| `output/cpg_truth.rs` | Coverage-weighted per-CpG truth bedGraph (from simulated reads) |
+| `output/methylation_bedgraph.rs` | Closed-form population-fraction methylation bedGraph |
 | `fragment.rs` | Fragment extraction, reverse complement, adapter padding |
 | `read.rs` | Read pair generation combining fragments + error model + naming |
 | `error_model/mod.rs` | ErrorModel trait + apply_errors free function |

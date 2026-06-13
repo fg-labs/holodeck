@@ -34,6 +34,9 @@ pooled-writer = "0.4"
 flate2 = { version = "1", features = ["zlib-ng"], default-features = false }
 bstr = "1"
 chrono = "0.4"
+# Packs per-haplotype, per-strand methylation state to one bit per base;
+# Vec<bool> would cost 8x the memory at whole-chromosome scale. See
+# MethylationTable in src/meth.rs.
 bitvec = "1"
 
 [dev-dependencies]

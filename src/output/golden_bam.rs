@@ -298,6 +298,13 @@ fn build_record(
         // indicator does not.
         let strand_tag = mt.conversion_type.as_tag_str();
         data.insert(DataTag::new(b'X', b'G'), DataValue::from(strand_tag));
+        // cf:i (holodeck) -- ground-truth conversion-failure flag. `1` when
+        // the source molecule was drawn as a whole-molecule conversion
+        // failure, `0` otherwise. A molecule property, so R1 and R2 share
+        // the value. Not recoverable from SEQ/YS alone (a molecule that
+        // converted normally can coincidentally retain C's), so it is
+        // stamped here as the truth an evaluator scores against.
+        data.insert(DataTag::new(b'c', b'f'), DataValue::from(i32::from(mt.conversion_failed)));
         // XR:Z (Bismark) -- read-conversion direction in the read's
         // own orientation. Under a directional library the read shows
         // a C→T conversion pattern when read 5'→3' if it is R1 (or SE),

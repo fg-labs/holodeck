@@ -784,6 +784,7 @@ mod tests {
         };
         let mut anno = MethylationAnnotation {
             conversion_type: ConversionType::Ct,
+            conversion_failed: false,
             r1_pre_conversion_bases: None,
             r2_pre_conversion_bases: None,
             r1_call_tags: None,
