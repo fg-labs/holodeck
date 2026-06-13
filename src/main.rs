@@ -11,6 +11,7 @@ use clap::builder::styling::{AnsiColor, Effects, Styles};
 use env_logger::Env;
 use holodeck_lib::commands::command::Command;
 use holodeck_lib::commands::eval::Eval;
+use holodeck_lib::commands::methylate::Methylate;
 use holodeck_lib::commands::mutate::Mutate;
 use holodeck_lib::commands::simulate::Simulate;
 
@@ -52,6 +53,7 @@ struct Cli {
 enum Subcommand {
     Simulate(Simulate),
     Mutate(Mutate),
+    Methylate(Methylate),
     Eval(Eval),
 }
 
@@ -60,6 +62,7 @@ impl Command for Subcommand {
         match self {
             Subcommand::Simulate(c) => c.execute(),
             Subcommand::Mutate(c) => c.execute(),
+            Subcommand::Methylate(c) => c.execute(),
             Subcommand::Eval(c) => c.execute(),
         }
     }
