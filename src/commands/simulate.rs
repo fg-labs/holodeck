@@ -126,14 +126,28 @@ pub struct Simulate {
     pub methylation_mode: Option<crate::meth::MethylationMode>,
 
     /// Probability that the converting class of cytosines (unmethylated
-    /// for em-seq/bisulfite, methylated for TAPS) is converted to thymine.
-    /// `1.0` is perfect chemistry; real protocols typically achieve
-    /// `0.99`–`0.999`. Only takes effect when `--methylation-mode` is set;
-    /// passing this flag without a mode is rejected. Defaults to `1.0`
-    /// (deterministic ground-truth simulation) when `--methylation-mode`
-    /// is set without this flag.
+    /// for em-seq/bisulfite, methylated for TAPS) is converted to thymine
+    /// in a molecule that converted normally. `1.0` is perfect chemistry;
+    /// real protocols typically achieve `0.99`–`0.999`. Only takes effect
+    /// when `--methylation-mode` is set; passing this flag without a mode is
+    /// rejected. Defaults to `0.999` when `--methylation-mode` is set
+    /// without this flag.
     #[arg(long, value_name = "FLOAT")]
     pub methylation_conversion_rate: Option<f64>,
+
+    /// Fraction of molecules that are whole-molecule conversion failures.
+    /// Real bisulfite/EM-seq conversion is bimodal: most molecules convert
+    /// near-completely, a small fraction (fragments that fail to denature or
+    /// re-anneal too fast) escape conversion as a coherent unit. A failed
+    /// molecule converts its should-convert cytosines at
+    /// `1 - methylation-conversion-rate` (near-zero), so it retains almost
+    /// all of them as C across both mates. The golden BAM stamps each
+    /// record with `cf:i:{0|1}` recording which camp the molecule was in.
+    /// Only takes effect when `--methylation-mode` is set; passing this flag
+    /// without a mode is rejected. Defaults to `0.01` (1%) when
+    /// `--methylation-mode` is set without this flag; pass `0.0` to disable.
+    #[arg(long, value_name = "FLOAT")]
+    pub methylation_failure_rate: Option<f64>,
 
     /// Write a per-CpG ground-truth methylation tally in MethylDackel's
     /// `extract` CpG bedGraph format. Columns: `chrom  start  end  rate
@@ -211,6 +225,14 @@ impl Simulate {
         // mistake, and silently dropping the request is worse than bailing.
         if self.methylation_mode.is_none() && self.methylation_conversion_rate.is_some() {
             bail!("--methylation-conversion-rate requires --methylation-mode");
+        }
+        if let Some(rate) = self.methylation_failure_rate
+            && (!rate.is_finite() || !(0.0..=1.0).contains(&rate))
+        {
+            bail!("--methylation-failure-rate must be in [0.0, 1.0]");
+        }
+        if self.methylation_mode.is_none() && self.methylation_failure_rate.is_some() {
+            bail!("--methylation-failure-rate requires --methylation-mode");
         }
         if self.cpg_truth_bedgraph.is_some() && self.methylation_mode.is_none() {
             bail!("--cpg-truth-bedgraph requires --methylation-mode");
@@ -522,7 +544,9 @@ impl Simulate {
             seed_desc.push(':');
             seed_desc.push_str(mode.as_seed_str());
             seed_desc.push(':');
-            seed_desc.push_str(&self.methylation_conversion_rate.unwrap_or(1.0).to_string());
+            seed_desc.push_str(&self.methylation_conversion_rate.unwrap_or(0.999).to_string());
+            seed_desc.push(':');
+            seed_desc.push_str(&self.methylation_failure_rate.unwrap_or(0.01).to_string());
         }
         resolve_seed(self.seed.seed, &seed_desc)
     }
@@ -682,7 +706,8 @@ impl Simulate {
             methylation.as_ref().map(|(cm, mode)| crate::meth::MethylationConfig {
                 contig_methylation: cm,
                 mode: *mode,
-                conversion_rate: self.methylation_conversion_rate.unwrap_or(1.0),
+                conversion_rate: self.methylation_conversion_rate.unwrap_or(0.999),
+                failure_rate: self.methylation_failure_rate.unwrap_or(0.01),
             });
 
         // Precompute reference CpG positions once per contig (only when the
@@ -889,6 +914,7 @@ mod tests {
             max_n_frac: 0.02,
             methylation_mode: None,
             methylation_conversion_rate: None,
+            methylation_failure_rate: None,
             cpg_truth_bedgraph: None,
             golden_bam: false,
             golden_vcf: false,
@@ -944,6 +970,20 @@ mod tests {
         assert_ne!(sim_em.compute_seed(), sim_taps.compute_seed());
     }
 
+    /// `--methylation-failure-rate` feeds the seed string, so two runs that
+    /// differ only in failure rate must derive different seeds (otherwise
+    /// reruns at a new failure rate would reuse the prior stream).
+    #[test]
+    fn test_compute_seed_differs_by_failure_rate() {
+        let mut sim_a = make_default_simulate();
+        sim_a.methylation_mode = Some(crate::meth::MethylationMode::EmSeq);
+        sim_a.methylation_failure_rate = Some(0.0);
+        let mut sim_b = make_default_simulate();
+        sim_b.methylation_mode = Some(crate::meth::MethylationMode::EmSeq);
+        sim_b.methylation_failure_rate = Some(0.5);
+        assert_ne!(sim_a.compute_seed(), sim_b.compute_seed());
+    }
+
     /// Non-default `--methylation-conversion-rate` without a mode is also
     /// rejected.
     #[test]
@@ -983,6 +1023,39 @@ mod tests {
         assert!(
             msg.contains("--methylation-conversion-rate requires --methylation-mode"),
             "error must mention required mode flag, got: {msg}"
+        );
+    }
+
+    /// `--methylation-failure-rate` without a mode is rejected, mirroring the
+    /// conversion-rate orphan check.
+    #[test]
+    fn test_methylation_failure_rate_without_mode_rejected() {
+        let mut sim = make_default_simulate();
+        sim.methylation_mode = None;
+        sim.methylation_failure_rate = Some(0.05);
+        let err =
+            sim.validate().expect_err("validate must reject orphaned methylation failure rate");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("--methylation-failure-rate requires --methylation-mode"),
+            "error must mention required mode flag, got: {msg}"
+        );
+    }
+
+    /// `--methylation-failure-rate` outside `[0, 1]` is rejected even with a
+    /// mode set.
+    #[test]
+    fn test_methylation_failure_rate_out_of_range_rejected() {
+        let mut sim = make_default_simulate();
+        sim.methylation_mode = Some(crate::meth::MethylationMode::EmSeq);
+        sim.methylation_failure_rate = Some(1.5);
+        let err = sim
+            .validate()
+            .expect_err("validate must reject --methylation-failure-rate outside [0, 1]");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("--methylation-failure-rate must be in [0.0, 1.0]"),
+            "error must mention the valid range, got: {msg}"
         );
     }
 

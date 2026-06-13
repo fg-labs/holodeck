@@ -131,6 +131,8 @@ fn methylate_then_simulate_propagates_methylation_to_golden_bam() {
         "em-seq",
         "--methylation-conversion-rate",
         "0.0",
+        "--methylation-failure-rate",
+        "0.0",
         "--golden-bam",
         "--threads",
         "1",

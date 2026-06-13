@@ -275,9 +275,26 @@ pub struct MethylationConfig<'a> {
     pub contig_methylation: &'a ContigMethylation,
     /// Which chemistry to apply (em-seq vs TAPS).
     pub mode: MethylationMode,
-    /// Probability that a qualifying C is converted to T. Clamped to
-    /// `[0.0, 1.0]` by the caller; not re-validated in the hot loop.
+    /// Probability that a qualifying C is converted to T in a molecule that
+    /// converted normally. Clamped to `[0.0, 1.0]` by the caller; not
+    /// re-validated in the hot loop.
     pub conversion_rate: f64,
+    /// Per-molecule probability that a fragment is a *conversion failure*.
+    /// Real bisulfite/EM-seq conversion is effectively bimodal: most
+    /// molecules convert near-completely, a small fraction escape conversion
+    /// as a unit (fragments that fail to denature, or re-anneal too fast).
+    /// A failed molecule converts its should-convert cytosines at
+    /// `1.0 - conversion_rate`, so it coherently retains almost all of them
+    /// as C. Drawn once per fragment so both mates agree. Clamped to
+    /// `[0.0, 1.0]` by the caller.
+    ///
+    /// The "near-zero failed rate" intuition assumes `conversion_rate` is
+    /// close to `1.0` (the realistic regime). At the degenerate setting
+    /// `conversion_rate == 0.0` the relationship inverts — failed molecules
+    /// convert at `1.0` (fully) while normal molecules don't convert at all —
+    /// which is a deliberate consequence of pinning the failed rate to
+    /// `1.0 - conversion_rate`, not a special case.
+    pub failure_rate: f64,
 }
 
 /// Apply per-base methylation chemistry conversion to read bases in place.
@@ -291,6 +308,15 @@ pub struct MethylationConfig<'a> {
 /// `haplotype_index` selects which per-haplotype methylation table to use
 /// from the [`ContigMethylation`] in `config`.
 ///
+/// Per-molecule conversion failure is drawn once here, before the per-base
+/// loop: with probability `config.failure_rate` the molecule is a failure
+/// and converts its should-convert cytosines at `1.0 - config.conversion_rate`
+/// (near-zero), otherwise at `config.conversion_rate`. Because this runs once
+/// per fragment (via [`crate::read::apply_fragment_chemistry`]), both mates
+/// derive from the same converted buffer and stay coherent. Returns whether
+/// the molecule was drawn as a conversion failure so the caller can record it
+/// as ground truth.
+///
 /// Called between `uppercase_in_place` and `apply_errors` in
 /// [`crate::read::generate_read_pair`]'s `build_mate` helper. Chemistry
 /// runs before sequencing errors are applied (mirroring the biological
@@ -298,10 +324,11 @@ pub struct MethylationConfig<'a> {
 ///
 /// # Panics
 ///
-/// Panics if `config.conversion_rate` is not a finite value in `[0.0, 1.0]`.
-/// Mirrors the guard on [`MethylationTable::from_haplotype`]: the CLI
-/// validates this, but the function is `pub`, and an unguarded `NaN` /
-/// out-of-range rate would silently distort every chemistry draw.
+/// Panics if `config.conversion_rate` or `config.failure_rate` is not a
+/// finite value in `[0.0, 1.0]`. Mirrors the guard on
+/// [`MethylationTable::from_haplotype`]: the CLI validates this, but the
+/// function is `pub`, and an unguarded `NaN` / out-of-range rate would
+/// silently distort every chemistry draw.
 pub fn apply_methylation_conversion(
     bases: &mut [u8],
     n_genomic: usize,
@@ -310,15 +337,27 @@ pub fn apply_methylation_conversion(
     haplotype_index: usize,
     config: &MethylationConfig<'_>,
     rng: &mut impl Rng,
-) {
+) -> bool {
     // Validate at the public boundary (see `from_haplotype` for the same
     // guard). An out-of-range / NaN rate would silently corrupt the
-    // `rng < conversion_rate` decision rather than fail loudly.
+    // `rng < rate` decision rather than fail loudly.
     assert!(
         config.conversion_rate.is_finite() && (0.0..=1.0).contains(&config.conversion_rate),
         "conversion_rate must be a finite value in [0.0, 1.0]; got {}",
         config.conversion_rate,
     );
+    assert!(
+        config.failure_rate.is_finite() && (0.0..=1.0).contains(&config.failure_rate),
+        "failure_rate must be a finite value in [0.0, 1.0]; got {}",
+        config.failure_rate,
+    );
+    // Draw the per-molecule camp once, before the per-base loop. A failed
+    // molecule converts at `1 - conversion_rate` (near-zero), retaining
+    // essentially all of its should-convert cytosines as a coherent unit.
+    // Only consume an RNG draw when failures are enabled.
+    let conversion_failed = config.failure_rate > 0.0 && rng.random::<f64>() < config.failure_rate;
+    let rate =
+        if conversion_failed { 1.0 - config.conversion_rate } else { config.conversion_rate };
     let table = config.contig_methylation.table_for(haplotype_index);
     for (i, base) in bases.iter_mut().enumerate().take(n_genomic) {
         let b = *base;
@@ -340,10 +379,11 @@ pub fn apply_methylation_conversion(
             MethylationMode::EmSeq => !is_meth,
             MethylationMode::Taps => is_meth,
         };
-        if should_convert && rng.random::<f64>() < config.conversion_rate {
+        if should_convert && rng.random::<f64>() < rate {
             *base = b'T';
         }
     }
+    conversion_failed
 }
 
 /// Which methylation conversion pattern a read displays when mapped to the
@@ -382,14 +422,18 @@ impl ConversionType {
 /// downstream writers (notably the golden BAM) to emit the full Bismark-
 /// compatible methylation tag set: `XG:Z` (genome-strand indicator),
 /// `XR:Z` (read-conversion direction; derived from the SAM flag at
-/// emission time), `YS:Z` (pre-conversion bases), plus the Bismark call
-/// tags `XM:Z` / `YM:Z` / `NM:i` / `MD:Z` carried in `r1_call_tags` /
-/// `r2_call_tags` and computed by
-/// [`crate::methylation_tags::populate_pair_call_tags`].
+/// emission time), `YS:Z` (pre-conversion bases), the holodeck `cf:i`
+/// conversion-failure flag, plus the Bismark call tags `XM:Z` / `YM:Z` /
+/// `NM:i` / `MD:Z` carried in `r1_call_tags` / `r2_call_tags` and computed
+/// by [`crate::methylation_tags::populate_pair_call_tags`].
 #[derive(Debug, Clone)]
 pub struct MethylationAnnotation {
     /// Conversion direction for the source fragment (same for R1 and R2).
     pub conversion_type: ConversionType,
+    /// Whether the source molecule was drawn as a conversion failure. A
+    /// molecule property, so it is identical for R1 and R2; surfaced in the
+    /// golden BAM as the `cf:i` ground-truth tag.
+    pub conversion_failed: bool,
     /// R1 pre-conversion bases. `None` when `capture_pre_conversion` was
     /// false at simulation time.
     pub r1_pre_conversion_bases: Option<Vec<u8>>,
@@ -412,6 +456,7 @@ impl MethylationAnnotation {
     pub fn r1_tags(&self) -> Option<MethylationRecordTags<'_>> {
         self.r1_pre_conversion_bases.as_deref().map(|bases| MethylationRecordTags {
             conversion_type: self.conversion_type,
+            conversion_failed: self.conversion_failed,
             pre_conversion_bases: bases,
             call_tags: self.r1_call_tags.as_ref(),
         })
@@ -423,6 +468,7 @@ impl MethylationAnnotation {
     pub fn r2_tags(&self) -> Option<MethylationRecordTags<'_>> {
         self.r2_pre_conversion_bases.as_deref().map(|bases| MethylationRecordTags {
             conversion_type: self.conversion_type,
+            conversion_failed: self.conversion_failed,
             pre_conversion_bases: bases,
             call_tags: self.r2_call_tags.as_ref(),
         })
@@ -446,6 +492,9 @@ impl MethylationAnnotation {
 pub struct MethylationRecordTags<'a> {
     /// Strand indicator for the `XG:Z` tag (same for R1 and R2 of a pair).
     pub conversion_type: ConversionType,
+    /// Whether the source molecule was a conversion failure; emitted as the
+    /// `cf:i` ground-truth tag. Same for R1 and R2 of a pair.
+    pub conversion_failed: bool,
     /// Pre-conversion bases (read 5'->3' orientation) for the `YS:Z` tag.
     pub pre_conversion_bases: &'a [u8],
     /// Precomputed Bismark methylation call tags. `None` when the
@@ -813,6 +862,7 @@ mod tests {
             contig_methylation: &cm,
             mode: MethylationMode::EmSeq,
             conversion_rate: 1.0,
+            failure_rate: 0.0,
         };
         apply_methylation_conversion(&mut bases, 8, false, 10, 0, &c, &mut rng);
 
@@ -837,6 +887,7 @@ mod tests {
             contig_methylation: &cm,
             mode: MethylationMode::EmSeq,
             conversion_rate: 1.0,
+            failure_rate: 0.0,
         };
         apply_methylation_conversion(&mut bases, 8, false, 10, 0, &c, &mut rng);
 
@@ -864,6 +915,7 @@ mod tests {
             contig_methylation: &cm,
             mode: MethylationMode::EmSeq,
             conversion_rate: 1.0,
+            failure_rate: 0.0,
         };
         apply_methylation_conversion(&mut bases, 5, true, 13, 0, &c, &mut rng);
 
@@ -882,12 +934,103 @@ mod tests {
             contig_methylation: &cm,
             mode: MethylationMode::EmSeq,
             conversion_rate: 1.0,
+            failure_rate: 0.0,
         };
         apply_methylation_conversion(&mut bases, 3, false, 0, 0, &c, &mut rng);
 
         // bases[0..3] = ACG -> ATG (one C converted)
         // bases[3..] untouched -> still CCNNN
         assert_eq!(&bases, b"ATGCCNNN");
+    }
+
+    // --- per-molecule conversion-failure tests ---
+
+    #[test]
+    fn test_failed_molecule_retains_all_should_convert_cytosines() {
+        // failure_rate = 1.0 forces the failed camp; with conversion_rate = 1.0
+        // the failed camp converts at 1 - 1.0 = 0.0, so every should-convert C
+        // is retained and the returned flag reports the failure.
+        let cm = single_hap_cm(MethylationTable::empty(20));
+        let mut bases = b"ACGTACGT".to_vec();
+        let mut rng = SmallRng::seed_from_u64(42);
+
+        let c = MethylationConfig {
+            contig_methylation: &cm,
+            mode: MethylationMode::EmSeq,
+            conversion_rate: 1.0,
+            failure_rate: 1.0,
+        };
+        let failed = apply_methylation_conversion(&mut bases, 8, false, 10, 0, &c, &mut rng);
+
+        assert!(failed, "molecule should be flagged as a conversion failure");
+        assert_eq!(&bases, b"ACGTACGT", "failed molecule must retain every should-convert C");
+    }
+
+    #[test]
+    fn test_failed_molecule_converts_at_one_minus_conversion_rate() {
+        // conversion_rate = 0.0 means the failed camp converts at 1 - 0.0 = 1.0,
+        // so a forced-failed molecule converts every should-convert C. Pins the
+        // "failed rate = 1 - conversion_rate" relationship.
+        let cm = single_hap_cm(MethylationTable::empty(20));
+        let mut bases = b"ACGTACGT".to_vec();
+        let mut rng = SmallRng::seed_from_u64(42);
+
+        let c = MethylationConfig {
+            contig_methylation: &cm,
+            mode: MethylationMode::EmSeq,
+            conversion_rate: 0.0,
+            failure_rate: 1.0,
+        };
+        let failed = apply_methylation_conversion(&mut bases, 8, false, 10, 0, &c, &mut rng);
+
+        assert!(failed);
+        assert_eq!(&bases, b"ATGTATGT", "failed camp at 1 - 0.0 = 1.0 converts every C");
+    }
+
+    #[test]
+    fn test_failure_rate_zero_never_flags_failure() {
+        let cm = single_hap_cm(MethylationTable::empty(20));
+        let mut bases = b"ACGTACGT".to_vec();
+        let mut rng = SmallRng::seed_from_u64(42);
+
+        let c = MethylationConfig {
+            contig_methylation: &cm,
+            mode: MethylationMode::EmSeq,
+            conversion_rate: 1.0,
+            failure_rate: 0.0,
+        };
+        let failed = apply_methylation_conversion(&mut bases, 8, false, 10, 0, &c, &mut rng);
+
+        assert!(!failed, "failure_rate 0.0 must never flag a failure");
+        assert_eq!(&bases, b"ATGTATGT", "non-failed molecule at rate 1.0 converts every C");
+    }
+
+    #[test]
+    fn test_failure_rate_observed_fraction_matches() {
+        // Each call models one molecule; ~50% should be flagged failed at
+        // failure_rate = 0.5. Band derived empirically with
+        // `SmallRng::seed_from_u64(42)` on rand 0.9; the [0.47, 0.53] window
+        // is ~4 sigma from 0.5 at n = 5000, so it tolerates RNG-stream churn,
+        // but may need re-derivation if `SmallRng`'s output stream changes.
+        let cm = single_hap_cm(MethylationTable::empty(8));
+        let mut rng = SmallRng::seed_from_u64(42);
+        let c = MethylationConfig {
+            contig_methylation: &cm,
+            mode: MethylationMode::EmSeq,
+            conversion_rate: 0.999,
+            failure_rate: 0.5,
+        };
+
+        let n = 5000;
+        let mut failures = 0;
+        for _ in 0..n {
+            let mut bases = b"ACGTACGT".to_vec();
+            if apply_methylation_conversion(&mut bases, 8, false, 0, 0, &c, &mut rng) {
+                failures += 1;
+            }
+        }
+        let frac = f64::from(failures) / f64::from(n);
+        assert!((0.47..=0.53).contains(&frac), "observed failed fraction {frac} out of band");
     }
 
     #[test]
@@ -906,6 +1049,7 @@ mod tests {
             contig_methylation: &cm,
             mode: MethylationMode::EmSeq,
             conversion_rate: 0.5,
+            failure_rate: 0.0,
         };
         apply_methylation_conversion(&mut bases, 10_000, false, 0, 0, &c, &mut rng);
 
@@ -925,6 +1069,7 @@ mod tests {
             contig_methylation: &cm,
             mode: MethylationMode::EmSeq,
             conversion_rate: 0.0,
+            failure_rate: 0.0,
         };
         apply_methylation_conversion(&mut bases, 8, false, 0, 0, &c, &mut rng);
 
@@ -941,6 +1086,7 @@ mod tests {
             contig_methylation: &cm,
             mode: MethylationMode::EmSeq,
             conversion_rate: 1.0,
+            failure_rate: 0.0,
         };
         apply_methylation_conversion(&mut bases, 8, false, 0, 0, &c, &mut rng);
 
@@ -964,6 +1110,7 @@ mod tests {
             contig_methylation: &cm,
             mode: MethylationMode::EmSeq,
             conversion_rate: 1.0,
+            failure_rate: 0.0,
         };
         apply_methylation_conversion(&mut bases, 10, false, 45, 0, &c, &mut rng);
 
@@ -989,6 +1136,7 @@ mod tests {
             contig_methylation: &cm,
             mode: MethylationMode::Taps,
             conversion_rate: 1.0,
+            failure_rate: 0.0,
         };
         apply_methylation_conversion(&mut bases, 8, false, 10, 0, &c, &mut rng);
 
@@ -1008,6 +1156,7 @@ mod tests {
             contig_methylation: &cm,
             mode: MethylationMode::Taps,
             conversion_rate: 1.0,
+            failure_rate: 0.0,
         };
         apply_methylation_conversion(&mut bases, 8, false, 10, 0, &c, &mut rng);
 
@@ -1031,6 +1180,7 @@ mod tests {
             contig_methylation: &cm,
             mode: MethylationMode::Taps,
             conversion_rate: 1.0,
+            failure_rate: 0.0,
         };
         apply_methylation_conversion(&mut bases, 5, true, 13, 0, &c, &mut rng);
 

@@ -67,9 +67,10 @@ holodeck methylate -r ref.fa -v mutations.vcf -o methylated.vcf.gz --methylation
 # (methylation chemistry applies because the input VCF has MT/MB fields from holodeck methylate;
 #  for a non-methylation run, drop --methylation-mode and pass -v mutations.vcf instead)
 holodeck simulate -r ref.fa -v methylated.vcf.gz -o sim --coverage 30 \
-    --methylation-mode em-seq --methylation-conversion-rate 0.99 --golden-bam
+    --methylation-mode em-seq --methylation-conversion-rate 0.999 \
+    --methylation-failure-rate 0.01 --golden-bam
 
-# Outputs: sim.r1.fastq.gz, sim.r2.fastq.gz, sim.golden.bam
+# Outputs: sim.r1.fastq.gz, sim.r2.fastq.gz, sim.golden.bam (records tagged cf:i for conversion failures)
 
 # Align reads and evaluate accuracy
 minimap2 -a ref.fa sim.r1.fastq.gz sim.r2.fastq.gz | samtools sort -o mapped.bam
@@ -121,7 +122,8 @@ holodeck simulate -r ref.fa -v methylated.vcf.gz -o output_taps \
 | `--max-error-rate` | 0.01 | Error rate at end of reads |
 | `--max-n-frac` | 0.02 | Reject reads with >this fraction of bases from ambiguous reference positions (see [Ambiguous reference bases](#ambiguous-reference-bases)) |
 | `--methylation-mode` | none | Methylation chemistry: `em-seq` (or `bisulfite`) or `taps`. Presence enables methylation simulation |
-| `--methylation-conversion-rate` | 1.0 | Chemistry efficiency (probability that the converting class of C converts to T) |
+| `--methylation-conversion-rate` | 0.999 | Chemistry efficiency for normally-converting molecules (probability that the converting class of C converts to T) |
+| `--methylation-failure-rate` | 0.01 | Fraction of molecules that are whole-molecule conversion failures (convert at `1 − conversion-rate`). Requires `--methylation-mode` |
 | `--cpg-truth-bedgraph` | none | Write per-CpG ground-truth methylation tally in MethylDackel `extract` bedGraph format. Requires `--methylation-mode` |
 | `--golden-bam` | off | Write ground-truth BAM |
 | `--single-end` | off | Generate SE instead of PE reads |
@@ -204,7 +206,8 @@ There are two record kinds:
 | Option | Default | Description |
 |--------|---------|-------------|
 | `--methylation-mode` | none | Methylation chemistry: `em-seq` (or `bisulfite`) or `taps`. Presence enables methylation simulation |
-| `--methylation-conversion-rate` | 1.0 | Chemistry efficiency: probability that the converting class of C converts to T |
+| `--methylation-conversion-rate` | 0.999 | Chemistry efficiency for normally-converting molecules: probability that the converting class of C converts to T |
+| `--methylation-failure-rate` | 0.01 | Fraction of molecules that are whole-molecule conversion failures. Requires `--methylation-mode` |
 | `--cpg-truth-bedgraph` | none | Write per-CpG ground-truth methylation tally in MethylDackel `extract` bedGraph format. Requires `--methylation-mode` |
 
 Note: `--methylation-rate` is **not** a `simulate` flag. Methylation truth comes exclusively from the `MT`/`MB` fields in the input VCF produced by `holodeck methylate`.
@@ -214,7 +217,15 @@ Note: `--methylation-rate` is **not** a `simulate` flag. Methylation truth comes
 - **em-seq** (alias `bisulfite`): unmethylated cytosines convert to thymine; methylated cytosines are preserved. Matches both classical bisulfite and enzymatic methyl-seq (em-seq, NEBNext) — the conversion patterns are identical.
 - **taps**: methylated cytosines convert to thymine; unmethylated cytosines are preserved. The inverse of em-seq — a `C→T` event at a CpG signals methylation rather than the absence of it.
 
-The "converting class" of cytosines (unmethylated for em-seq, methylated for taps) converts to thymine with probability `--methylation-conversion-rate` (default `1.0`). Non-CpG cytosines are always treated as unmethylated.
+The "converting class" of cytosines (unmethylated for em-seq, methylated for taps) converts to thymine with probability `--methylation-conversion-rate` (default `0.999`) in a molecule that converted normally. Non-CpG cytosines are always treated as unmethylated.
+
+#### Conversion failure (per-molecule)
+
+Real bisulfite/EM-seq conversion is effectively **bimodal** at the molecule level: most molecules convert near-completely, while a small fraction (fragments that fail to denature, or re-anneal too fast) escape conversion as a coherent unit. The dataset-wide "conversion rate" you see quoted (~0.98–0.99) is the *mean of this mixture*, not a rate any individual molecule sits at.
+
+Holodeck models this with `--methylation-failure-rate` (default `0.01`): each fragment is independently drawn as a *conversion failure* with that probability. A failed molecule converts its should-convert cytosines at `1 − --methylation-conversion-rate` (near-zero), so it coherently retains almost all of them as C — and because the draw happens once per fragment, both mates of a pair agree. Pass `--methylation-failure-rate 0.0` (with `--methylation-conversion-rate 1.0`) to recover perfectly deterministic, lossless conversion.
+
+When `--golden-bam` is set, every record is stamped with `cf:i:{0|1}` recording whether its source molecule was drawn as a failure (see the golden-BAM tag section) — the one piece of conversion-failure truth that is *not* recoverable from the read sequence alone.
 
 #### Behavior under different conversion rates
 
@@ -274,7 +285,7 @@ When `--golden-bam` is enabled together with `--methylation-mode`, holodeck emit
 
 ##### Tag reference
 
-A non-methylation `--golden-bam` run emits **none** of the tags below; the BAM only carries `RG`, `hp` (haplotype index), and `ne` (number of error events). All seven methylation tags appear together when `--methylation-mode` is set.
+A non-methylation `--golden-bam` run emits **none** of the tags below; the BAM only carries `RG`, `hp` (haplotype index), and `ne` (number of error events). All eight methylation tags appear together when `--methylation-mode` is set.
 
 | Tag    | Source   | One-line summary |
 | ---    | ---      | --- |
@@ -285,6 +296,7 @@ A non-methylation `--golden-bam` run emits **none** of the tags below; the BAM o
 | `NM:i` | Bismark  | Edit distance against the unconverted reference, chemistry events suppressed. |
 | `MD:Z` | Bismark  | Match/mismatch description against the unconverted reference, chemistry events suppressed. |
 | `YS:Z` | holodeck | Pre-conversion read sequence in reference-forward orientation. |
+| `cf:i` | holodeck | Conversion-failure flag: `1` if the source molecule was drawn as a whole-molecule conversion failure, else `0`. |
 
 ###### `XG:Z` — genome-strand indicator
 
@@ -324,6 +336,10 @@ Match/mismatch description against the unconverted reference, same suppression r
 ###### `YS:Z` — pre-conversion read sequence
 
 Holodeck-specific. The pre-chemistry read sequence in reference-forward orientation. Diff `SEQ` against `YS` base-for-base to recover the ground-truth chemistry events the simulator applied to this record. Identical mechanics under em-seq and TAPS; the recovered events carry the mode's biological meaning.
+
+###### `cf:i` — conversion-failure flag
+
+Holodeck-specific. `1` if the source molecule was drawn as a whole-molecule conversion failure (see [Conversion failure](#conversion-failure-per-molecule)), else `0`. A molecule property, so R1 and R2 of a pair always carry the same value. This is the one piece of conversion-failure ground truth that *cannot* be recovered from the read alone: a normally-converted molecule can coincidentally retain cytosines and look failed, and vice versa, so a detector scored on `SEQ`/`YS` needs `cf` as the gold label. The *consequences* of failure are still observable without it — a failed read has `SEQ ≈ YS` and its `XM:Z` diverges from `YM:Z` at retained CpH cytosines.
 
 ##### Truth vs observation: when do `XM` and `YM` diverge?
 

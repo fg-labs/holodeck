@@ -88,6 +88,8 @@ fn test_em_seq_full_conversion_eliminates_c() {
         "em-seq",
         "--methylation-conversion-rate",
         "1.0",
+        "--methylation-failure-rate",
+        "0.0",
         "--threads",
         "1",
     ]);
@@ -146,6 +148,8 @@ fn test_em_seq_full_methylation_preserves_c() {
         "em-seq",
         "--methylation-conversion-rate",
         "1.0",
+        "--methylation-failure-rate",
+        "0.0",
         "--threads",
         "1",
     ]);
@@ -201,6 +205,8 @@ fn test_em_seq_partial_conversion_rate() {
         "em-seq",
         "--methylation-conversion-rate",
         "0.5",
+        "--methylation-failure-rate",
+        "0.0",
         "--seed",
         "42",
         "--threads",
@@ -258,6 +264,8 @@ fn test_em_seq_intermediate_methylation_preserves_some_c() {
         "em-seq",
         "--methylation-conversion-rate",
         "1.0",
+        "--methylation-failure-rate",
+        "0.0",
         "--seed",
         "42",
         "--threads",
@@ -298,6 +306,8 @@ fn test_methylation_is_deterministic_with_seed() {
         "em-seq",
         "--methylation-conversion-rate",
         "0.5",
+        "--methylation-failure-rate",
+        "0.0",
         "--seed",
         "12345",
         "--threads",
@@ -354,6 +364,8 @@ fn test_golden_bam_em_seq_emits_xg_xr_and_ys_tags_when_enabled() {
         "em-seq",
         "--methylation-conversion-rate",
         "1.0",
+        "--methylation-failure-rate",
+        "0.0",
         "--golden-bam",
         "--threads",
         "1",
@@ -461,11 +473,13 @@ fn test_golden_bam_omits_methylation_tags_when_methylation_disabled() {
     let xr = DataTag::new(b'X', b'R');
     let yc = DataTag::new(b'Y', b'C');
     let ys = DataTag::new(b'Y', b'S');
+    let cf = DataTag::new(b'c', b'f');
     for rec in &records {
         assert!(rec.data().get(&xg).is_none(), "XG must not be present without methylation");
         assert!(rec.data().get(&xr).is_none(), "XR must not be present without methylation");
         assert!(rec.data().get(&yc).is_none(), "YC must never be present (removed)");
         assert!(rec.data().get(&ys).is_none(), "YS must not be present without methylation");
+        assert!(rec.data().get(&cf).is_none(), "cf must not be present without methylation");
     }
 }
 
@@ -503,6 +517,8 @@ fn test_golden_bam_em_seq_ys_matches_reference_oriented_pre_conversion() {
         "em-seq",
         "--methylation-conversion-rate",
         "1.0",
+        "--methylation-failure-rate",
+        "0.0",
         "--golden-bam",
         "--threads",
         "1",
@@ -591,6 +607,8 @@ fn test_em_seq_single_end_emits_xg_ys_and_full_conversion() {
         "em-seq",
         "--methylation-conversion-rate",
         "1.0",
+        "--methylation-failure-rate",
+        "0.0",
         "--golden-bam",
         "--threads",
         "1",
@@ -622,10 +640,16 @@ fn test_em_seq_single_end_emits_xg_ys_and_full_conversion() {
     let xg = DataTag::new(b'X', b'G');
     let xr = DataTag::new(b'X', b'R');
     let ys = DataTag::new(b'Y', b'S');
+    let cf = DataTag::new(b'c', b'f');
 
     for rec in &records {
         // SE records are not paired; SEGMENTED flag should be absent.
         assert!(!rec.flags().is_segmented(), "SE record must not have SEGMENTED flag set");
+
+        // The SE path carries cf:i too; failure-rate 0.0 → every record is 0.
+        let cf_val =
+            rec.data().get(&cf).expect("cf:i must be present").as_int().expect("cf is int");
+        assert_eq!(cf_val, 0, "SE record at failure-rate 0.0 must be cf:i:0");
 
         let xg_val = rec.data().get(&xg).expect("XG:Z must be present");
         let DataValue::String(s) = xg_val else {
@@ -691,6 +715,8 @@ fn test_taps_full_methylation_full_conversion_eliminates_c_at_cpg() {
         "taps",
         "--methylation-conversion-rate",
         "1.0",
+        "--methylation-failure-rate",
+        "0.0",
         "--threads",
         "1",
     ]);
@@ -743,6 +769,8 @@ fn test_taps_zero_methylation_preserves_all_c() {
         "taps",
         "--methylation-conversion-rate",
         "1.0",
+        "--methylation-failure-rate",
+        "0.0",
         "--threads",
         "1",
     ]);
@@ -793,6 +821,8 @@ fn test_taps_golden_bam_emits_xg_xr_and_ys() {
         "taps",
         "--methylation-conversion-rate",
         "1.0",
+        "--methylation-failure-rate",
+        "0.0",
         "--golden-bam",
         "--threads",
         "1",
@@ -868,6 +898,8 @@ fn test_em_seq_and_taps_produce_different_output() {
         "0",
         "--methylation-conversion-rate",
         "1.0",
+        "--methylation-failure-rate",
+        "0.0",
         "--seed",
         "9876",
         "--threads",
@@ -1051,6 +1083,8 @@ fn test_bisulfite_alias_byte_identical_to_em_seq() {
         "50",
         "--methylation-conversion-rate",
         "1.0",
+        "--methylation-failure-rate",
+        "0.0",
         "--seed",
         "12345",
         "--threads",
@@ -1138,6 +1172,8 @@ fn test_taps_golden_bam_ys_diffs_match_chemistry() {
         "taps",
         "--methylation-conversion-rate",
         "1.0",
+        "--methylation-failure-rate",
+        "0.0",
         "--golden-bam",
         "--seed",
         "42",
@@ -1240,6 +1276,8 @@ fn test_em_seq_full_cpg_methylation_still_converts_non_cpg() {
         "em-seq",
         "--methylation-conversion-rate",
         "1.0",
+        "--methylation-failure-rate",
+        "0.0",
         "--seed",
         "42",
         "--threads",
@@ -1337,6 +1375,8 @@ fn test_em_seq_with_vcf_handles_haplotype_specific_cpgs() {
         "em-seq",
         "--methylation-conversion-rate",
         "1.0",
+        "--methylation-failure-rate",
+        "0.0",
         "--golden-bam",
         "--seed",
         "42",
@@ -1500,6 +1540,8 @@ fn test_cpg_truth_bedgraph_full_methylation_emits_only_methylated_calls() {
         "em-seq",
         "--methylation-conversion-rate",
         "1.0",
+        "--methylation-failure-rate",
+        "0.0",
         "--cpg-truth-bedgraph",
         bg.to_str().unwrap(),
         "--seed",
@@ -1567,6 +1609,8 @@ fn test_cpg_truth_bedgraph_zero_methylation_emits_only_unmethylated_calls() {
         "em-seq",
         "--methylation-conversion-rate",
         "1.0",
+        "--methylation-failure-rate",
+        "0.0",
         "--cpg-truth-bedgraph",
         bg.to_str().unwrap(),
         "--seed",
@@ -1622,6 +1666,8 @@ fn test_cpg_truth_bedgraph_taps_intermediate_methylation_yields_mixed_rates() {
         "taps",
         "--methylation-conversion-rate",
         "1.0",
+        "--methylation-failure-rate",
+        "0.0",
         "--cpg-truth-bedgraph",
         bg.to_str().unwrap(),
         "--seed",
@@ -1685,6 +1731,8 @@ fn test_golden_bam_emits_xm_ym_nm_md_under_full_methylation_no_errors() {
         "em-seq",
         "--methylation-conversion-rate",
         "1.0",
+        "--methylation-failure-rate",
+        "0.0",
         "--golden-bam",
         "--threads",
         "1",
@@ -1780,6 +1828,8 @@ fn test_golden_bam_xm_lowercase_under_full_conversion() {
         "em-seq",
         "--methylation-conversion-rate",
         "1.0",
+        "--methylation-failure-rate",
+        "0.0",
         "--golden-bam",
         "--threads",
         "1",
@@ -1883,6 +1933,8 @@ fn test_xm_ym_diverge_under_errors_at_methylated_cpg() {
         "em-seq",
         "--methylation-conversion-rate",
         "1.0",
+        "--methylation-failure-rate",
+        "0.0",
         "--golden-bam",
         "--seed",
         "42",
@@ -1953,6 +2005,8 @@ fn matrix_vcf_with_mtmb_and_mode_runs_chemistry() {
         "em-seq",
         "--methylation-conversion-rate",
         "1.0",
+        "--methylation-failure-rate",
+        "0.0",
         "--threads",
         "1",
     ]);
@@ -1996,6 +2050,8 @@ fn matrix_vcf_with_mtmb_no_mode_warns_and_runs_variants_only() {
         "em-seq",
         "--methylation-conversion-rate",
         "1.0",
+        "--methylation-failure-rate",
+        "0.0",
         "--seed",
         "99",
         "--threads",
@@ -2196,4 +2252,207 @@ fn cpg_truth_bedgraph_works_with_matrix_true_true_cell() {
         !data_lines.is_empty(),
         "--cpg-truth-bedgraph should have at least one per-CpG record under non-zero coverage"
     );
+}
+
+/// With `--methylation-failure-rate 1.0` every molecule is a conversion
+/// failure; at `--methylation-conversion-rate 1.0` the failed camp converts
+/// at `1 - 1.0 = 0.0`, so nothing converts. Every golden-BAM record must
+/// carry `cf:i:1`, and `SEQ` must equal `YS:Z` (the pre-conversion bases)
+/// because no chemistry was applied.
+#[test]
+fn test_golden_bam_all_failed_sets_cf_one_and_retains_cytosines() {
+    use noodles::sam::alignment::record::data::field::Tag as DataTag;
+    use noodles::sam::alignment::record_buf::data::field::Value as DataValue;
+
+    let env = cytosine_rich_env();
+    let out = env.output_prefix();
+    let vcf = methylate_to_vcf(&env, &env.fasta_path, 0.0, 42, "meth.vcf.gz");
+
+    let (ok, _, stderr) = run_simulate(&[
+        "simulate",
+        "-r",
+        env.fasta_path.to_str().unwrap(),
+        "-v",
+        vcf.to_str().unwrap(),
+        "-o",
+        out.to_str().unwrap(),
+        "--coverage",
+        "5",
+        "--read-length",
+        "50",
+        "--fragment-mean",
+        "100",
+        "--fragment-stddev",
+        "10",
+        "--min-error-rate",
+        "0",
+        "--max-error-rate",
+        "0",
+        "--methylation-mode",
+        "em-seq",
+        "--methylation-conversion-rate",
+        "1.0",
+        "--methylation-failure-rate",
+        "1.0",
+        "--golden-bam",
+        "--threads",
+        "1",
+    ]);
+    assert!(ok, "simulate failed: {stderr}");
+
+    let records = read_bam_records(&out.with_extension("golden.bam"));
+    assert!(!records.is_empty(), "expected non-empty golden BAM");
+
+    let cf = DataTag::new(b'c', b'f');
+    let ys = DataTag::new(b'Y', b'S');
+    let mut any_retained_c = false;
+    for rec in &records {
+        let cf_val =
+            rec.data().get(&cf).expect("cf:i must be present").as_int().expect("cf is int");
+        assert_eq!(cf_val, 1, "every molecule is a forced failure → cf:i:1");
+
+        let DataValue::String(ys_bytes) = rec.data().get(&ys).expect("YS:Z must be present") else {
+            panic!("YS must be a String tag");
+        };
+        let seq: Vec<u8> = rec.sequence().as_ref().to_vec();
+        let ys_slice: &[u8] = ys_bytes.as_ref();
+        assert_eq!(
+            seq, ys_slice,
+            "failed molecule must not convert: SEQ must equal pre-conversion YS"
+        );
+        any_retained_c |= seq.contains(&b'C');
+    }
+    assert!(any_retained_c, "cytosine-rich reads should retain C's when conversion fails");
+}
+
+/// With `--methylation-failure-rate 0.0` no molecule fails, so every record
+/// carries `cf:i:0`.
+#[test]
+fn test_golden_bam_no_failure_sets_cf_zero() {
+    use noodles::sam::alignment::record::data::field::Tag as DataTag;
+
+    let env = cytosine_rich_env();
+    let out = env.output_prefix();
+    let vcf = methylate_to_vcf(&env, &env.fasta_path, 0.0, 42, "meth.vcf.gz");
+
+    let (ok, _, stderr) = run_simulate(&[
+        "simulate",
+        "-r",
+        env.fasta_path.to_str().unwrap(),
+        "-v",
+        vcf.to_str().unwrap(),
+        "-o",
+        out.to_str().unwrap(),
+        "--coverage",
+        "5",
+        "--read-length",
+        "50",
+        "--fragment-mean",
+        "100",
+        "--fragment-stddev",
+        "10",
+        "--min-error-rate",
+        "0",
+        "--max-error-rate",
+        "0",
+        "--methylation-mode",
+        "em-seq",
+        "--methylation-conversion-rate",
+        "1.0",
+        "--methylation-failure-rate",
+        "0.0",
+        "--golden-bam",
+        "--threads",
+        "1",
+    ]);
+    assert!(ok, "simulate failed: {stderr}");
+
+    let records = read_bam_records(&out.with_extension("golden.bam"));
+    assert!(!records.is_empty(), "expected non-empty golden BAM");
+
+    let cf = DataTag::new(b'c', b'f');
+    for rec in &records {
+        let cf_val =
+            rec.data().get(&cf).expect("cf:i must be present").as_int().expect("cf is int");
+        assert_eq!(cf_val, 0, "no failures → cf:i:0 on every record");
+    }
+}
+
+/// `cf` is a molecule property, so both mates of a pair must agree. At a
+/// mixed `--methylation-failure-rate 0.5` over many fragments we must see
+/// both camps, and the two records of any template must share their `cf`.
+#[test]
+fn test_cf_identical_across_mates_and_mix_present() {
+    use std::collections::HashMap;
+
+    use noodles::sam::alignment::record::data::field::Tag as DataTag;
+
+    let env = cytosine_rich_env();
+    let out = env.output_prefix();
+    let vcf = methylate_to_vcf(&env, &env.fasta_path, 0.0, 42, "meth.vcf.gz");
+
+    let (ok, _, stderr) = run_simulate(&[
+        "simulate",
+        "-r",
+        env.fasta_path.to_str().unwrap(),
+        "-v",
+        vcf.to_str().unwrap(),
+        "-o",
+        out.to_str().unwrap(),
+        "--coverage",
+        "30",
+        "--read-length",
+        "50",
+        "--fragment-mean",
+        "100",
+        "--fragment-stddev",
+        "10",
+        "--min-error-rate",
+        "0",
+        "--max-error-rate",
+        "0",
+        "--methylation-mode",
+        "em-seq",
+        "--methylation-conversion-rate",
+        "0.999",
+        "--methylation-failure-rate",
+        "0.5",
+        "--golden-bam",
+        "--seed",
+        "7",
+        "--threads",
+        "1",
+    ]);
+    assert!(ok, "simulate failed: {stderr}");
+
+    let records = read_bam_records(&out.with_extension("golden.bam"));
+    assert!(!records.is_empty(), "expected non-empty golden BAM");
+
+    let cf = DataTag::new(b'c', b'f');
+    let mut by_template: HashMap<String, Vec<i64>> = HashMap::new();
+    for rec in &records {
+        let name = std::str::from_utf8(rec.name().expect("read name present").as_ref())
+            .unwrap()
+            .to_string();
+        let cf_val =
+            rec.data().get(&cf).expect("cf:i must be present").as_int().expect("cf is int");
+        by_template.entry(name).or_default().push(cf_val);
+    }
+
+    let mut seen_failed = false;
+    let mut seen_converted = false;
+    for (name, cfs) in &by_template {
+        let first = cfs[0];
+        assert!(
+            cfs.iter().all(|&v| v == first),
+            "both mates of template {name} must share cf; got {cfs:?}"
+        );
+        match first {
+            0 => seen_converted = true,
+            1 => seen_failed = true,
+            other => panic!("cf must be 0 or 1, got {other}"),
+        }
+    }
+    assert!(seen_failed, "at failure_rate 0.5 some molecules must be flagged cf:i:1");
+    assert!(seen_converted, "at failure_rate 0.5 some molecules must be cf:i:0");
 }

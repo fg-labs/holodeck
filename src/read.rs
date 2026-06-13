@@ -84,6 +84,10 @@ struct MateOutput {
 /// with `is_negative_strand = true` (which selects the bottom bitmap and
 /// reverses the index), then revcomp back to top orientation before
 /// returning.
+///
+/// Returns the post-chemistry top-strand bases together with whether the
+/// molecule was drawn as a conversion failure (a molecule property, the same
+/// for both mates).
 fn apply_fragment_chemistry(
     pre_chem_top: &[u8],
     hap_start: u32,
@@ -91,13 +95,13 @@ fn apply_fragment_chemistry(
     haplotype_index: usize,
     config: &MethylationConfig<'_>,
     rng: &mut impl Rng,
-) -> Vec<u8> {
+) -> (Vec<u8>, bool) {
     let mut bases = pre_chem_top.to_vec();
     if !is_forward {
         reverse_complement(&mut bases);
     }
     let n = bases.len();
-    apply_methylation_conversion(
+    let conversion_failed = apply_methylation_conversion(
         &mut bases,
         n,
         !is_forward,
@@ -109,7 +113,7 @@ fn apply_fragment_chemistry(
     if !is_forward {
         reverse_complement(&mut bases);
     }
-    bases
+    (bases, conversion_failed)
 }
 
 /// Build one mate (R1 or R2) from already-extracted bases.
@@ -260,7 +264,7 @@ pub fn generate_read_pair(
     // strand. This produces top-strand-oriented bases reflecting the
     // appropriate strand's chemistry (em-seq / TAPS, with CpG context
     // resolved per-haplotype).
-    let post_chem_top = match methylation {
+    let (post_chem_top, conversion_failed) = match methylation {
         Some(mc) => apply_fragment_chemistry(
             &pre_chem_top,
             fragment.hap_start,
@@ -269,7 +273,7 @@ pub fn generate_read_pair(
             mc,
             rng,
         ),
-        None => pre_chem_top.clone(),
+        None => (pre_chem_top.clone(), false),
     };
 
     // Step 4 — derive per-mate read bases from the chemistry-applied
@@ -302,6 +306,7 @@ pub fn generate_read_pair(
 
         let methylation_annotation = methylation.map(|_| MethylationAnnotation {
             conversion_type: ConversionType::from_strand(fragment.is_forward),
+            conversion_failed,
             r1_pre_conversion_bases: r1.pre_conversion,
             r2_pre_conversion_bases: None,
             r1_call_tags: None,
@@ -342,6 +347,7 @@ pub fn generate_read_pair(
 
     let methylation_annotation = methylation.map(|_| MethylationAnnotation {
         conversion_type: ConversionType::from_strand(fragment.is_forward),
+        conversion_failed,
         r1_pre_conversion_bases: r1.pre_conversion,
         r2_pre_conversion_bases: r2.pre_conversion,
         r1_call_tags: None,
@@ -701,6 +707,7 @@ mod tests {
             contig_methylation: &cm,
             mode: MethylationMode::EmSeq,
             conversion_rate: 1.0,
+            failure_rate: 0.0,
         };
 
         // Fragment with C's at known positions, forward strand → R1 sees them
@@ -770,6 +777,7 @@ mod tests {
             contig_methylation: &cm,
             mode: MethylationMode::EmSeq,
             conversion_rate: 1.0,
+            failure_rate: 0.0,
         };
 
         // Reverse-strand fragment → reads come from the bottom strand → XG=GA.
@@ -843,6 +851,7 @@ mod tests {
             contig_methylation: &cm,
             mode: MethylationMode::EmSeq,
             conversion_rate: 1.0,
+            failure_rate: 0.0,
         };
 
         let fragment = test_fragment(b"ACAGACAGACAG", 0);
@@ -895,6 +904,7 @@ mod tests {
             contig_methylation: &cm,
             mode: MethylationMode::EmSeq,
             conversion_rate: 1.0,
+            failure_rate: 0.0,
         };
 
         let mut fragment = test_fragment(b"ACAGACAGACAG", 0);
