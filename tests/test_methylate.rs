@@ -240,8 +240,10 @@ fn methylate_default_is_no_longer_fully_methylated() {
     // methylated. Over a long open-sea reference the MEAN per-CpG rate should
     // sit near the open-sea target and clearly below 100 — a structural check,
     // not "at least one happens to be unmethylated". Guards against a
-    // regression to the old flat-1.0 default. Seed-pinned; the band assumes
-    // SmallRng on rand 0.9 and may need widening if the RNG stream changes.
+    // regression to the old flat-1.0 default. Seed-pinned (measured ~81.5 at
+    // this seed; ~81–91 across seeds), so the band is tight enough to catch a
+    // flat-default regression yet leaves headroom for the SmallRng-on-rand-0.9
+    // caveat; widen if the RNG stream changes.
     let seq = b"ACGT".repeat(25_000); // 100 kb, CpG every 4 bp → all open-sea
     let env = TestEnv::new(&[("chr1", &seq)]);
     let out_path = env.dir.path().join("meth.vcf.gz");
@@ -262,7 +264,7 @@ fn methylate_default_is_no_longer_fully_methylated() {
     assert!(!rates.is_empty(), "expected bedgraph records");
     let mean = rates.iter().map(|&(_, r)| f64::from(r)).sum::<f64>() / rates.len() as f64;
     assert!(
-        (50.0..=95.0).contains(&mean),
+        (70.0..=95.0).contains(&mean),
         "default open-sea mean rate {mean} should be near ~85 and clearly below the old flat 100"
     );
 }

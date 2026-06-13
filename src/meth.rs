@@ -153,7 +153,7 @@ impl MethylationModel {
     /// `[0.0, 1.0]` and every correlation length is finite and `> 0`.
     ///
     /// Called at the CLI boundary; [`MethylationTable::from_haplotype`] also
-    /// asserts a valid model as defense-in-depth on the `pub` boundary.
+    /// asserts a valid model as defense-in-depth on the `pub(crate)` boundary.
     ///
     /// # Errors
     ///
@@ -254,8 +254,9 @@ impl MethylationTable {
     ///
     /// Panics if `model` fails [`MethylationModel::validate`] (NaN/out-of-range
     /// rate or non-positive correlation length). The `methylate` CLI validates
-    /// the model at startup, but this is a `pub` constructor reachable from
-    /// library code, so the invariant is asserted here as defense-in-depth.
+    /// the model at startup, but this is a `pub(crate)` constructor reachable
+    /// from elsewhere in the crate, so the invariant is asserted here as
+    /// defense-in-depth.
     pub(crate) fn from_haplotype(
         haplotype: &crate::haplotype::Haplotype,
         reference: &[u8],
