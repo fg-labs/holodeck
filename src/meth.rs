@@ -235,7 +235,9 @@ impl MethylationTable {
     /// Methylation is **symmetric** by default (a methylated CpG sets both the
     /// top-strand C and the bottom-strand C); with probability
     /// [`MethylationModel::hemi_rate`] a methylated CpG is made hemimethylated
-    /// by unsetting exactly one randomly chosen strand.
+    /// by unsetting exactly one randomly chosen strand. The stationary mean `m`
+    /// is the per-CpG *methylated-state* rate; when `hemi_rate > 0` the realized
+    /// per-strand methylated fraction is `m * (1 - hemi_rate / 2)`.
     ///
     /// # Panics
     ///
@@ -576,9 +578,10 @@ fn island_runs(mask: &BitVec) -> Vec<(u32, u32)> {
     runs
 }
 
-/// Whether `c` is within [`SHORE_WIDTH_BP`] of any island run (but not inside
-/// one — callers test the mask for `Island` first). `runs` are ascending and
-/// disjoint, so only the run immediately left and right of `c` can be nearest.
+/// Whether `c` is within [`SHORE_WIDTH_BP`] (inclusive) of any island run, but
+/// not inside one — callers test the mask for `Island` first. `runs` are
+/// ascending and disjoint, so only the run immediately left and right of `c`
+/// can be the nearest.
 fn near_island(c: u32, runs: &[(u32, u32)]) -> bool {
     // First run whose start is strictly greater than `c` (the right neighbor).
     let idx = runs.partition_point(|&(s, _)| s <= c);
@@ -1274,6 +1277,73 @@ mod tests {
         // Single CpG, full methylation → both strands set.
         let t = MethylationTable::from_haplotype(&hap, b"ACGT", &uniform_model(1.0), &mut rng);
         assert!(t.is_methylated(1, false) && t.is_methylated(2, true));
+    }
+
+    #[test]
+    fn test_walk_shore_rate_is_intermediate_between_island_and_open_sea() {
+        // Guards the Shore branch of `params_for`: shore CpGs (within 2 kb of
+        // the island, but outside it) must take the shore rate, landing
+        // between island (hypo) and open-sea (hyper). A bug routing Shore to
+        // the wrong ContextParams would otherwise pass every other test, which
+        // all exclude the shore band. Distinct rates + small L for tight means.
+        let os_unit = b"AATTCGAATT"; // CG every 10 bp, 20% GC → open-sea
+        let mut seq = b"CG".repeat(150); // 300 bp island at the start
+        let island_end = seq.len();
+        for _ in 0..1500 {
+            seq.extend_from_slice(os_unit); // 15 kb of CpG-bearing open-sea
+        }
+        let hap = ref_haplotype();
+        let mut rng = SmallRng::seed_from_u64(42);
+        let m = MethylationModel {
+            island: ContextParams { rate: 0.1, correlation_length_bp: 30.0 },
+            shore: ContextParams { rate: 0.5, correlation_length_bp: 30.0 },
+            open_sea: ContextParams { rate: 0.85, correlation_length_bp: 30.0 },
+            hemi_rate: 0.0,
+        };
+        let table = MethylationTable::from_haplotype(&hap, &seq, &m, &mut rng);
+
+        let cpgs = find_reference_cpgs(&seq);
+        let mean_over = |lo: usize, hi: usize| {
+            let v: Vec<bool> = cpgs
+                .iter()
+                .filter(|&&c| (c as usize) >= lo && (c as usize) < hi)
+                .map(|&c| table.is_methylated(c, false))
+                .collect();
+            assert!(!v.is_empty(), "no CpGs in [{lo}, {hi})");
+            v.iter().filter(|&&b| b).count() as f64 / v.len() as f64
+        };
+        // Island interior; shore band (within 2 kb, past the relaxation zone);
+        // far open sea (> 2 kb past the island).
+        let island = mean_over(50, island_end - 20);
+        let shore = mean_over(island_end + 400, island_end + 1900);
+        let open_sea = mean_over(island_end + 6000, seq.len());
+        assert!(island < shore, "island {island} should be below shore {shore}");
+        assert!(shore < open_sea, "shore {shore} should be below open sea {open_sea}");
+        assert!((0.3..=0.7).contains(&shore), "shore mean {shore} should be ~0.5");
+    }
+
+    #[test]
+    fn test_from_haplotypes_allele_specific_methylation() {
+        // Two haplotypes with IDENTICAL CpG content (no variants → both are the
+        // reference) must receive DIFFERENT methylation patterns, because each
+        // haplotype is walked as an independent chain. Pins the advertised
+        // allele-specific-methylation behaviour, which the rate-1.0/0.0 tests
+        // (deterministic) cannot exercise.
+        let reference = acgt_repeat(2000); // 2000 CpGs, identical on both haps
+        let haps = build_haplotypes(&[], 2, &mut SmallRng::seed_from_u64(0));
+        let mut rng = SmallRng::seed_from_u64(42);
+        let cm =
+            ContigMethylation::from_haplotypes(&haps, &reference, &model(0.5, 1.0, 0.0), &mut rng);
+        let (h0, h1) = (cm.table_for(0), cm.table_for(1));
+        let differ = (0u32..2000)
+            .filter(|&s| h0.is_methylated(s * 4 + 1, false) != h1.is_methylated(s * 4 + 1, false))
+            .count();
+        // Independent Bernoulli(0.5) draws differ ~50% of the time; require a
+        // large fraction to rule out shared/duplicated draws across haplotypes.
+        assert!(
+            differ > 600,
+            "haplotypes should diverge at many CpGs; only {differ}/2000 differed"
+        );
     }
 
     // --- CpG-island detector tests ---

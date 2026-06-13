@@ -82,7 +82,7 @@ fn methylate_produces_loadable_vcf_with_mt_mb() {
 ///
 /// Reference: a 1 kb ACGT-repeat contig where every C is in a CpG context.
 /// Pipeline:
-///   1. `holodeck methylate --methylation-rate 1.0` → `meth.vcf.gz`
+///   1. `holodeck methylate` with all context rates 1.0 → `meth.vcf.gz`
 ///      (all CpGs unconditionally methylated on both haplotypes)
 ///   2. `holodeck simulate --vcf meth.vcf.gz --methylation-mode em-seq
 ///        --methylation-conversion-rate 0.0 --golden-bam`
@@ -186,7 +186,7 @@ fn methylate_then_simulate_propagates_methylation_to_golden_bam() {
 #[test]
 fn methylate_writes_bedgraph_when_requested() {
     // Reference ACGTACG has two CpGs: top-C at ref positions 1 and 5.
-    // With --methylation-rate 1.0 both are fully methylated on both haplotypes.
+    // With all context rates 1.0 both are fully methylated on both haplotypes.
     let seq = b"ACGTACG".to_vec();
     let env = TestEnv::new(&[("chr1", &seq)]);
     let out_path = env.dir.path().join("meth.vcf.gz");
@@ -237,9 +237,12 @@ fn parse_bedgraph(contents: &str) -> Vec<(usize, u32)> {
 #[test]
 fn methylate_default_is_no_longer_fully_methylated() {
     // The no-flags default is now context-aware (open-sea ~0.85), NOT 100%
-    // methylated. Over a long open-sea reference at least some CpGs must come
-    // out unmethylated. Guards against a regression to the old flat-1.0 default.
-    let seq = b"ACGT".repeat(12_500); // 50 kb, CpG every 4 bp → all open-sea
+    // methylated. Over a long open-sea reference the MEAN per-CpG rate should
+    // sit near the open-sea target and clearly below 100 — a structural check,
+    // not "at least one happens to be unmethylated". Guards against a
+    // regression to the old flat-1.0 default. Seed-pinned; the band assumes
+    // SmallRng on rand 0.9 and may need widening if the RNG stream changes.
+    let seq = b"ACGT".repeat(25_000); // 100 kb, CpG every 4 bp → all open-sea
     let env = TestEnv::new(&[("chr1", &seq)]);
     let out_path = env.dir.path().join("meth.vcf.gz");
     let bg_path = env.dir.path().join("meth.bedgraph");
@@ -257,9 +260,10 @@ fn methylate_default_is_no_longer_fully_methylated() {
     assert!(ok, "methylate failed: {stderr}");
     let rates = parse_bedgraph(&std::fs::read_to_string(&bg_path).unwrap());
     assert!(!rates.is_empty(), "expected bedgraph records");
+    let mean = rates.iter().map(|&(_, r)| f64::from(r)).sum::<f64>() / rates.len() as f64;
     assert!(
-        rates.iter().any(|&(_, r)| r < 100),
-        "default output is fully methylated — the context-aware default regressed"
+        (50.0..=95.0).contains(&mean),
+        "default open-sea mean rate {mean} should be near ~85 and clearly below the old flat 100"
     );
 }
 
