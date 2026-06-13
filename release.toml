@@ -1,0 +1,43 @@
+# Configuration for `cargo release` (https://github.com/crate-ci/cargo-release).
+#
+# Releases are cut locally from `main`:
+#
+#   cargo release patch            # preview a 0.2.1 -> 0.2.2 release (dry-run by default)
+#   cargo release patch --execute  # actually bump, changelog, commit, tag, push, and publish
+#
+# A release run will: run the full CI gate (fmt + lint + test) as a pre-release
+# hook, bump the version in Cargo.toml/Cargo.lock, roll the CHANGELOG's
+# `[Unreleased]` section into a dated version section, commit, create an
+# annotated `vX.Y.Z` tag, push the branch and tag to origin, and publish to
+# crates.io.
+
+# Only ever release from main -- guards against tagging a feature branch.
+allow-branch = ["main"]
+
+# Publish the crate to crates.io as part of the release.
+publish = true
+
+# Build-verify the package before publishing (cargo publish does this anyway,
+# but being explicit documents intent).
+verify = true
+
+# Push the release commit and tag to origin after a successful publish.
+push = true
+
+# Commit/tag wording. Tag name defaults to `v{{version}}` for a single-package
+# repo, which matches our existing v0.1.0/v0.2.0/v0.2.1 tags -- so it is left
+# at the default.
+pre-release-commit-message = "chore: release version {{version}}"
+tag-message = "Release {{version}}"
+
+# Run the same gate CI runs before allowing a release to proceed.
+pre-release-hook = ["sh", "-c", "cargo ci-fmt && cargo ci-lint && cargo ci-test"]
+
+# Roll the CHANGELOG forward as part of the release commit. The `[Unreleased]`
+# heading gains a new dated version section beneath it, and the link-reference
+# footer is updated so `[unreleased]` compares against the new tag and a fresh
+# `[X.Y.Z]` compare link is inserted.
+pre-release-replacements = [
+  { file = "CHANGELOG.md", search = "## \\[Unreleased\\]", replace = "## [Unreleased]\n\n## [{{version}}] - {{date}}", exactly = 1 },
+  { file = "CHANGELOG.md", search = "\\[unreleased\\]: https://github.com/fg-labs/holodeck/compare/v[0-9.]+\\.\\.\\.HEAD", replace = "[unreleased]: https://github.com/fg-labs/holodeck/compare/v{{version}}...HEAD\n[{{version}}]: https://github.com/fg-labs/holodeck/compare/v{{prev_version}}...v{{version}}", exactly = 1 },
+]

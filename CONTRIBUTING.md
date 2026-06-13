@@ -102,8 +102,43 @@ Holodeck is a single-crate project with a binary (`holodeck`) and library (`holo
 
 ## CI
 
-GitHub Actions runs three jobs on every push to `main` and on pull requests:
+GitHub Actions runs these jobs on every push to `main` and on pull requests:
 
 1. **test** -- `cargo ci-test` (nextest)
 2. **lint** -- `cargo ci-lint` (clippy with pedantic warnings)
 3. **format** -- `cargo ci-fmt` (rustfmt check)
+4. **security** -- `cargo audit` (advisory-database scan)
+
+## Releasing
+
+Releases are cut **locally** from `main` with [`cargo release`](https://github.com/crate-ci/cargo-release)
+(`cargo install cargo-release`).  Configuration lives in `release.toml`.
+
+1. Make sure `main` is up to date, green in CI, and `[Unreleased]` in
+   `CHANGELOG.md` describes everything in the release.
+2. Preview the release (this is the default -- no changes are made):
+
+   ```bash
+   cargo release patch    # or: minor / major
+   ```
+
+3. When the preview looks right, execute it:
+
+   ```bash
+   cargo release patch --execute
+   ```
+
+   This runs the full gate (`cargo ci-fmt && cargo ci-lint && cargo ci-test`),
+   bumps the version in `Cargo.toml`/`Cargo.lock`, rolls the `[Unreleased]`
+   CHANGELOG section into a dated version section, commits, creates an annotated
+   `vX.Y.Z` tag, pushes the commit and tag to `origin`, and publishes to
+   crates.io.
+
+4. Create the GitHub release from the new tag (not yet automated):
+
+   ```bash
+   gh release create vX.Y.Z --generate-notes
+   ```
+
+Publishing to crates.io requires a one-time `cargo login` with a token from
+<https://crates.io/me>.
