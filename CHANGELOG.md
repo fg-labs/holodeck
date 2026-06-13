@@ -55,6 +55,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.1.0] - 2026-04-22
 
+### Added
+
 - First release of holodeck, an NGS read simulator.
 
 [unreleased]: https://github.com/fg-labs/holodeck/compare/v0.2.1...HEAD
