@@ -13,7 +13,8 @@ pub mod genotype;
 /// the `methylate` subcommand and the methylation-aware `simulate` path.
 pub mod methylation;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::io::{BufRead, Read};
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
@@ -59,7 +60,8 @@ pub struct ParsedVariants {
 /// ploidy even on contigs (or whole samples) with no ALT calls.
 ///
 /// # Arguments
-/// * `path` — Path to the VCF file (plain or BGZF; noodles autodetects).
+/// * `path` — Path to the VCF file (plain text, gzip, or BGZF; detected from
+///   the leading magic bytes).
 /// * `sample_name` — Sample to resolve genotypes for, or `None` to use the
 ///   only sample in a single-sample VCF.
 /// * `_dict` — Sequence dictionary (reserved for future cross-validation
@@ -73,11 +75,7 @@ pub fn parse_variants_by_contig(
     sample_name: Option<&str>,
     _dict: &SequenceDictionary,
 ) -> Result<ParsedVariants> {
-    let mut reader = vcf::io::reader::Builder::default()
-        .build_from_path(path)
-        .with_context(|| format!("Failed to open VCF: {}", path.display()))?;
-
-    let header = reader.read_header()?;
+    let (header, mut reader) = open_lenient_vcf_reader(path)?;
     let sample_index = resolve_sample_index(&header, sample_name)?;
 
     let mut by_contig: HashMap<String, Vec<VariantRecord>> = HashMap::new();
@@ -153,10 +151,7 @@ pub fn parse_variants_by_contig(
 /// Returns an error if the VCF cannot be read or the sample configuration
 /// is invalid.
 pub(crate) fn validate_vcf_sample(path: &Path, sample_name: Option<&str>) -> Result<String> {
-    let mut reader = vcf::io::reader::Builder::default()
-        .build_from_path(path)
-        .with_context(|| format!("Failed to open VCF: {}", path.display()))?;
-    let header = reader.read_header()?;
+    let (header, _reader) = open_lenient_vcf_reader(path)?;
     let idx = resolve_sample_index(&header, sample_name)?;
     Ok(header
         .sample_names()
@@ -204,6 +199,112 @@ fn resolve_sample_index(header: &vcf::Header, sample_name: Option<&str>) -> Resu
             }
         }
     }
+}
+
+/// Open a VCF and return its parsed header plus a record reader, tolerating
+/// duplicate meta-information definitions that noodles would otherwise reject.
+///
+/// noodles' header parser errors on any redeclared `##INFO`/`##FORMAT`/
+/// `##FILTER`/`##ALT`/`##contig` ID (e.g. `duplicate INFO ID: BREAKSIMLENGTH`).
+/// Real VCFs from upstream tools (Manta, DELLY, hand-merged files) routinely
+/// carry such duplicates, and bcftools reads them without complaint; holodeck
+/// must not be stricter. This reads the raw header text first, drops every
+/// repeated structured definition (keeping the first, matching bcftools), and
+/// hands the cleaned header back to noodles for parsing. The record stream is
+/// untouched — only the header is rewritten.
+///
+/// Compression is detected from the leading magic bytes (plain text, gzip, or
+/// BGZF), so the reader is also indifferent to the file's extension.
+///
+/// # Errors
+/// Returns an error if the file cannot be opened or the (cleaned) header fails
+/// to parse.
+fn open_lenient_vcf_reader(
+    path: &Path,
+) -> Result<(vcf::Header, vcf::io::Reader<Box<dyn BufRead>>)> {
+    let mut inner = open_vcf_buf_reader(path)
+        .with_context(|| format!("Failed to open VCF: {}", path.display()))?;
+
+    // Read raw header lines up to and including the `#CHROM` column header,
+    // dropping duplicate structured definitions. Everything after `#CHROM`
+    // stays unread in `inner` and is streamed as records below.
+    let mut header_text = String::new();
+    let mut seen: HashSet<(String, String)> = HashSet::new();
+    let mut line = String::new();
+    loop {
+        line.clear();
+        let n = inner
+            .read_line(&mut line)
+            .with_context(|| format!("Failed to read VCF header: {}", path.display()))?;
+        if n == 0 {
+            break; // EOF before `#CHROM`; let noodles report the malformed header
+        }
+        let is_meta = line.starts_with("##");
+        if is_meta
+            && let Some(key) = structured_header_key(&line)
+            && !seen.insert(key.clone())
+        {
+            log::warn!("dropping duplicate VCF header definition: ##{}=<ID={},...>", key.0, key.1);
+            continue;
+        }
+        let is_column_header = !is_meta; // first non-`##` line is `#CHROM`
+        header_text.push_str(&line);
+        if is_column_header {
+            break;
+        }
+    }
+
+    // Replay the cleaned header in front of the still-unread record stream so
+    // noodles parses the header and reads records from one continuous source.
+    let chained: Box<dyn BufRead> =
+        Box::new(std::io::Cursor::new(header_text.into_bytes()).chain(inner));
+    let mut reader = vcf::io::Reader::new(chained);
+    let header = reader
+        .read_header()
+        .with_context(|| format!("Failed to parse VCF header: {}", path.display()))?;
+    Ok((header, reader))
+}
+
+/// Open a VCF for buffered reading, transparently decompressing gzip/BGZF.
+///
+/// Compression is detected from the leading two magic bytes (`1f 8b`) rather
+/// than the file extension, and `MultiGzDecoder` handles both single-member
+/// gzip and the multi-member BGZF blocks `bgzip`/`bcftools` produce.
+///
+/// # Errors
+/// Returns an I/O error if the file cannot be opened or its first bytes read.
+pub(crate) fn open_vcf_buf_reader(path: &Path) -> std::io::Result<Box<dyn BufRead>> {
+    use std::io::BufReader;
+
+    let mut peek = [0u8; 2];
+    // A file shorter than two bytes cannot be gzip; only treat the input as
+    // compressed when both magic bytes were actually read.
+    let bytes_read = {
+        let mut f = std::fs::File::open(path)?;
+        f.read(&mut peek)?
+    };
+    let file = std::fs::File::open(path)?;
+    if bytes_read == 2 && peek == [0x1f, 0x8b] {
+        Ok(Box::new(BufReader::new(flate2::read::MultiGzDecoder::new(file))))
+    } else {
+        Ok(Box::new(BufReader::new(file)))
+    }
+}
+
+/// Extract the `(directive, ID)` identity of a structured meta-information
+/// line, e.g. `##INFO=<ID=DP,...>` → `("INFO", "DP")`.
+///
+/// Returns `None` for lines without a leading `ID=` field — `##fileformat`,
+/// free-form `##key=value`, or the rare case where `ID` is not the first
+/// attribute. Such lines are never deduplicated, matching the categories
+/// noodles enforces unique (`INFO`/`FORMAT`/`FILTER`/`ALT`/`contig`), whose
+/// emitters all write `ID` first.
+fn structured_header_key(line: &str) -> Option<(String, String)> {
+    let rest = line.trim_start_matches('#').trim_end_matches(['\n', '\r']);
+    let (directive, value) = rest.split_once('=')?;
+    let id_field = value.strip_prefix('<')?.strip_prefix("ID=")?;
+    let id = id_field.split([',', '>']).next()?;
+    Some((directive.to_string(), id.to_string()))
 }
 
 /// Extract the GT field as a string for a specific sample from a VCF record.
@@ -375,5 +476,84 @@ chr1\t10\t.\tA\tT\t.\t.\t.\tGT\t0|0|1
         let parsed = parse_variants_by_contig(f.path(), None, &dict).unwrap();
         assert_eq!(parsed.sample_ploidy, 3);
         assert_eq!(parsed.by_contig.get("chr1").map(Vec::len), Some(1));
+    }
+
+    /// A VCF that redeclares an `##INFO` ID must still parse. noodles' header
+    /// parser rejects duplicate IDs outright (`duplicate INFO ID: ...`), but
+    /// real-world VCFs from tools like Manta/DELLY carry repeated definitions
+    /// that bcftools tolerates; holodeck must not be stricter than bcftools.
+    #[test]
+    fn parse_variants_by_contig_tolerates_duplicate_info_headers() {
+        let vcf = "\
+##fileformat=VCFv4.3
+##contig=<ID=chr1,length=100>
+##INFO=<ID=BREAKSIMLENGTH,Number=1,Type=Integer,Description=\"first\">
+##INFO=<ID=BREAKSIMLENGTH,Number=1,Type=Integer,Description=\"second\">
+##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\">
+#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tSAMPLE
+chr1\t10\t.\tA\tT\t.\tPASS\tBREAKSIMLENGTH=5\tGT\t0/1
+";
+        let f = write_temp_vcf(vcf);
+        let dict = dict_for(&[("chr1", 100)]);
+        let parsed = parse_variants_by_contig(f.path(), None, &dict).unwrap();
+        assert_eq!(parsed.by_contig.get("chr1").map(Vec::len), Some(1));
+        assert_eq!(parsed.by_contig["chr1"][0].position, 9);
+    }
+
+    /// Duplicate `##FORMAT`/`##FILTER`/`##contig` declarations are tolerated
+    /// alongside `##INFO`; all of noodles' duplicate-ID categories are covered
+    /// by the same dedup pass.
+    #[test]
+    fn parse_variants_by_contig_tolerates_duplicate_format_filter_contig() {
+        let vcf = "\
+##fileformat=VCFv4.3
+##contig=<ID=chr1,length=100>
+##contig=<ID=chr1,length=100>
+##FILTER=<ID=q10,Description=\"first\">
+##FILTER=<ID=q10,Description=\"second\">
+##FORMAT=<ID=GT,Number=1,Type=String,Description=\"first\">
+##FORMAT=<ID=GT,Number=1,Type=String,Description=\"second\">
+#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tSAMPLE
+chr1\t10\t.\tA\tT\t.\tPASS\t.\tGT\t0/1
+";
+        let f = write_temp_vcf(vcf);
+        let dict = dict_for(&[("chr1", 100)]);
+        let parsed = parse_variants_by_contig(f.path(), None, &dict).unwrap();
+        assert_eq!(parsed.by_contig.get("chr1").map(Vec::len), Some(1));
+    }
+
+    /// `validate_vcf_sample` reads the header through the same lenient path, so
+    /// it too must accept a VCF with duplicate definitions.
+    #[test]
+    fn validate_vcf_sample_tolerates_duplicate_info_headers() {
+        let vcf = "\
+##fileformat=VCFv4.3
+##contig=<ID=chr1,length=100>
+##INFO=<ID=DP,Number=1,Type=Integer,Description=\"first\">
+##INFO=<ID=DP,Number=1,Type=Integer,Description=\"second\">
+##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\">
+#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tNA12878
+chr1\t10\t.\tA\tT\t.\tPASS\tDP=5\tGT\t0/1
+";
+        let f = write_temp_vcf(vcf);
+        let sample = validate_vcf_sample(f.path(), None).unwrap();
+        assert_eq!(sample, "NA12878");
+    }
+
+    #[test]
+    fn structured_header_key_extracts_directive_and_id() {
+        assert_eq!(
+            structured_header_key("##INFO=<ID=DP,Number=1,Type=Integer>\n"),
+            Some(("INFO".to_string(), "DP".to_string()))
+        );
+        assert_eq!(
+            structured_header_key("##contig=<ID=chr1,length=100>"),
+            Some(("contig".to_string(), "chr1".to_string()))
+        );
+        // No ID field -> not a dedup candidate.
+        assert_eq!(structured_header_key("##fileformat=VCFv4.3"), None);
+        assert_eq!(structured_header_key("##source=holodeck-mutate"), None);
+        // ID not the first field -> conservatively not deduplicated.
+        assert_eq!(structured_header_key("##INFO=<Number=1,ID=DP>"), None);
     }
 }
