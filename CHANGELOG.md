@@ -15,6 +15,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   repeated definitions (keeping the first) instead of erroring. Compression is
   now detected from the file's magic bytes rather than its extension, so the
   variant reader also accepts plain-gzip and extension-less inputs.
+- `mutate` and `methylate` now choose VCF output compression from the file
+  extension: `.gz`/`.bgz` paths are BGZF-compressed, everything else is plain
+  text. Previously `mutate` always wrote uncompressed text (so a `*.vcf.gz`
+  output was rejected by `simulate` with an opaque BGZF error) and `methylate`
+  always wrote BGZF (so a `*.vcf` output was a BGZF stream the reader treated as
+  plain text). Both now round-trip through `simulate`/`methylate` regardless of
+  name.
 
 ## [0.3.0] - 2026-06-13
 
