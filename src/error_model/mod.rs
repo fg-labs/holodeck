@@ -90,7 +90,7 @@ pub fn apply_errors(
 ///
 /// Given a DNA base (A, C, G, T), returns one of the other three bases
 /// chosen uniformly at random using a single RNG draw and a lookup table.
-fn random_different_base(base: u8, rng: &mut impl Rng) -> u8 {
+pub(crate) fn random_different_base(base: u8, rng: &mut impl Rng) -> u8 {
     // For each input base, the three possible substitute bases.
     const ALTS: [u8; 12] = [
         b'C', b'G', b'T', // A -> C, G, T

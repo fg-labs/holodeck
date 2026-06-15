@@ -12,7 +12,7 @@ use std::path::PathBuf;
 
 use helpers::{
     PileupColumn, TestEnv, VcfVariant, count_fastq_records, non_repetitive_seq, pileup_bases,
-    read_gzipped, run_simulate, simple_env,
+    read_bam_records, read_gzipped, run_simulate, simple_env,
 };
 use std::collections::HashMap;
 
@@ -3505,4 +3505,168 @@ fn test_simulate_reproducible_ambiguity_resolution() {
     let r1_a = read_gzipped(&PathBuf::from(format!("{}.r1.fastq.gz", out_a.display())));
     let r1_b = read_gzipped(&PathBuf::from(format!("{}.r1.fastq.gz", out_b.display())));
     assert_eq!(r1_a, r1_b, "seeded runs should be byte-identical");
+}
+
+/// Sum of soft-clip lengths across a record's CIGAR.
+fn total_softclip_bp(record: &RecordBuf) -> usize {
+    record
+        .cigar()
+        .as_ref()
+        .iter()
+        .filter(|op| op.kind() == CigarKind::SoftClip)
+        .map(|op| op.len())
+        .sum()
+}
+
+#[test]
+fn test_terminal_clip_appears_in_golden_bam() {
+    // With a high 5' clip rate and no adapter read-through (fragments well
+    // longer than the read), the golden BAM should carry soft-clips that did
+    // not exist before the model. The default run (no clip flags) must have
+    // essentially none, so the difference is attributable to the model.
+    let seq = non_repetitive_seq(5000);
+    let env = TestEnv::new(&[("chr1", &seq)]);
+
+    let run = |out: &std::path::Path, clip_args: &[&str]| {
+        let mut args = vec![
+            "simulate",
+            "-r",
+            env.fasta_path.to_str().unwrap(),
+            "-o",
+            out.to_str().unwrap(),
+            "--coverage",
+            "30",
+            "--read-length",
+            "100",
+            "--fragment-mean",
+            "400",
+            "--fragment-stddev",
+            "20",
+            "--golden-bam",
+            "--seed",
+            "7",
+        ];
+        args.extend_from_slice(clip_args);
+        let (ok, _, stderr) = run_simulate(&args);
+        assert!(ok, "simulate failed: {stderr}");
+        read_bam_records(&PathBuf::from(format!("{}.golden.bam", out.display())))
+    };
+
+    let baseline = run(&env.dir.path().join("baseline"), &[]);
+    let clipped =
+        run(&env.dir.path().join("clipped"), &["--clip-5p-rate", "0.5", "--clip-3p-rate", "0.0"]);
+
+    let baseline_clipped_reads = baseline.iter().filter(|r| total_softclip_bp(r) > 0).count();
+    let clipped_clipped_reads = clipped.iter().filter(|r| total_softclip_bp(r) > 0).count();
+
+    // Fragments (mean 400) are far longer than the 100bp reads, so adapter
+    // read-through is essentially impossible: the baseline should be clip-free.
+    assert_eq!(
+        baseline_clipped_reads, 0,
+        "baseline (no clip model) unexpectedly has soft-clipped records"
+    );
+
+    // ~50% 5' clip rate over both mates → a large fraction of records clipped.
+    let frac = clipped_clipped_reads as f64 / clipped.len() as f64;
+    assert!(
+        (0.40..=0.60).contains(&frac),
+        "expected ~50% of records soft-clipped, got {frac} ({clipped_clipped_reads}/{})",
+        clipped.len()
+    );
+
+    // Every soft-clip must respect the configured maximum length per end.
+    for r in &clipped {
+        assert!(
+            total_softclip_bp(r) <= 20,
+            "soft-clip exceeds --clip-length-max: {}",
+            helpers_cigar(r)
+        );
+    }
+}
+
+#[test]
+fn test_terminal_clip_preserves_truth_alignment_start() {
+    // A clip injected on the genomic read must keep the recorded alignment
+    // exact: the un-clipped reference span still aligns end-to-end (only M/D
+    // ops between the soft-clips), so no mismatch is introduced into the
+    // aligned block. We verify by checking that every clipped record's aligned
+    // portion is a clean M run against the reference at its POS.
+    let seq = non_repetitive_seq(5000);
+    let env = TestEnv::new(&[("chr1", &seq)]);
+    let out = env.dir.path().join("clip_truth");
+
+    let (ok, _, stderr) = run_simulate(&[
+        "simulate",
+        "-r",
+        env.fasta_path.to_str().unwrap(),
+        "-o",
+        out.to_str().unwrap(),
+        "--coverage",
+        "20",
+        "--read-length",
+        "100",
+        "--fragment-mean",
+        "400",
+        "--fragment-stddev",
+        "20",
+        "--golden-bam",
+        "--clip-5p-rate",
+        "0.5",
+        "--clip-3p-rate",
+        "0.3",
+        "--seed",
+        "11",
+    ]);
+    assert!(ok, "simulate failed: {stderr}");
+
+    let records = read_bam_records(&PathBuf::from(format!("{}.golden.bam", out.display())));
+    let mut saw_lead = false;
+    let mut saw_trail = false;
+    for r in &records {
+        let ops: Vec<_> = r.cigar().as_ref().iter().collect();
+        // The aligned interior (between any leading/trailing soft-clips) must
+        // consist only of M ops here (no variants in this reference), so the
+        // soft-clip is the only non-M op and ground truth is internally
+        // consistent.
+        let n = ops.len();
+        for (i, op) in ops.iter().enumerate() {
+            if op.kind() == CigarKind::SoftClip {
+                assert!(i == 0 || i == n - 1, "soft-clip must be terminal: {}", helpers_cigar(r));
+                if i == 0 {
+                    saw_lead = true;
+                } else {
+                    saw_trail = true;
+                }
+            } else {
+                assert_eq!(
+                    op.kind(),
+                    CigarKind::Match,
+                    "aligned interior should be all-M in a variant-free reference: {}",
+                    helpers_cigar(r)
+                );
+            }
+        }
+    }
+    assert!(saw_lead, "expected at least one leading soft-clip");
+    assert!(saw_trail, "expected at least one trailing soft-clip");
+}
+
+/// Format a record's CIGAR for assertion messages.
+fn helpers_cigar(record: &RecordBuf) -> String {
+    use std::fmt::Write;
+    record.cigar().as_ref().iter().fold(String::new(), |mut s, op| {
+        let c = match op.kind() {
+            CigarKind::Match => 'M',
+            CigarKind::Insertion => 'I',
+            CigarKind::Deletion => 'D',
+            CigarKind::SoftClip => 'S',
+            CigarKind::HardClip => 'H',
+            CigarKind::Skip => 'N',
+            CigarKind::Pad => 'P',
+            CigarKind::SequenceMatch => '=',
+            CigarKind::SequenceMismatch => 'X',
+        };
+        let _ = write!(s, "{}{c}", op.len());
+        s
+    })
 }

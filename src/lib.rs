@@ -5,6 +5,7 @@
 compile_error!("holodeck requires a 64-bit or wider platform");
 
 pub mod bed;
+pub mod clip;
 pub mod commands;
 pub mod error_model;
 pub mod fasta;

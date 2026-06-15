@@ -40,6 +40,7 @@ Holodeck is a single-crate Rust project with a binary (`holodeck`) and library (
 | `vcf/methylation.rs` | MT/MB FORMAT field read/write; CpG classification across haplotypes |
 | `output/cpg_truth.rs` | Coverage-weighted per-CpG truth bedGraph (from simulated reads) |
 | `output/methylation_bedgraph.rs` | Closed-form population-fraction methylation bedGraph |
+| `clip.rs` | Terminal soft-clip artifact model (per-end 5'/3' clip sampling) |
 | `fragment.rs` | Fragment extraction, reverse complement, adapter padding |
 | `read.rs` | Read pair generation combining fragments + error model + naming |
 | `error_model/mod.rs` | ErrorModel trait + apply_errors free function |

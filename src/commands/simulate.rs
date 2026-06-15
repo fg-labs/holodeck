@@ -123,6 +123,34 @@ pub struct Simulate {
     #[arg(long, default_value_t = 0.02, value_name = "FLOAT")]
     pub max_n_frac: f64,
 
+    /// Probability in `[0.0, 1.0]` that a read's 5' end carries a terminal
+    /// soft-clip artifact (end-repair fill-in, damaged or non-templated read
+    /// ends). The clipped bases are replaced with random sequence so a
+    /// downstream aligner soft-clips them, and the golden BAM records the clip
+    /// in the CIGAR so ground truth stays exact. Real Twist EM-seq shows ~8%
+    /// of reads 5'-clipped. Defaults to `0.0` (disabled). Protocol-agnostic:
+    /// independent of `--methylation-mode`.
+    #[arg(long, default_value_t = 0.0, value_name = "FLOAT")]
+    pub clip_5p_rate: f64,
+
+    /// Probability in `[0.0, 1.0]` that a read's 3' end carries a terminal
+    /// soft-clip artifact, independent of (and in addition to) 3' adapter
+    /// read-through. Real Twist EM-seq shows ~2% of reads 3'-clipped. Defaults
+    /// to `0.0` (disabled).
+    #[arg(long, default_value_t = 0.0, value_name = "FLOAT")]
+    pub clip_3p_rate: f64,
+
+    /// Mean length in bases of an injected terminal soft-clip. Lengths are
+    /// drawn from a truncated geometric distribution centered here and capped
+    /// by `--clip-length-max`. Only takes effect when a clip rate is non-zero.
+    #[arg(long, default_value_t = 8, value_name = "INT")]
+    pub clip_length_mean: usize,
+
+    /// Maximum length in bases of an injected terminal soft-clip. Only takes
+    /// effect when a clip rate is non-zero.
+    #[arg(long, default_value_t = 20, value_name = "INT")]
+    pub clip_length_max: usize,
+
     /// Enable methylation chemistry simulation. `em-seq` (or `bisulfite`)
     /// converts unmethylated cytosines to thymine and preserves methylated
     /// ones (matches both bisulfite and em-seq protocols). `taps` is the
@@ -222,6 +250,22 @@ impl Simulate {
         }
         if !self.max_n_frac.is_finite() || !(0.0..=1.0).contains(&self.max_n_frac) {
             bail!("--max-n-frac must be in [0.0, 1.0]");
+        }
+        if !self.clip_5p_rate.is_finite() || !(0.0..=1.0).contains(&self.clip_5p_rate) {
+            bail!("--clip-5p-rate must be in [0.0, 1.0]");
+        }
+        if !self.clip_3p_rate.is_finite() || !(0.0..=1.0).contains(&self.clip_3p_rate) {
+            bail!("--clip-3p-rate must be in [0.0, 1.0]");
+        }
+        // Validate clip-length parameters only when the model is enabled, so a
+        // disabled model (both rates zero) never rejects on unused values.
+        if self.clip_5p_rate > 0.0 || self.clip_3p_rate > 0.0 {
+            if self.clip_length_max == 0 {
+                bail!("--clip-length-max must be > 0 when a terminal clip rate is set");
+            }
+            if self.clip_length_mean > self.clip_length_max {
+                bail!("--clip-length-mean must be <= --clip-length-max");
+            }
         }
         if let Some(rate) = self.methylation_conversion_rate
             && (!rate.is_finite() || !(0.0..=1.0).contains(&rate))
@@ -349,6 +393,18 @@ impl Simulate {
 
         let error_model =
             IlluminaErrorModel::new(self.read_length, self.min_error_rate, self.max_error_rate);
+
+        // Terminal soft-clip artifact model. Passed as `Some` only when at
+        // least one end can clip; a disabled model is equivalent to `None`
+        // (it draws no randomness) but keeping it `None` makes intent clear.
+        let clip_config = (self.clip_5p_rate > 0.0 || self.clip_3p_rate > 0.0).then_some(
+            crate::clip::TerminalClipConfig {
+                rate_5p: self.clip_5p_rate,
+                rate_3p: self.clip_3p_rate,
+                length_mean: self.clip_length_mean,
+                length_max: self.clip_length_max,
+            },
+        );
         let frag_dist = Normal::new(self.fragment_mean as f64, self.fragment_stddev as f64)
             .map_err(|e| anyhow::anyhow!("Invalid fragment distribution parameters: {e}"))?;
 
@@ -457,6 +513,7 @@ impl Simulate {
                 targets.as_ref(),
                 total_reads,
                 &error_model,
+                clip_config.as_ref(),
                 &frag_dist,
                 adapter_r1.as_bytes(),
                 adapter_r2.as_bytes(),
@@ -599,6 +656,7 @@ impl Simulate {
         targets: Option<&TargetRegions>,
         total_reads: u64,
         error_model: &IlluminaErrorModel,
+        clip_config: Option<&crate::clip::TerminalClipConfig>,
         frag_dist: &Normal<f64>,
         adapter_r1: &[u8],
         adapter_r2: &[u8],
@@ -803,6 +861,7 @@ impl Simulate {
                 // YS:Z tag — skip the per-mate clone when no golden BAM is
                 // requested.
                 self.golden_bam,
+                clip_config,
                 rng,
             ) else {
                 // Too many ambiguity-resolved bases in this read pair; resample.
@@ -926,6 +985,10 @@ mod tests {
             min_error_rate: 0.001,
             max_error_rate: 0.01,
             max_n_frac: 0.02,
+            clip_5p_rate: 0.0,
+            clip_3p_rate: 0.0,
+            clip_length_mean: 8,
+            clip_length_max: 20,
             methylation_mode: None,
             methylation_conversion_rate: None,
             methylation_failure_rate: None,

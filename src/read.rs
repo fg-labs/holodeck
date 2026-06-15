@@ -9,6 +9,7 @@ use noodles::sam::alignment::record::cigar::op::{Kind, Op};
 use noodles::sam::alignment::record_buf::Cigar;
 use rand::Rng;
 
+use crate::clip::TerminalClipConfig;
 use crate::error_model::{self, ErrorModel, ReadEnd};
 use crate::fragment::{
     Fragment, extract_read_bases, lowercase_fraction, reverse_complement, uppercase_in_place,
@@ -40,8 +41,8 @@ pub struct ReadPair {
     pub r1_truth: TruthAlignment,
     /// Truth alignment for R2 (present only for paired-end mode).
     pub r2_truth: Option<TruthAlignment>,
-    /// Truth CIGAR for R1, reflecting haplotype variants and adapter
-    /// soft-clipping.
+    /// Truth CIGAR for R1, reflecting haplotype variants plus adapter
+    /// read-through and terminal-artifact soft-clips.
     pub r1_cigar: Cigar,
     /// Truth CIGAR for R2. `None` for single-end reads.
     pub r2_cigar: Option<Cigar>,
@@ -61,7 +62,7 @@ struct MateOutput {
     /// Pre-conversion bases (5'→3' read orientation). `None` when methylation
     /// chemistry was not applied or capture was not requested.
     pre_conversion: Option<Vec<u8>>,
-    /// CIGAR including any adapter soft-clip.
+    /// CIGAR including any adapter and terminal-artifact soft-clips.
     cigar: Cigar,
     /// Truth alignment for this mate.
     truth: TruthAlignment,
@@ -116,6 +117,34 @@ fn apply_fragment_chemistry(
     (bases, conversion_failed)
 }
 
+/// Overwrite the soft-clipped terminal bases of a read with divergent
+/// sequence.
+///
+/// `bases` is in read 5'→3' orientation, so the 5' clip covers the first
+/// `clip_5p` bases and the 3' clip covers the `clip_3p` genomic bases ending
+/// at `genomic` (the adapter pad, if any, sits beyond `genomic` and is left
+/// untouched). Each clipped base is replaced with a base *different* from the
+/// one already there (reusing the error model's
+/// [`random_different_base`](error_model::random_different_base)), so the ends
+/// are guaranteed to diverge from the reference and a downstream aligner
+/// re-derives the soft-clip rather than forcing matches. Drawing uniformly
+/// from all four bases would, for a short clip, frequently regenerate the
+/// original base and leave the artifact invisible.
+fn corrupt_clipped_bases(
+    bases: &mut [u8],
+    genomic: usize,
+    clip_5p: usize,
+    clip_3p: usize,
+    rng: &mut impl Rng,
+) {
+    for b in &mut bases[..clip_5p] {
+        *b = error_model::random_different_base(*b, rng);
+    }
+    for b in &mut bases[genomic - clip_3p..genomic] {
+        *b = error_model::random_different_base(*b, rng);
+    }
+}
+
 /// Build one mate (R1 or R2) from already-extracted bases.
 ///
 /// `bases` is post-chemistry, post-uppercase, in read 5'→3' orientation
@@ -124,9 +153,11 @@ fn apply_fragment_chemistry(
 /// this function: errors mutate `bases` and advance `rng`, so rejection
 /// must happen first to avoid desynchronising the RNG stream.
 ///
-/// Pipeline (per-mate): apply_errors → CIGAR + truth.
+/// Pipeline (per-mate): apply_errors → terminal clip → CIGAR + truth.
 /// Chemistry runs once at fragment scale upstream — see
-/// [`apply_fragment_chemistry`].
+/// [`apply_fragment_chemistry`]. `clip_config`, when present and enabled,
+/// injects terminal soft-clip artifacts; a disabled or absent config draws no
+/// randomness and leaves the read end-to-end aligned.
 #[allow(clippy::too_many_arguments)]
 fn build_mate(
     fragment: &Fragment,
@@ -137,6 +168,7 @@ fn build_mate(
     pre_conversion: Option<Vec<u8>>,
     adapter_bases: usize,
     model: &impl ErrorModel,
+    clip_config: Option<&TerminalClipConfig>,
     rng: &mut impl Rng,
 ) -> MateOutput {
     let frag_len = fragment.bases.len();
@@ -153,15 +185,34 @@ fn build_mate(
 
     let (n_errors, qualities) = error_model::apply_errors(model, &mut bases, end, rng);
 
-    let cigar = cigar_from_ref_positions(positions, adapter_bases, is_negative_strand);
+    // Terminal soft-clip artifacts: sample per-end clip lengths over the
+    // aligned portion, corrupt those bases, and fold the clips into the CIGAR
+    // and alignment start so ground truth stays exact. A disabled/absent
+    // config yields (0, 0) without touching the RNG.
+    let (clip_5p, clip_3p) = clip_config.map_or((0, 0), |c| c.sample_clips(genomic, rng));
+    if clip_5p > 0 || clip_3p > 0 {
+        corrupt_clipped_bases(&mut bases, genomic, clip_5p, clip_3p, rng);
+    }
 
-    let ref_pos = if fragment.ref_positions.is_empty() {
-        0
-    } else if is_negative_strand {
-        fragment.ref_positions[right_start] + 1
+    // Read 5'→3' maps to ascending reference positions for a forward read but
+    // to descending for a reverse read (stored reverse-complemented in BAM),
+    // so a read-5' clip trims the front of `positions` on the forward strand
+    // and the back on the reverse strand.
+    let (front_trim, back_trim) =
+        if is_negative_strand { (clip_3p, clip_5p) } else { (clip_5p, clip_3p) };
+    let kept = &positions[front_trim..positions.len() - back_trim];
+
+    // Adapter read-through sits at the read's 3' end — the left of the record
+    // for a reverse read, the right for a forward read. Terminal clips add to
+    // the same record ends as their position trims.
+    let (lead_clip, trail_clip) = if is_negative_strand {
+        (front_trim + adapter_bases, back_trim)
     } else {
-        fragment.ref_positions[0] + 1
+        (front_trim, back_trim + adapter_bases)
     };
+    let cigar = cigar_from_ref_positions(kept, lead_clip, trail_clip);
+
+    let ref_pos = if kept.is_empty() { 0 } else { kept[0] + 1 };
 
     #[expect(clippy::cast_possible_truncation, reason = "fragment length fits in u32")]
     let fragment_length = frag_len as u32;
@@ -214,6 +265,9 @@ fn build_mate(
 /// * `capture_pre_conversion` — When `true` AND `methylation` is `Some`,
 ///   capture the pre-conversion bases of each mate for the `YS:Z` golden-BAM
 ///   tag. Has no effect when `methylation` is `None`.
+/// * `clip_config` — Optional terminal soft-clip artifact model. Each mate
+///   independently samples 5'/3' clips; a disabled or absent config leaves
+///   reads end-to-end aligned and draws no randomness.
 /// * `rng` — Random number generator.
 #[allow(clippy::too_many_arguments)] // Orchestrator for the read-pair pipeline
 pub fn generate_read_pair(
@@ -229,6 +283,7 @@ pub fn generate_read_pair(
     simple_names: bool,
     methylation: Option<&MethylationConfig>,
     capture_pre_conversion: bool,
+    clip_config: Option<&TerminalClipConfig>,
     rng: &mut impl Rng,
 ) -> Option<ReadPair> {
     let frag_len = fragment.bases.len();
@@ -297,6 +352,7 @@ pub fn generate_read_pair(
         r1_pre_conversion,
         adapter_bases,
         model,
+        clip_config,
         rng,
     );
 
@@ -336,6 +392,7 @@ pub fn generate_read_pair(
         r2_pre_conversion,
         adapter_bases,
         model,
+        clip_config,
         rng,
     );
 
@@ -365,8 +422,8 @@ pub fn generate_read_pair(
     })
 }
 
-/// Compute a CIGAR from a slice of ascending reference positions, plus
-/// optional adapter soft-clipping.
+/// Compute a CIGAR from a slice of ascending reference positions, with
+/// explicit leading and trailing soft-clip lengths.
 ///
 /// Positions must be in ascending order (forward strand). Consecutive
 /// positions incrementing by 1 produce M ops, same position produces I ops,
@@ -376,24 +433,30 @@ pub fn generate_read_pair(
 /// reference order from the leftmost aligned position, so even negative-strand
 /// reads use ascending positions.
 ///
-/// Adapter bases are appended as a soft-clip (S) operation. For
-/// negative-strand reads (`negative_strand = true`) the adapter is sequenced
-/// at the 3' end of the read but sits at the left (5') end of the stored BAM
-/// record after reverse-complementing, so the S op is placed at the *start*
-/// of the CIGAR. For forward-strand reads the S op is placed at the *end*.
+/// `lead_clip` and `trail_clip` are soft-clip lengths in BAM-record
+/// orientation (left and right of the alignment, respectively). The caller is
+/// responsible for folding both adapter read-through and terminal-artifact
+/// clips into these counts according to strand — for a forward-strand read the
+/// 3' adapter sits at the right (trailing), while for a reverse-strand read it
+/// sits at the left (leading) after reverse-complementing.
+///
+/// When `positions` is empty the read has no aligned bases, so the two clip
+/// counts collapse into a single soft-clip op (a CIGAR cannot carry two `S`
+/// ops with nothing between them).
 #[must_use]
-pub fn cigar_from_ref_positions(
-    positions: &[u32],
-    adapter_bases: usize,
-    negative_strand: bool,
-) -> Cigar {
+pub fn cigar_from_ref_positions(positions: &[u32], lead_clip: usize, trail_clip: usize) -> Cigar {
     let mut ops: Vec<Op> = Vec::new();
 
     if positions.is_empty() {
-        if adapter_bases > 0 {
-            ops.push(Op::new(Kind::SoftClip, adapter_bases));
+        let total = lead_clip + trail_clip;
+        if total > 0 {
+            ops.push(Op::new(Kind::SoftClip, total));
         }
         return Cigar::from(ops);
+    }
+
+    if lead_clip > 0 {
+        ops.push(Op::new(Kind::SoftClip, lead_clip));
     }
 
     let mut match_run: usize = 1; // First base is always a match.
@@ -442,15 +505,8 @@ pub fn cigar_from_ref_positions(
         ops.push(Op::new(Kind::Match, match_run));
     }
 
-    // Adapter bases as soft-clip. Negative-strand reads are stored
-    // reverse-complemented in BAM, so the adapter (at the 3' end in read
-    // order) moves to the left (5') end of the record — a leading S op.
-    if adapter_bases > 0 {
-        if negative_strand {
-            ops.insert(0, Op::new(Kind::SoftClip, adapter_bases));
-        } else {
-            ops.push(Op::new(Kind::SoftClip, adapter_bases));
-        }
+    if trail_clip > 0 {
+        ops.push(Op::new(Kind::SoftClip, trail_clip));
     }
 
     Cigar::from(ops)
@@ -503,69 +559,77 @@ mod tests {
 
     #[test]
     fn test_cigar_all_match() {
-        let cigar = cigar_from_ref_positions(&[0, 1, 2, 3, 4], 0, false);
+        let cigar = cigar_from_ref_positions(&[0, 1, 2, 3, 4], 0, 0);
         assert_eq!(cigar_to_string(&cigar), "5M");
     }
 
     #[test]
     fn test_cigar_with_insertion() {
         // Positions 0,1,2,2,2,3,4: two inserted bases at ref pos 2.
-        let cigar = cigar_from_ref_positions(&[0, 1, 2, 2, 2, 3, 4], 0, false);
+        let cigar = cigar_from_ref_positions(&[0, 1, 2, 2, 2, 3, 4], 0, 0);
         assert_eq!(cigar_to_string(&cigar), "3M2I2M");
     }
 
     #[test]
     fn test_cigar_with_deletion() {
         // Gap from 2 to 5: 2 deleted ref bases.
-        let cigar = cigar_from_ref_positions(&[0, 1, 2, 5, 6], 0, false);
+        let cigar = cigar_from_ref_positions(&[0, 1, 2, 5, 6], 0, 0);
         assert_eq!(cigar_to_string(&cigar), "3M2D2M");
     }
 
     #[test]
-    fn test_cigar_with_adapter_softclip_forward() {
-        // Forward-strand: adapter is a trailing soft-clip.
-        let cigar = cigar_from_ref_positions(&[0, 1, 2], 2, false);
+    fn test_cigar_with_trailing_softclip() {
+        // Forward-strand adapter (or 3' clip): trailing soft-clip.
+        let cigar = cigar_from_ref_positions(&[0, 1, 2], 0, 2);
         assert_eq!(cigar_to_string(&cigar), "3M2S");
     }
 
     #[test]
-    fn test_cigar_with_adapter_softclip_negative_strand() {
-        // Negative-strand: adapter moves to a leading soft-clip after RC.
-        let cigar = cigar_from_ref_positions(&[0, 1, 2], 2, true);
+    fn test_cigar_with_leading_softclip() {
+        // Negative-strand adapter (or read-3' clip after RC): leading soft-clip.
+        let cigar = cigar_from_ref_positions(&[0, 1, 2], 2, 0);
         assert_eq!(cigar_to_string(&cigar), "2S3M");
     }
 
     #[test]
-    fn test_cigar_all_adapter() {
-        // All-adapter read: placement doesn't matter, but it still round-trips.
-        let cigar = cigar_from_ref_positions(&[], 5, false);
+    fn test_cigar_with_both_leading_and_trailing_softclip() {
+        // A terminal clip on one end plus adapter on the other yields a clip
+        // at both ends of the record.
+        let cigar = cigar_from_ref_positions(&[5, 6, 7], 2, 3);
+        assert_eq!(cigar_to_string(&cigar), "2S3M3S");
+    }
+
+    #[test]
+    fn test_cigar_all_softclip() {
+        // No aligned bases: leading and trailing clips collapse to one S op.
+        let cigar = cigar_from_ref_positions(&[], 2, 3);
         assert_eq!(cigar_to_string(&cigar), "5S");
     }
 
     #[test]
     fn test_cigar_with_insertion_and_deletion() {
         // Insertion at pos 2 (two extra bases), then deletion of 2 ref bases.
-        let cigar = cigar_from_ref_positions(&[0, 1, 2, 2, 5, 6], 0, false);
+        let cigar = cigar_from_ref_positions(&[0, 1, 2, 2, 5, 6], 0, 0);
         assert_eq!(cigar_to_string(&cigar), "3M1I2D2M");
     }
 
     #[test]
-    fn test_cigar_with_adapter_and_deletion() {
-        let cigar = cigar_from_ref_positions(&[0, 1, 4, 5], 3, false);
+    fn test_cigar_with_trailing_clip_and_deletion() {
+        let cigar = cigar_from_ref_positions(&[0, 1, 4, 5], 0, 3);
         assert_eq!(cigar_to_string(&cigar), "2M2D2M3S");
     }
 
     #[test]
     fn test_cigar_single_base() {
-        let cigar = cigar_from_ref_positions(&[42], 0, false);
+        let cigar = cigar_from_ref_positions(&[42], 0, 0);
         assert_eq!(cigar_to_string(&cigar), "1M");
     }
 
     #[test]
     fn test_cigar_high_positions() {
         // Negative-strand R2: positions start from a high offset (ascending),
-        // no adapter — CIGAR is identical to forward strand.
-        let cigar = cigar_from_ref_positions(&[100, 101, 102, 103, 104], 0, true);
+        // no clips — CIGAR is identical to forward strand.
+        let cigar = cigar_from_ref_positions(&[100, 101, 102, 103, 104], 0, 0);
         assert_eq!(cigar_to_string(&cigar), "5M");
     }
 
@@ -579,7 +643,7 @@ mod tests {
 
         let pair = generate_read_pair(
             &fragment, "chr1", 1, 10, true, b"ADAPTER", b"ADAPTER", 1.0, &model, false, None,
-            false, &mut rng,
+            false, None, &mut rng,
         )
         .expect("no ambiguous bases — should not reject");
 
@@ -599,7 +663,7 @@ mod tests {
 
         let pair = generate_read_pair(
             &fragment, "chr1", 5, 10, false, b"ADAPTER", b"ADAPTER", 1.0, &model, false, None,
-            false, &mut rng,
+            false, None, &mut rng,
         )
         .unwrap();
 
@@ -618,12 +682,183 @@ mod tests {
 
         let pair = generate_read_pair(
             &fragment, "chr1", 1, 5, true, b"TTTTT", b"GGGGG", 1.0, &model, false, None, false,
-            &mut rng,
+            None, &mut rng,
         )
         .unwrap();
 
         assert_eq!(cigar_to_string(&pair.r1_cigar), "2M3S");
         assert_eq!(cigar_to_string(pair.r2_cigar.as_ref().unwrap()), "3S2M");
+    }
+
+    #[test]
+    fn test_terminal_clip_5p_forward_shifts_pos_and_leading_clips() {
+        use crate::clip::TerminalClipConfig;
+        // length_mean = 1 makes the clip length deterministic (always 1 bp),
+        // rate 1.0 makes the clip certain — so the test asserts exact CIGAR/POS.
+        let clip = TerminalClipConfig { rate_5p: 1.0, rate_3p: 0.0, length_mean: 1, length_max: 5 };
+        let fragment = test_fragment(b"ACGTACGTACGTACGTACGT", 100); // forward, 20 bp.
+        let model = IlluminaErrorModel::new(20, 0.0, 0.0);
+        let mut rng = SmallRng::seed_from_u64(7);
+
+        let pair = generate_read_pair(
+            &fragment,
+            "chr1",
+            1,
+            20,
+            true,
+            b"ADAPTER",
+            b"ADAPTER",
+            1.0,
+            &model,
+            false,
+            None,
+            false,
+            Some(&clip),
+            &mut rng,
+        )
+        .unwrap();
+
+        // R1 is forward strand: read 5' is the left of the record, so the clip
+        // is leading and the alignment start advances past the clipped base.
+        assert_eq!(cigar_to_string(&pair.r1_cigar), "1S19M");
+        assert_eq!(pair.r1_truth.position, 102, "5' clip on a forward read must advance POS by 1");
+        // R2 is reverse strand: read 5' is the right of the record, so its own
+        // 5' clip is trailing and POS is unchanged.
+        assert_eq!(cigar_to_string(pair.r2_cigar.as_ref().unwrap()), "19M1S");
+        assert_eq!(pair.r2_truth.as_ref().unwrap().position, 101);
+    }
+
+    #[test]
+    fn test_terminal_clip_bases_diverge_from_reference() {
+        use crate::clip::TerminalClipConfig;
+        // With the error model disabled, the only mutation to R1's genomic
+        // bases is the clip. Every clipped 5' base must differ from the
+        // corresponding original fragment base, so the clip is guaranteed
+        // visible to a downstream aligner (not a coincidental match).
+        let clip = TerminalClipConfig { rate_5p: 1.0, rate_3p: 0.0, length_mean: 6, length_max: 8 };
+        let original = b"ACGTACGTACGTACGTACGT";
+        let fragment = test_fragment(original, 100);
+        let model = IlluminaErrorModel::new(20, 0.0, 0.0);
+        let mut rng = SmallRng::seed_from_u64(3);
+
+        let pair = generate_read_pair(
+            &fragment,
+            "chr1",
+            1,
+            20,
+            false,
+            b"ADAPTER",
+            b"ADAPTER",
+            1.0,
+            &model,
+            false,
+            None,
+            false,
+            Some(&clip),
+            &mut rng,
+        )
+        .unwrap();
+
+        // R1 is forward and only the 5' end clips, so the CIGAR is `<k>S<rest>M`.
+        // Recover the clip length from the leading soft-clip op rather than
+        // assuming a fixed sample.
+        let ops = pair.r1_cigar.as_ref();
+        assert_eq!(ops[0].kind(), Kind::SoftClip, "expected a leading 5' soft-clip");
+        let clip_len = ops[0].len();
+        assert!(clip_len >= 1);
+        for (i, (&got, &orig)) in
+            pair.read1.bases[..clip_len].iter().zip(&original[..clip_len]).enumerate()
+        {
+            assert_ne!(got, orig, "clipped 5' base {i} must differ from the reference base");
+        }
+        // The aligned interior is untouched.
+        assert_eq!(&pair.read1.bases[clip_len..], &original[clip_len..]);
+    }
+
+    #[test]
+    fn test_terminal_clip_3p_forward_is_trailing() {
+        use crate::clip::TerminalClipConfig;
+        let clip = TerminalClipConfig { rate_5p: 0.0, rate_3p: 1.0, length_mean: 1, length_max: 5 };
+        let fragment = test_fragment(b"ACGTACGTACGTACGTACGT", 100);
+        let model = IlluminaErrorModel::new(20, 0.0, 0.0);
+        let mut rng = SmallRng::seed_from_u64(7);
+
+        let pair = generate_read_pair(
+            &fragment,
+            "chr1",
+            1,
+            20,
+            true,
+            b"ADAPTER",
+            b"ADAPTER",
+            1.0,
+            &model,
+            false,
+            None,
+            false,
+            Some(&clip),
+            &mut rng,
+        )
+        .unwrap();
+
+        // Forward read, 3' clip → trailing, POS unchanged.
+        assert_eq!(cigar_to_string(&pair.r1_cigar), "19M1S");
+        assert_eq!(pair.r1_truth.position, 101);
+    }
+
+    #[test]
+    fn test_terminal_clip_disabled_is_identical_to_none() {
+        use crate::clip::TerminalClipConfig;
+        // A disabled config (both rates 0) must produce byte-identical output
+        // to passing no config at all — same bases, qualities, CIGAR, POS.
+        let disabled =
+            TerminalClipConfig { rate_5p: 0.0, rate_3p: 0.0, length_mean: 8, length_max: 20 };
+        let fragment = test_fragment(b"ACGTACGTACGTACGTACGT", 100);
+        let model = IlluminaErrorModel::new(20, 0.01, 0.05);
+
+        let mut rng_none = SmallRng::seed_from_u64(123);
+        let none = generate_read_pair(
+            &fragment,
+            "chr1",
+            1,
+            20,
+            true,
+            b"ADAPTER",
+            b"ADAPTER",
+            1.0,
+            &model,
+            false,
+            None,
+            false,
+            None,
+            &mut rng_none,
+        )
+        .unwrap();
+
+        let mut rng_dis = SmallRng::seed_from_u64(123);
+        let dis = generate_read_pair(
+            &fragment,
+            "chr1",
+            1,
+            20,
+            true,
+            b"ADAPTER",
+            b"ADAPTER",
+            1.0,
+            &model,
+            false,
+            None,
+            false,
+            Some(&disabled),
+            &mut rng_dis,
+        )
+        .unwrap();
+
+        assert_eq!(none.read1.bases, dis.read1.bases);
+        assert_eq!(none.read1.qualities, dis.read1.qualities);
+        assert_eq!(cigar_to_string(&none.r1_cigar), cigar_to_string(&dis.r1_cigar));
+        assert_eq!(none.r1_truth.position, dis.r1_truth.position);
+        assert_eq!(none.read2.as_ref().unwrap().bases, dis.read2.as_ref().unwrap().bases);
     }
 
     #[test]
@@ -633,7 +868,8 @@ mod tests {
         let mut rng = SmallRng::seed_from_u64(42);
 
         let pair = generate_read_pair(
-            &fragment, "chr1", 42, 4, true, b"A", b"A", 1.0, &model, true, None, false, &mut rng,
+            &fragment, "chr1", 42, 4, true, b"A", b"A", 1.0, &model, true, None, false, None,
+            &mut rng,
         )
         .unwrap();
 
@@ -647,7 +883,8 @@ mod tests {
         let mut rng = SmallRng::seed_from_u64(42);
 
         let pair = generate_read_pair(
-            &fragment, "chr1", 1, 10, true, b"A", b"A", 1.0, &model, false, None, false, &mut rng,
+            &fragment, "chr1", 1, 10, true, b"A", b"A", 1.0, &model, false, None, false, None,
+            &mut rng,
         )
         .unwrap();
 
@@ -667,7 +904,7 @@ mod tests {
 
         let pair = generate_read_pair(
             &fragment, "chr1", 1, 10, true, b"ADAPTER", b"ADAPTER", 0.5, &model, false, None,
-            false, &mut rng,
+            false, None, &mut rng,
         );
 
         assert!(pair.is_none(), "all-lowercase fragment should be rejected at threshold 0.5");
@@ -683,7 +920,7 @@ mod tests {
 
         let pair = generate_read_pair(
             &fragment, "chr1", 1, 10, true, b"ADAPTER", b"ADAPTER", 0.5, &model, false, None,
-            false, &mut rng,
+            false, None, &mut rng,
         )
         .expect("0.3 < 0.5 — should accept");
 
@@ -730,6 +967,7 @@ mod tests {
             false,
             Some(&mc),
             true,
+            None,
             &mut rng,
         )
         .unwrap();
@@ -799,6 +1037,7 @@ mod tests {
             false,
             Some(&mc),
             true,
+            None,
             &mut rng,
         )
         .unwrap();
@@ -871,6 +1110,7 @@ mod tests {
             false,
             Some(&mc),
             false,
+            None,
             &mut rng,
         )
         .unwrap();
@@ -925,6 +1165,7 @@ mod tests {
             false,
             Some(&mc),
             false,
+            None,
             &mut rng,
         )
         .unwrap();
@@ -969,6 +1210,7 @@ mod tests {
             false,
             None,
             false,
+            None,
             &mut rng_a,
         );
         assert!(rejected.is_none(), "expected rejection when R2 is all-lowercase");
@@ -985,6 +1227,7 @@ mod tests {
             false,
             None,
             false,
+            None,
             &mut rng_a,
         )
         .unwrap();
@@ -1004,6 +1247,7 @@ mod tests {
             false,
             None,
             false,
+            None,
             &mut rng_b,
         )
         .unwrap();

@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Optional terminal soft-clip artifact model for `simulate`. Real libraries
+  soft-clip a few bases off one or both read ends on a meaningful fraction of
+  reads (end-repair fill-in, damaged or non-templated ends); Twist EM-seq, for
+  example, shows ~8% of reads clipped, strongly 5'-biased and modal at 6–10 bp.
+  Four new flags control it: `--clip-5p-rate` and `--clip-3p-rate` (both
+  default `0.0`, i.e. disabled) give independent per-end probabilities, and
+  `--clip-length-mean` (default `8`) / `--clip-length-max` (default `20`) shape
+  a shared truncated-geometric clip-length distribution. Clipped bases are
+  replaced with random sequence and the soft-clip is recorded in the
+  golden-BAM CIGAR (advancing the alignment start when a forward read's 5' end
+  is clipped), so ground truth stays exact. The model is protocol-agnostic
+  (independent of `--methylation-mode`); a disabled or omitted model draws no
+  randomness, leaving existing seeded runs byte-identical.
+
 ## [0.3.0] - 2026-06-13
 
 ### Added

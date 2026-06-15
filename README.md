@@ -125,6 +125,10 @@ holodeck simulate -r ref.fa -v methylated.vcf.gz -o output_taps \
 | `--min-error-rate` | 0.001 | Error rate at start of reads |
 | `--max-error-rate` | 0.01 | Error rate at end of reads |
 | `--max-n-frac` | 0.02 | Reject reads with >this fraction of bases from ambiguous reference positions (see [Ambiguous reference bases](#ambiguous-reference-bases)) |
+| `--clip-5p-rate` | 0.0 | Probability a read's 5' end carries a terminal soft-clip artifact (see [Terminal soft-clip artifacts](#terminal-soft-clip-artifacts)) |
+| `--clip-3p-rate` | 0.0 | Probability a read's 3' end carries a terminal soft-clip artifact, independent of 3' adapter read-through |
+| `--clip-length-mean` | 8 | Mean injected clip length (truncated geometric); only used when a clip rate is non-zero |
+| `--clip-length-max` | 20 | Maximum injected clip length; only used when a clip rate is non-zero |
 | `--methylation-mode` | none | Methylation chemistry: `em-seq` (or `bisulfite`) or `taps`. Presence enables methylation simulation |
 | `--methylation-conversion-rate` | 0.999 | Chemistry efficiency for normally-converting molecules (probability that the converting class of C converts to T) |
 | `--methylation-failure-rate` | 0.01 | Fraction of molecules that are whole-molecule conversion failures (convert at `1 − conversion-rate`). Requires `--methylation-mode` |
@@ -154,6 +158,14 @@ Real references contain a mix of `A`/`C`/`G`/`T`, large stretches of `N` (assemb
    Set `--max-n-frac 1.0` to disable the filter (accept reads from any region). Set `--max-n-frac 0.0` to require every base in every read to come from an unambiguous reference position.
 
 **Known limitation:** requested `--coverage` is computed from raw contig/BED lengths, not from the non-ambiguous territory. For a reference like hs38DH (~5% N), rejection is noise and coverage lands where you'd expect. For simulations targeted at heavily-N contigs (or with `--max-n-frac 0.0` in N-dense regions), effective coverage will be slightly below the requested value; a warning is logged if the resampling budget is exhausted.
+
+### Terminal soft-clip artifacts
+
+By default holodeck's reads align essentially end-to-end: aside from VCF-derived indels and 3' adapter read-through, the simulated CIGAR is one long match block. Real libraries are messier — end-repair fill-in, damaged or non-templated read ends, and similar effects make aligners soft-clip a few bases off one or both ends of a meaningful fraction of reads. Twist EM-seq, for example, shows ~8% of reads carrying a soft clip, strongly 5'-biased and modal at 6–10 bp. The mechanism is protocol-agnostic, so the model is independent of `--methylation-mode` and useful for both methylation and non-methylation simulation.
+
+`--clip-5p-rate` and `--clip-3p-rate` turn this on (both default to `0.0`, i.e. disabled). For each read, the 5' and 3' ends independently receive a clip with their configured probabilities; a clipped end's length is drawn from a truncated geometric distribution with mean `--clip-length-mean`, capped at `--clip-length-max`. The 5' and 3' rates are separate because real libraries are markedly asymmetric (the 5' end clips several times more often), while the length distribution is shared across both ends.
+
+When an end is clipped, holodeck replaces those terminal bases with random sequence — so a downstream aligner re-derives the soft-clip rather than forcing a match — and records the soft-clip in the golden-BAM CIGAR (and advances the alignment start when a forward read's 5' end is clipped). Ground truth therefore stays exact: the aligned block still maps to the correct reference span. A disabled (or omitted) model draws no randomness, so existing seeded runs remain byte-identical.
 
 ### Golden BAM
 
