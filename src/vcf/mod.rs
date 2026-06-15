@@ -12,6 +12,9 @@ pub mod genotype;
 /// Per-CpG methylation classifier and MT/MB FORMAT VCF reader/writer used by
 /// the `methylate` subcommand and the methylation-aware `simulate` path.
 pub mod methylation;
+/// Extension-aware (plain vs. BGZF) VCF output sink shared by the `mutate` and
+/// `methylate` subcommands.
+pub mod writer;
 
 use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, Read};

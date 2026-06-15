@@ -76,7 +76,8 @@ pub struct Methylate {
     #[arg(long, default_value_t = crate::meth::DEFAULT_HEMI_RATE, value_name = "FLOAT")]
     pub hemimethylation_rate: f64,
 
-    /// Output methylation-annotated VCF (BGZF-compressed).
+    /// Output methylation-annotated VCF. Compression follows the output
+    /// extension: `.gz`/`.bgz` => BGZF, otherwise plain text.
     #[arg(long, short = 'o', value_name = "PATH")]
     pub output: PathBuf,
 
@@ -110,14 +111,13 @@ impl Methylate {
 
 impl Command for Methylate {
     fn execute(&self) -> Result<()> {
-        use noodles_bgzf as bgzf;
-
         use crate::fasta::Fasta;
         use crate::haplotype::build_haplotypes;
         use crate::meth::ContigMethylation;
         use crate::seed::{derive_seed, resolve_seed};
         use crate::vcf::methylation::write_contig;
         use crate::vcf::methylation::write_vcf_header;
+        use crate::vcf::writer::VcfWriter;
         use crate::version::VERSION;
 
         // 1. Build and validate the methylation model from the per-context flags.
@@ -159,13 +159,15 @@ impl Command for Methylate {
             None
         };
 
-        // 5. Open the output VCF, BGZF-compressed.
-        let file = File::create(&self.output)?;
-        let mut bgzf = bgzf::io::Writer::new(file);
+        // 5. Open the output VCF. Compression follows the file extension
+        //    (`.gz`/`.bgz` → BGZF, else plain text) so the file is named
+        //    truthfully for `simulate` and any external tool that keys codec
+        //    off the extension (e.g. `tabix`/`bcftools`).
+        let mut vcf_out = VcfWriter::new(&self.output)?;
 
         // 6. Write the VCF header.
         let cmd_line = capture_command_line();
-        write_vcf_header(&mut bgzf, &dict, resolved_sample.as_deref(), &VERSION, &cmd_line)?;
+        write_vcf_header(&mut vcf_out, &dict, resolved_sample.as_deref(), &VERSION, &cmd_line)?;
 
         // 6b. Open the bedGraph output file and write the track header, if requested.
         let mut bedgraph_writer: Option<BufWriter<File>> =
@@ -224,7 +226,7 @@ impl Command for Methylate {
                 ContigMethylation::from_haplotypes(&haplotypes, &reference, &model, &mut meth_rng);
 
             write_contig(
-                &mut bgzf,
+                &mut vcf_out,
                 contig_name,
                 &reference,
                 variants,
@@ -248,9 +250,9 @@ impl Command for Methylate {
             }
         }
 
-        // 8. Flush and close the VCF.
-        bgzf.flush()?;
-        drop(bgzf);
+        // 8. Finalize the VCF: flush buffered data and (when BGZF) write the
+        //    EOF block.
+        vcf_out.close()?;
 
         // 8b. Flush and close the bedGraph, if open.
         if let Some(mut bg) = bedgraph_writer {

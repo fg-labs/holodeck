@@ -13,6 +13,7 @@ use crate::bed::TargetRegions;
 use crate::fasta::Fasta;
 use crate::ploidy::PloidyMap;
 use crate::seed::{derive_seed, resolve_seed};
+use crate::vcf::writer::VcfWriter;
 
 /// DNA bases for random mutation generation.
 const BASES: [u8; 4] = [b'A', b'C', b'G', b'T'];
@@ -144,8 +145,11 @@ impl Mutate {
         let indel_dist = Geometric::new(self.indel_length_param)
             .map_err(|e| anyhow::anyhow!("Invalid indel length distribution: {e}"))?;
 
-        // Open output VCF.
-        let mut vcf_out = std::fs::File::create(&self.output)?;
+        // Open output VCF. Compression follows the file extension (`.gz`/`.bgz`
+        // → BGZF, else plain text) so the file is named truthfully for
+        // `holodeck simulate` and any external tool that keys codec off the
+        // extension (e.g. `tabix`/`bcftools`).
+        let mut vcf_out = VcfWriter::new(&self.output)?;
         Self::write_vcf_header(&mut vcf_out, &dict)?;
 
         let total_rate = self.snp_rate + self.indel_rate + self.mnp_rate;
@@ -229,13 +233,17 @@ impl Mutate {
             }
         }
 
+        // Finalize the VCF: flush buffered data and (when BGZF) write the EOF
+        // block.
+        vcf_out.close()?;
+
         log::info!("Generated {total_variants} variants");
         Ok(())
     }
 
     /// Write the VCF header to the output file.
-    fn write_vcf_header(
-        out: &mut std::fs::File,
+    fn write_vcf_header<W: Write>(
+        out: &mut W,
         dict: &crate::sequence_dict::SequenceDictionary,
     ) -> Result<()> {
         writeln!(out, "##fileformat=VCFv4.3")?;
@@ -373,6 +381,74 @@ fn generate_genotype(ploidy: u8, het_hom_ratio: f64, rng: &mut impl Rng) -> Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::commands::common::{BedOptions, ReferenceOptions, SeedOptions};
+
+    /// Build a `Mutate` for a given reference and output path with a high SNP
+    /// rate (so even a tiny contig yields several variants) and a fixed seed.
+    fn mutate_for(reference: std::path::PathBuf, output: std::path::PathBuf) -> Mutate {
+        Mutate {
+            reference: ReferenceOptions { reference },
+            bed: BedOptions { targets: None },
+            seed: SeedOptions { seed: Some(42) },
+            output,
+            snp_rate: 0.05,
+            indel_rate: 0.0,
+            mnp_rate: 0.0,
+            indel_length_param: 0.7,
+            het_hom_ratio: 2.0,
+            ploidy: 2,
+            ploidy_override: Vec::new(),
+        }
+    }
+
+    /// A `.vcf.gz` output path must produce a real BGZF stream (gzip magic up
+    /// front) — not plain text mislabelled with a `.gz` name — that round-trips
+    /// through `parse_variants_by_contig`, the reader `holodeck simulate` uses.
+    #[test]
+    fn mutate_gz_output_is_bgzf_and_reads_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let seq: Vec<u8> = b"ACGT".iter().copied().cycle().take(2000).collect();
+        let ref_path = crate::fasta::write_test_fasta(dir.path(), &[("chr1", &seq)]);
+        let out_path = dir.path().join("muts.vcf.gz");
+
+        mutate_for(ref_path, out_path.clone()).execute().unwrap();
+
+        // Output must be gzip/BGZF, not plain text.
+        let bytes = std::fs::read(&out_path).unwrap();
+        assert_eq!(&bytes[..2], &[0x1f, 0x8b], "expected BGZF/gzip magic bytes");
+
+        // And it must read back through the simulate consumption path.
+        let dict = crate::sequence_dict::SequenceDictionary::from_entries(vec![
+            crate::sequence_dict::SequenceMetadata::new(0, "chr1".to_string(), 2000),
+        ]);
+        let parsed = crate::vcf::parse_variants_by_contig(&out_path, None, &dict).unwrap();
+        assert!(
+            parsed.by_contig.get("chr1").is_some_and(|v| !v.is_empty()),
+            "expected at least one variant to round-trip from the .gz output"
+        );
+    }
+
+    /// A plain `.vcf` output path must produce uncompressed text that also
+    /// reads back through the simulate consumption path.
+    #[test]
+    fn mutate_plain_output_is_text_and_reads_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let seq: Vec<u8> = b"ACGT".iter().copied().cycle().take(2000).collect();
+        let ref_path = crate::fasta::write_test_fasta(dir.path(), &[("chr1", &seq)]);
+        let out_path = dir.path().join("muts.vcf");
+
+        mutate_for(ref_path, out_path.clone()).execute().unwrap();
+
+        let bytes = std::fs::read(&out_path).unwrap();
+        assert_ne!(&bytes[..2], &[0x1f, 0x8b], "plain .vcf output must not be gzip");
+        assert!(bytes.starts_with(b"##fileformat=VCFv4.3"), "expected plain VCF header");
+
+        let dict = crate::sequence_dict::SequenceDictionary::from_entries(vec![
+            crate::sequence_dict::SequenceMetadata::new(0, "chr1".to_string(), 2000),
+        ]);
+        let parsed = crate::vcf::parse_variants_by_contig(&out_path, None, &dict).unwrap();
+        assert!(parsed.by_contig.get("chr1").is_some_and(|v| !v.is_empty()));
+    }
 
     #[test]
     fn test_generate_snp() {
