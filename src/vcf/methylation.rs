@@ -1237,25 +1237,6 @@ fn per_hap_bot_bit_string(
         .join("|")
 }
 
-/// Open a VCF file as a buffered line reader, transparently decompressing
-/// BGZF-/gzip-compressed inputs detected by the gzip magic bytes
-/// `0x1f 0x8b` at the start of the file. Returns a boxed `BufRead` so
-/// header-only probes and full-body readers can share the open/peek logic.
-fn open_vcf_buf_reader(path: &std::path::Path) -> std::io::Result<Box<dyn std::io::BufRead>> {
-    use std::io::{BufReader, Read as _};
-    let mut peek_buf = [0u8; 2];
-    {
-        let mut f = std::fs::File::open(path)?;
-        f.read_exact(&mut peek_buf)?;
-    }
-    let file = std::fs::File::open(path)?;
-    if peek_buf == [0x1f, 0x8b] {
-        Ok(Box::new(BufReader::new(flate2::read::MultiGzDecoder::new(file))))
-    } else {
-        Ok(Box::new(BufReader::new(file)))
-    }
-}
-
 /// Check whether a VCF actually carries methylation truth: the header must
 /// declare both `MT` and `MB` FORMAT fields **and** at least one data record
 /// must list `MT` (or `MB`) in its FORMAT column.
@@ -1283,7 +1264,7 @@ fn open_vcf_buf_reader(path: &std::path::Path) -> std::io::Result<Box<dyn std::i
 /// Returns an I/O error if the file cannot be opened or read.
 pub fn vcf_has_mt_mb_records(path: &std::path::Path) -> std::io::Result<bool> {
     use std::io::BufRead as _;
-    let mut reader = open_vcf_buf_reader(path)?;
+    let mut reader = crate::vcf::open_vcf_buf_reader(path)?;
     let mut saw_top_strand_field = false;
     let mut saw_bot_strand_field = false;
     let mut line = String::new();
@@ -1361,7 +1342,7 @@ pub fn parse_methylation_vcf(path: &std::path::Path) -> std::io::Result<Methylat
     // memory: the whole-file `String` and the per-contig `Vec<u8>`s held
     // the body bytes twice. Streaming halves that to roughly one body
     // worth (the `HashMap` values) plus a single `read_line` buffer.
-    let mut reader = open_vcf_buf_reader(path)?;
+    let mut reader = crate::vcf::open_vcf_buf_reader(path)?;
 
     let mut saw_top_strand_field = false;
     let mut saw_bot_strand_field = false;

@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- `simulate` and `methylate` now tolerate VCFs that redeclare a header ID
+  (e.g. `duplicate INFO ID: BREAKSIMLENGTH`). Such duplicates are common in
+  files from upstream tools and are accepted by bcftools; holodeck drops the
+  repeated definitions (keeping the first) instead of erroring. Compression is
+  now detected from the file's magic bytes rather than its extension, so the
+  variant reader also accepts plain-gzip and extension-less inputs.
+
 ## [0.3.0] - 2026-06-13
 
 ### Added
