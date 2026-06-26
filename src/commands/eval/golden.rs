@@ -3,15 +3,16 @@
 //!
 //! The golden BAM written by `holodeck simulate --golden-bam` carries the
 //! true alignment of every read (MAPQ 60, correct CIGAR, the sequence the read
-//! was given) and — for methylation runs — Bismark-style `NM:i` / `MD:Z` call
-//! tags. This module indexes those records by read end so the eval pass can
+//! was given) and — for methylation runs — the Bismark `XG` genome-conversion
+//! strand. This module indexes those records by read end so the eval pass can
 //! look up each mapped read's truth in O(1), including the actual allele the
-//! read carries at any reference position (see [`GoldenInfo::base_at`]).
+//! read carries at any reference position (see [`GoldenInfo::base_at`]) and the
+//! read's true bisulfite strand (see [`GoldenInfo::conv_dir`]).
 
 use std::collections::HashMap;
 use std::path::Path;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use bstr::ByteSlice;
 use noodles::bam;
 use noodles::sam::alignment::record::data::field::Tag;
@@ -24,6 +25,27 @@ use super::cigar;
 /// (R2). R1 and single-end reads use `false`.
 pub type ReadKey = (Vec<u8>, bool);
 
+/// Bisulfite conversion direction of a read, from the Bismark `XG`/`XR` tags.
+/// On the golden record this is ground truth (the strand the simulator drew);
+/// on an aligner record it is the aligner's own call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConvDir {
+    /// `CT` strand: `C->T` is the converted (freed) cell.
+    Ct,
+    /// `GA` strand: `G->A` is the converted (freed) cell.
+    Ga,
+}
+
+/// Parse a record's bisulfite strand from its `XG` tag, falling back to `XR`.
+pub(super) fn conv_dir_from_tags(record: &noodles::sam::alignment::RecordBuf) -> Option<ConvDir> {
+    let tag = string_tag(record, b'X', b'G').or_else(|| string_tag(record, b'X', b'R'))?;
+    match tag.as_str() {
+        "CT" => Some(ConvDir::Ct),
+        "GA" => Some(ConvDir::Ga),
+        _ => None,
+    }
+}
+
 /// True alignment for one read end, taken from the golden BAM.
 #[derive(Debug, Clone)]
 pub struct GoldenInfo {
@@ -33,10 +55,6 @@ pub struct GoldenInfo {
     pub start0: u32,
     /// Reference bases consumed by the true alignment.
     pub ref_len: u32,
-    /// `NM:i` edit distance, if present.
-    pub nm: Option<i64>,
-    /// `MD:Z` string, if present.
-    pub md: Option<String>,
     /// Uppercased read sequence of the true alignment. Paired with `cigar` and
     /// `start0`, this is the per-read oracle for which allele a read actually
     /// carries at a variant site — making variant-representation scoring
@@ -45,6 +63,9 @@ pub struct GoldenInfo {
     /// CIGAR of the true alignment, for mapping a reference position to a read
     /// offset within `sequence`.
     pub cigar: Cigar,
+    /// True bisulfite strand (golden `XG`), or `None` for non-meth reads. Used
+    /// to exclude bisulfite conversions when computing genomic edit distance.
+    pub conv_dir: Option<ConvDir>,
 }
 
 impl GoldenInfo {
@@ -84,12 +105,25 @@ pub fn load(path: &Path) -> Result<HashMap<ReadKey, GoldenInfo>> {
             continue;
         }
 
-        let Some(name) = record.name() else { continue };
-        let Some(ref_id) = record.reference_sequence_id() else { continue };
-        let Some((contig_name, _)) = header.reference_sequences().get_index(ref_id) else {
-            continue;
+        // The golden BAM is holodeck's own truth; a primary mapped record
+        // missing a required field, or a duplicated read-end, means corrupt or
+        // non-holodeck input. Fail fast rather than silently skipping or
+        // overwriting, which would quietly mis-score the eval.
+        let Some(name) = record.name() else {
+            bail!("Golden BAM has a primary mapped record with no read name");
         };
-        let Some(start) = record.alignment_start() else { continue };
+        let Some(ref_id) = record.reference_sequence_id() else {
+            bail!("Golden BAM record {} has no reference sequence id", name.to_str_lossy());
+        };
+        let Some((contig_name, _)) = header.reference_sequences().get_index(ref_id) else {
+            bail!(
+                "Golden BAM record {} references unknown sequence id {ref_id}",
+                name.to_str_lossy()
+            );
+        };
+        let Some(start) = record.alignment_start() else {
+            bail!("Golden BAM record {} has no alignment start", name.to_str_lossy());
+        };
 
         let start0 = u32::try_from(usize::from(start).saturating_sub(1)).unwrap_or(0);
         let cigar = record.cigar().clone();
@@ -97,12 +131,20 @@ pub fn load(path: &Path) -> Result<HashMap<ReadKey, GoldenInfo>> {
             contig: contig_name.to_str_lossy().into_owned(),
             start0,
             ref_len: cigar::reference_len(&cigar),
-            nm: int_tag(&record, b'N', b'M'),
-            md: string_tag(&record, b'M', b'D'),
-            sequence: record.sequence().as_ref().to_vec(),
+            // Uppercase at ingestion so `sequence` honors its documented
+            // contract for every consumer (noodles usually decodes uppercase,
+            // but normalize defensively rather than rely on it).
+            sequence: record.sequence().as_ref().iter().map(u8::to_ascii_uppercase).collect(),
             cigar,
+            conv_dir: conv_dir_from_tags(&record),
         };
-        map.insert((name.to_vec(), flags.is_last_segment()), info);
+        let segment = if flags.is_last_segment() { "R2" } else { "R1" };
+        if map.insert((name.to_vec(), flags.is_last_segment()), info).is_some() {
+            bail!(
+                "Golden BAM has a duplicate primary {segment} record for read {}",
+                name.to_str_lossy()
+            );
+        }
     }
 
     Ok(map)

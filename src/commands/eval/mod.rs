@@ -13,6 +13,7 @@
 //!   `<prefix>.meth.tsv`).
 
 mod cigar;
+mod edits;
 mod golden;
 mod meth;
 mod placement;
@@ -20,11 +21,13 @@ mod variants;
 
 use std::path::PathBuf;
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use clap::Parser;
 
 use super::command::Command;
 use super::common::OutputPrefixOptions;
+use crate::fasta::Fasta;
+use edits::RefCache;
 
 /// Evaluate alignment accuracy of simulated reads.
 ///
@@ -46,7 +49,7 @@ pub struct Eval {
     pub mapped: PathBuf,
 
     /// Golden BAM (`simulate --golden-bam`) supplying each read's true span,
-    /// haplotype, and MD/NM tags. Required by `--variants`.
+    /// sequence, and (for meth) bisulfite strand. Required by `--variants`.
     #[arg(long, value_name = "BAM")]
     pub truth: Option<PathBuf>,
 
@@ -70,6 +73,14 @@ pub struct Eval {
     /// methylation-level correlation against the aligner's `XM` calls.
     #[arg(long, value_name = "BEDGRAPH")]
     pub cpg_truth: Option<PathBuf>,
+
+    /// Reference FASTA (indexed). Enables bisulfite-aware genomic NM/MD
+    /// concordance under `--variants`: each read's edits are recomputed against
+    /// the reference and conversions excluded via its true strand, so the
+    /// metric is comparable across aligners regardless of their NM/MD
+    /// convention. Without it NM/MD concordance is reported as NA.
+    #[arg(short = 'r', long, value_name = "FASTA")]
+    pub reference: Option<PathBuf>,
 
     #[command(flatten)]
     pub output: OutputPrefixOptions,
@@ -103,7 +114,25 @@ impl Command for Eval {
             // Safe: the guard above rejects --variants without --truth.
             let golden = golden.as_ref().expect("--variants requires --truth");
             let truth = variants::VariantTruth::from_vcf(vcf, self.sample.as_deref())?;
-            variants::run(&self.mapped, golden, &truth, self.meth, &self.output.output)?;
+            let mut reference = if let Some(path) = &self.reference {
+                Some(RefCache::new(
+                    Fasta::from_path(path)
+                        .with_context(|| format!("Failed to open reference {}", path.display()))?,
+                ))
+            } else {
+                log::warn!(
+                    "--reference not given; NM/MD genomic-edit concordance will be reported as NA"
+                );
+                None
+            };
+            variants::run(
+                &self.mapped,
+                golden,
+                &truth,
+                self.meth,
+                reference.as_mut(),
+                &self.output.output,
+            )?;
         }
 
         if let Some(cpg_truth) = &self.cpg_truth {

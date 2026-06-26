@@ -1,13 +1,15 @@
 //! Variant-representation accuracy: do aligned reads carry the simulated
 //! variants they should, and how confidently?
 //!
-//! Truth comes entirely from holodeck's own outputs: the per-haplotype phased
-//! genotypes in the truth VCF say which single-base substitutions a read on a
-//! given haplotype should carry, and the golden BAM gives each read's true
-//! span and haplotype. For every expected substitution this pass walks the
-//! *mapped* read's CIGAR to the variant's reference position and checks whether
-//! the observed base matches the alternate allele, accumulating the represented
-//! fraction together with the read's `MAPQ` and `AS` per substitution class.
+//! Truth comes entirely from holodeck's own outputs: the truth VCF enumerates
+//! the simulated single-base substitutions and the golden BAM gives each read's
+//! true span and the actual base it carries at each site (so whether a read is
+//! expected to show the alt is read from the golden sequence, independent of
+//! whether the VCF is phased). For every expected substitution this pass walks
+//! the *mapped* read's CIGAR to the variant's reference position and checks
+//! whether the observed base matches the alternate allele, accumulating the
+//! represented fraction together with the read's `MAPQ` and `AS` per
+//! substitution class.
 //!
 //! ## Methylation framing
 //!
@@ -17,8 +19,10 @@
 //! rather than treated as a true accuracy signal. The discriminating classes
 //! are the mirror (`T->C`) and the transversions, where a methylation-aware
 //! scoring mode should neither over- nor under-penalize relative to the
-//! genomic truth. Classes are assigned from the read's conversion direction
-//! (`XG`, falling back to `XR`).
+//! genomic truth. Classes are assigned from the read's TRUE conversion
+//! direction, taken from the golden BAM (its `XG`) rather than the mapped
+//! record's tags, so an aligner that omits or rewrites `XG`/`XR` cannot shift a
+//! variant into the wrong class.
 
 use std::collections::{BTreeMap, HashMap};
 use std::io::Write;
@@ -26,22 +30,13 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 use noodles::bam;
-use noodles::sam::alignment::RecordBuf;
 
 use super::cigar;
-use super::golden::{GoldenInfo, ReadKey, contig_name, int_tag, string_tag};
+use super::edits::{self, RefCache};
+use super::golden::{ConvDir, GoldenInfo, ReadKey, contig_name, int_tag};
 use crate::commands::command::output_path;
 use crate::sequence_dict::SequenceDictionary;
 use crate::vcf::{ParsedVariants, parse_variants_by_contig};
-
-/// Bisulfite conversion direction for a read, from the `XG`/`XR` Bismark tags.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ConvDir {
-    /// `CT` strand: `C->T` is the converted (freed) cell.
-    Ct,
-    /// `GA` strand: `G->A` is the converted (freed) cell.
-    Ga,
-}
 
 /// Classification of a single-base substitution under a conversion direction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -109,13 +104,17 @@ pub struct ExpectedSnv {
     pub alt_base: u8,
 }
 
-/// One truth substitution site. Only the position and reference base are kept:
-/// which copy carries the alt — and which base — is read per-read from the
-/// golden BAM, so the VCF need not be phased.
+/// One truth substitution site. The position and reference base, plus the
+/// single-base ALT base(s) the sample's genotype declares here (uppercased).
+/// Which copy carries the alt — and thus which read shows it — is read per-read
+/// from the golden BAM, so the VCF need not be phased; the ALT set is retained
+/// only so a bisulfite conversion or sequencing error that yields some *other*
+/// non-reference base is not mistaken for the variant.
 #[derive(Debug, Clone)]
 struct SnvSite {
     pos0: u32,
     ref_base: u8,
+    alts: Vec<u8>,
 }
 
 /// Truth SNVs indexed by contig for per-read span queries.
@@ -151,16 +150,28 @@ impl VariantTruth {
                 if record.ref_allele.len() != 1 {
                     continue; // SNV requires a single reference base.
                 }
-                // Keep only sites the sample actually carries as a substitution:
-                // some genotype allele indexes a single-base ALT.
-                let carries_snv_alt = record.genotype.alleles().iter().any(|allele| {
-                    matches!(allele, Some(idx) if *idx > 0
-                        && record.allele_bases(*idx).is_some_and(|b| b.len() == 1))
-                });
-                if carries_snv_alt {
+                // The single-base ALT base(s) the genotype carries here. Keep
+                // the site only if it has at least one (i.e. the sample carries
+                // a substitution); skip ref-only and non-SNV-ALT records.
+                let mut alts: Vec<u8> = record
+                    .genotype
+                    .alleles()
+                    .iter()
+                    .filter_map(|allele| match allele {
+                        Some(idx) if *idx > 0 => record
+                            .allele_bases(*idx)
+                            .filter(|b| b.len() == 1)
+                            .map(|b| b[0].to_ascii_uppercase()),
+                        _ => None,
+                    })
+                    .collect();
+                alts.sort_unstable();
+                alts.dedup();
+                if !alts.is_empty() {
                     sites.push(SnvSite {
                         pos0: record.position,
                         ref_base: record.ref_allele[0].to_ascii_uppercase(),
+                        alts,
                     });
                 }
             }
@@ -175,11 +186,13 @@ impl VariantTruth {
     /// Substitutions a read actually carries, read from the golden truth.
     ///
     /// For every truth SNV site within the read's true span, the golden read's
-    /// own base at that site is the per-read oracle: when it differs from the
-    /// reference, this read carries that alternate (the value the simulator
-    /// placed on the copy this read was sequenced from). A read sequenced from
-    /// the reference copy shows the reference base and yields nothing — so the
-    /// result is correct whether or not the truth VCF is phased.
+    /// own base at that site is the per-read oracle: when it matches one of the
+    /// site's declared ALT bases, this read carries that variant (the value the
+    /// simulator placed on the copy it was sequenced from). A read sequenced
+    /// from the reference copy shows the reference base and yields nothing — so
+    /// the result is correct whether or not the truth VCF is phased. Requiring
+    /// an ALT match (rather than merely "non-reference") keeps a bisulfite
+    /// conversion or sequencing error at the site from posing as the variant.
     #[must_use]
     pub fn expected_for_read(&self, golden: &GoldenInfo) -> Vec<ExpectedSnv> {
         let Some(sites) = self.by_contig.get(&golden.contig) else {
@@ -193,7 +206,7 @@ impl VariantTruth {
                 break;
             }
             if let Some(base) = golden.base_at(site.pos0)
-                && base != site.ref_base
+                && site.alts.contains(&base)
             {
                 out.push(ExpectedSnv { pos0: site.pos0, ref_base: site.ref_base, alt_base: base });
             }
@@ -317,16 +330,6 @@ fn pct_or_na(numerator: u64, denominator: u64) -> String {
     }
 }
 
-/// Conversion direction for a mapped record from its `XG` (or `XR`) tag.
-fn conv_dir(record: &RecordBuf) -> Option<ConvDir> {
-    let tag = string_tag(record, b'X', b'G').or_else(|| string_tag(record, b'X', b'R'))?;
-    match tag.as_str() {
-        "CT" => Some(ConvDir::Ct),
-        "GA" => Some(ConvDir::Ga),
-        _ => None,
-    }
-}
-
 /// Evaluate variant representation of `mapped` against `golden` + `truth`.
 ///
 /// # Errors
@@ -336,6 +339,7 @@ pub fn run(
     golden: &HashMap<ReadKey, GoldenInfo>,
     truth: &VariantTruth,
     meth: bool,
+    mut reference: Option<&mut RefCache>,
     output_prefix: &Path,
 ) -> Result<()> {
     let mut reader = bam::io::reader::Builder
@@ -362,7 +366,7 @@ pub fn run(
 
         let mapq = record.mapping_quality().map_or(0, u8::from);
         let as_score = int_tag(&record, b'A', b'S');
-        let conv = if meth { conv_dir(&record) } else { None };
+        let conv = if meth { truth_aln.conv_dir } else { None };
 
         // The mapped record represents a variant only if it is aligned to the
         // variant's contig; otherwise (unmapped / mismapped) it cannot.
@@ -380,24 +384,46 @@ pub fn run(
                 }
                 _ => false,
             };
-            // In meth mode the class needs the read's conversion direction; a
-            // read lacking XG/XR yields None and is counted as unclassified.
+            // In meth mode the class needs the read's TRUE conversion direction
+            // (from the golden truth, so an aligner that omits or rewrites XG/XR
+            // cannot move a variant into the wrong class); a non-meth read yields
+            // None and is counted as unclassified.
             let class = conv.map(|dir| classify_substitution(snv.ref_base, snv.alt_base, dir));
             report.record(class, meth, represented, mapq, as_score);
         }
 
-        // MD/NM concordance against the golden truth tags for this read,
-        // counted only where the golden record carries the tag.
-        if let Some(golden_nm) = truth_aln.nm {
-            report.nm_comparable_reads += 1;
-            if int_tag(&record, b'N', b'M') == Some(golden_nm) {
-                report.nm_concordant_reads += 1;
-            }
-        }
-        if let Some(golden_md) = truth_aln.md.as_deref() {
-            report.md_comparable_reads += 1;
-            if string_tag(&record, b'M', b'D').as_deref() == Some(golden_md) {
-                report.md_concordant_reads += 1;
+        // Bisulfite-aware genomic NM/MD concordance against the golden read,
+        // computed from the reference (not the aligner's tags) using the read's
+        // TRUE strand, so it is comparable across aligners regardless of their
+        // NM/MD convention. Requires --reference; NA without it.
+        if let (Some(ref_cache), Some(m_contig), Some(m_start0)) =
+            (reference.as_deref_mut(), mapped_contig.as_deref(), mapped_start0)
+        {
+            // Borrow each contig in turn: both calls return owned GenomicEdits,
+            // so the &[u8] borrows do not overlap.
+            let golden_edits = ref_cache.contig(&truth_aln.contig).map(|r| {
+                edits::genomic_edits(
+                    &truth_aln.sequence,
+                    &truth_aln.cigar,
+                    truth_aln.start0,
+                    r,
+                    truth_aln.conv_dir,
+                )
+            });
+            let aligned_edits = ref_cache.contig(m_contig).map(|r| {
+                edits::genomic_edits(
+                    record.sequence().as_ref(),
+                    record.cigar(),
+                    m_start0,
+                    r,
+                    truth_aln.conv_dir,
+                )
+            });
+            if let (Some(g), Some(a)) = (golden_edits, aligned_edits) {
+                report.nm_comparable_reads += 1;
+                report.nm_concordant_reads += u64::from(a.nm == g.nm);
+                report.md_comparable_reads += 1;
+                report.md_concordant_reads += u64::from(a.positions == g.positions);
             }
         }
     }
@@ -458,10 +484,9 @@ mod tests {
             contig: "chr1".to_string(),
             start0,
             ref_len: cigar::reference_len(&cigar),
-            nm: None,
-            md: None,
             sequence: seq.to_vec(),
             cigar,
+            conv_dir: None,
         }
     }
 
@@ -511,10 +536,9 @@ mod tests {
             contig: "chrX".to_string(),
             start0: 0,
             ref_len: 100,
-            nm: None,
-            md: None,
             sequence: vec![b'T'; 100],
             cigar: Cigar::from(vec![Op::new(Kind::Match, 100)]),
+            conv_dir: None,
         };
         assert!(truth.expected_for_read(&g).is_empty());
     }

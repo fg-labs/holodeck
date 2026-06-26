@@ -243,6 +243,86 @@ fn test_eval_variant_representation_perfect() {
     assert_eq!(parse_footer(&contents, "nm_concordant_pct"), "NA");
 }
 
+/// With `--reference`, NM/MD concordance is the bisulfite-aware genomic edit
+/// distance recomputed against the reference (not the raw tags). Grading the
+/// golden BAM against itself must be perfect — every read's genomic edits match
+/// its own — so both report 100%, not NA.
+#[test]
+fn test_eval_genomic_nm_md_concordance_with_reference() {
+    let seq = non_repetitive_seq(2_000);
+    let env = TestEnv::new(&[("chr1", &seq)]);
+
+    let positions = [400usize, 800, 1200, 1600];
+    let refs: Vec<String> = positions.iter().map(|&p| (seq[p] as char).to_string()).collect();
+    let alts: Vec<String> =
+        refs.iter().map(|r| if r == "A" { "C" } else { "A" }.to_string()).collect();
+    let alt_arrays: Vec<[&str; 1]> = alts.iter().map(|a| [a.as_str()]).collect();
+    let variants: Vec<VcfVariant<'_>> = positions
+        .iter()
+        .enumerate()
+        .map(|(i, &p)| VcfVariant {
+            chrom: "chr1",
+            pos_1based: p as u32 + 1,
+            ref_allele: refs[i].as_str(),
+            alt_alleles: &alt_arrays[i],
+            gt: "1|1",
+        })
+        .collect();
+    let vcf = env.write_vcf("sample", &[("chr1", 2_000)], &variants);
+
+    let sim_out = env.output_prefix();
+    let (ok, _, stderr) = run_simulate(&[
+        "simulate",
+        "-r",
+        env.fasta_path.to_str().unwrap(),
+        "-v",
+        vcf.to_str().unwrap(),
+        "-o",
+        sim_out.to_str().unwrap(),
+        "--coverage",
+        "30",
+        "--read-length",
+        "50",
+        "--fragment-mean",
+        "150",
+        "--fragment-stddev",
+        "20",
+        "--min-error-rate",
+        "0",
+        "--max-error-rate",
+        "0",
+        "--golden-bam",
+        "--single-end",
+        "--seed",
+        "42",
+    ]);
+    assert!(ok, "simulate failed: {stderr}");
+
+    let golden = PathBuf::from(format!("{}.golden.bam", sim_out.display()));
+    let eval_out = env.dir.path().join("eval_ref");
+    let (ok, _, stderr) = run_eval(&[
+        "eval",
+        "--mapped",
+        golden.to_str().unwrap(),
+        "--truth",
+        golden.to_str().unwrap(),
+        "--variants",
+        vcf.to_str().unwrap(),
+        "--reference",
+        env.fasta_path.to_str().unwrap(),
+        "-o",
+        eval_out.to_str().unwrap(),
+    ]);
+    assert!(ok, "eval failed: {stderr}");
+
+    let variants_tsv = PathBuf::from(format!("{}.variants.tsv", eval_out.display()));
+    let contents = std::fs::read_to_string(&variants_tsv).unwrap();
+    // Golden vs itself: genomic edits are identical → 100% concordance, and
+    // crucially NOT "NA" (which is what the raw-tag path returned here).
+    assert_eq!(parse_footer(&contents, "md_concordant_pct"), "100.00");
+    assert_eq!(parse_footer(&contents, "nm_concordant_pct"), "100.00");
+}
+
 /// Simulate EM-seq reads with a methylation golden BAM and a cpg-truth
 /// bedGraph, then correlate the golden BAM's own XM calls against that truth.
 /// Because both derive from the same methylation draws, the correlation is

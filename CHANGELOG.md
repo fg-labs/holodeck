@@ -19,13 +19,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reference copy shows the reference base and is not expected to carry the
   alt). For every such expected substitution it walks the mapped read's CIGAR
   to the variant position and checks the observed base, accumulating the
-  represented fraction with the read's MAPQ and alignment score, plus per-read
-  MD/NM concordance against the golden tags. `--meth`
-  breaks the results down by bisulfite substitution class, labelling the
-  conversion-confounded `C->T`/`G->A` cell as such. `--cpg-truth` correlates
-  the aligner's Bismark `XM` calls against the simulated cpg-truth bedGraph
-  (Pearson r and RMSE). Results are written to `<prefix>.variants.tsv` and
-  `<prefix>.meth.tsv` alongside the existing `<prefix>.eval.txt`.
+  represented fraction with the read's MAPQ and alignment score. With
+  `--reference` it also reports per-read NM/MD concordance as a **bisulfite-aware
+  genomic edit distance**: rather than comparing raw `NM:i`/`MD:Z` tags (which
+  are convention-dependent — a bisulfite aligner may score against the original
+  or the converted reference, so the tags differ even when both placed the read
+  correctly), it recomputes each read's edits against the reference and excludes
+  conversions using the read's TRUE strand (taken from the golden truth, so it
+  works even for aligners such as bwameth that emit no `XG`). The result is
+  comparable across aligners; without `--reference` NM/MD concordance is `NA`.
+  `--meth` breaks the variant results down by bisulfite substitution class,
+  labelling the conversion-confounded `C->T`/`G->A` cell as such. `--cpg-truth`
+  correlates the aligner's Bismark `XM` calls against the simulated cpg-truth
+  bedGraph (Pearson r and RMSE; `NA` for aligners that emit no `XM`). Results
+  are written to `<prefix>.variants.tsv` and `<prefix>.meth.tsv` alongside the
+  existing `<prefix>.eval.txt`.
 
 ### Fixed
 
