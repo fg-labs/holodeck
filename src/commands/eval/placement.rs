@@ -1,11 +1,12 @@
 //! Placement accuracy: true vs mapped position, stratified by MAPQ bin.
 //!
-//! Truth positions are parsed from encoded holodeck read names. For each
-//! primary mapped record, the mapped start is compared to the true start on
-//! the same contig within a wiggle tolerance; reads are tallied as correct,
-//! mismapped, or unmapped within their MAPQ bin.
+//! For each primary mapped record, the mapped start is compared to the true
+//! start on the same contig within a wiggle tolerance; reads are tallied as
+//! correct, mismapped, or unmapped within their MAPQ bin. Truth positions come
+//! from the golden BAM when one is supplied (exact, indel-aware), otherwise
+//! from the encoded holodeck read name.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io::Write;
 use std::path::Path;
 
@@ -13,8 +14,15 @@ use anyhow::{Context, Result};
 use bstr::ByteSlice;
 use noodles::bam;
 
+use super::golden::{GoldenInfo, ReadKey};
 use crate::commands::command::output_path;
 use crate::read_naming::{parse_encoded_pe_name, parse_encoded_se_name};
+
+/// A read's true contig and 1-based start, from golden BAM or read name.
+struct TruthPos {
+    contig: String,
+    position: u32,
+}
 
 /// Accuracy counts for a single MAPQ bin.
 #[derive(Debug, Default, Clone)]
@@ -31,9 +39,17 @@ struct BinCounts {
 
 /// Evaluate placement accuracy of `mapped` and write `<prefix>.eval.txt`.
 ///
+/// When `golden` is supplied, each read's truth position is taken from its
+/// golden record; otherwise it is parsed from the encoded read name.
+///
 /// # Errors
 /// Returns an error if the BAM cannot be read or the output cannot be written.
-pub fn run(mapped: &Path, output_prefix: &Path, wiggle: u32) -> Result<()> {
+pub fn run(
+    mapped: &Path,
+    output_prefix: &Path,
+    wiggle: u32,
+    golden: Option<&HashMap<ReadKey, GoldenInfo>>,
+) -> Result<()> {
     let mut reader = bam::io::reader::Builder
         .build_from_path(mapped)
         .with_context(|| format!("Failed to open BAM: {}", mapped.display()))?;
@@ -55,17 +71,24 @@ pub fn run(mapped: &Path, output_prefix: &Path, wiggle: u32) -> Result<()> {
         }
         total_reads += 1;
 
-        // Get read name.
         let name_bytes = record.name().map_or(&b""[..], |n| n.as_bytes());
-        let name = name_bytes.to_str().unwrap_or("");
 
-        // Parse truth from encoded read name. For PE names, pick R1 or R2
-        // based on the record's segment flag; mis-selecting here caused R2
-        // alignments to be scored against the R1 truth position.
-        let truth = if let Some((_, r1, r2)) = parse_encoded_pe_name(name) {
-            if flags.is_last_segment() { Some(r2) } else { Some(r1) }
+        // Resolve truth from the golden BAM when present (exact, indel-aware),
+        // else from the encoded read name. For PE names, pick R1 or R2 by the
+        // segment flag; mis-selecting scores R2 against the R1 truth position.
+        let truth = if let Some(golden) = golden {
+            golden
+                .get(&(name_bytes.to_vec(), flags.is_last_segment()))
+                .map(|info| TruthPos { contig: info.contig.clone(), position: info.start0 + 1 })
         } else {
-            parse_encoded_se_name(name).map(|(_, truth)| truth)
+            let name = name_bytes.to_str().unwrap_or("");
+            if let Some((_, r1, r2)) = parse_encoded_pe_name(name) {
+                let t = if flags.is_last_segment() { r2 } else { r1 };
+                Some(TruthPos { contig: t.contig, position: t.position })
+            } else {
+                parse_encoded_se_name(name)
+                    .map(|(_, t)| TruthPos { contig: t.contig, position: t.position })
+            }
         };
 
         let Some(truth) = truth else {
@@ -115,7 +138,8 @@ pub fn run(mapped: &Path, output_prefix: &Path, wiggle: u32) -> Result<()> {
     }
 
     if parse_failures > 0 {
-        log::warn!("{parse_failures} reads had unparseable names; skipped");
+        let reason = if golden.is_some() { "no golden truth record" } else { "unparseable names" };
+        log::warn!("{parse_failures} reads had {reason}; skipped");
     }
 
     // Write results.
