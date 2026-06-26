@@ -38,6 +38,11 @@ chrono = "0.4"
 # Vec<bool> would cost 8x the memory at whole-chromosome scale. See
 # MethylationTable in src/meth.rs.
 bitvec = "1"
+# Data-parallel `methylate`: every contig is methylated independently (its RNGs
+# are seeded from `(seed, contig)` with no state carried between contigs), so
+# the per-contig loop runs as a work-stealing `par_iter`. See the per-contig
+# map in `Methylate::execute` (src/commands/methylate.rs).
+rayon = "1"
 
 [dev-dependencies]
 tempfile = "3"
