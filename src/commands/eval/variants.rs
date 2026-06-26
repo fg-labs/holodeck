@@ -97,25 +97,25 @@ pub fn classify_substitution(ref_base: u8, alt_base: u8, conv: ConvDir) -> SubCl
     if transition { SubClass::Other } else { SubClass::Transversion }
 }
 
-/// A single-base substitution a read is expected to carry on its haplotype.
+/// A single-base substitution a read actually carries, with the alternate base
+/// read from the golden truth sequence (not inferred from VCF phasing).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ExpectedSnv {
     /// 0-based reference position.
     pub pos0: u32,
     /// Uppercased reference base.
     pub ref_base: u8,
-    /// Uppercased alternate base on the queried haplotype.
+    /// Uppercased alternate base the golden read carries at this site.
     pub alt_base: u8,
 }
 
-/// One truth SNV site with its per-haplotype alternate bases.
+/// One truth substitution site. Only the position and reference base are kept:
+/// which copy carries the alt — and which base — is read per-read from the
+/// golden BAM, so the VCF need not be phased.
 #[derive(Debug, Clone)]
 struct SnvSite {
     pos0: u32,
     ref_base: u8,
-    /// Expected base per haplotype: `Some(alt)` when that haplotype carries a
-    /// single-base alternate here, `None` for reference / missing / non-SNV.
-    alt_by_hap: Vec<Option<u8>>,
 }
 
 /// Truth SNVs indexed by contig for per-read span queries.
@@ -139,8 +139,10 @@ impl VariantTruth {
         Ok(Self::from_parsed(&parsed))
     }
 
-    /// Build SNV truth from already-parsed variants, keeping only sites that
-    /// are a single-base substitution on at least one haplotype.
+    /// Build SNV truth from already-parsed variants, keeping each site that is
+    /// a single-base substitution the sample carries (single-base reference and
+    /// at least one single-base ALT in the genotype). The realized allele per
+    /// read is resolved later from the golden sequence, so no phasing is stored.
     fn from_parsed(parsed: &ParsedVariants) -> Self {
         let mut by_contig: BTreeMap<String, Vec<SnvSite>> = BTreeMap::new();
         for (contig, records) in &parsed.by_contig {
@@ -149,26 +151,17 @@ impl VariantTruth {
                 if record.ref_allele.len() != 1 {
                     continue; // SNV requires a single reference base.
                 }
-                let ref_base = record.ref_allele[0].to_ascii_uppercase();
-                let mut any = false;
-                let alt_by_hap: Vec<Option<u8>> = record
-                    .genotype
-                    .alleles()
-                    .iter()
-                    .map(|allele| {
-                        let alt = match allele {
-                            Some(idx) if *idx > 0 => record
-                                .allele_bases(*idx)
-                                .filter(|b| b.len() == 1)
-                                .map(|b| b[0].to_ascii_uppercase()),
-                            _ => None,
-                        };
-                        any |= alt.is_some();
-                        alt
-                    })
-                    .collect();
-                if any {
-                    sites.push(SnvSite { pos0: record.position, ref_base, alt_by_hap });
+                // Keep only sites the sample actually carries as a substitution:
+                // some genotype allele indexes a single-base ALT.
+                let carries_snv_alt = record.genotype.alleles().iter().any(|allele| {
+                    matches!(allele, Some(idx) if *idx > 0
+                        && record.allele_bases(*idx).is_some_and(|b| b.len() == 1))
+                });
+                if carries_snv_alt {
+                    sites.push(SnvSite {
+                        pos0: record.position,
+                        ref_base: record.ref_allele[0].to_ascii_uppercase(),
+                    });
                 }
             }
             sites.sort_by_key(|s| s.pos0);
@@ -179,26 +172,30 @@ impl VariantTruth {
         Self { by_contig }
     }
 
-    /// Expected SNVs for a read on `haplotype` spanning `[start0, end0)`.
+    /// Substitutions a read actually carries, read from the golden truth.
+    ///
+    /// For every truth SNV site within the read's true span, the golden read's
+    /// own base at that site is the per-read oracle: when it differs from the
+    /// reference, this read carries that alternate (the value the simulator
+    /// placed on the copy this read was sequenced from). A read sequenced from
+    /// the reference copy shows the reference base and yields nothing — so the
+    /// result is correct whether or not the truth VCF is phased.
     #[must_use]
-    pub fn expected_snvs(
-        &self,
-        contig: &str,
-        haplotype: usize,
-        start0: u32,
-        end0: u32,
-    ) -> Vec<ExpectedSnv> {
-        let Some(sites) = self.by_contig.get(contig) else {
+    pub fn expected_for_read(&self, golden: &GoldenInfo) -> Vec<ExpectedSnv> {
+        let Some(sites) = self.by_contig.get(&golden.contig) else {
             return Vec::new();
         };
-        let lo = sites.partition_point(|s| s.pos0 < start0);
+        let end0 = golden.end0();
+        let lo = sites.partition_point(|s| s.pos0 < golden.start0);
         let mut out = Vec::new();
         for site in &sites[lo..] {
             if site.pos0 >= end0 {
                 break;
             }
-            if let Some(Some(alt)) = site.alt_by_hap.get(haplotype) {
-                out.push(ExpectedSnv { pos0: site.pos0, ref_base: site.ref_base, alt_base: *alt });
+            if let Some(base) = golden.base_at(site.pos0)
+                && base != site.ref_base
+            {
+                out.push(ExpectedSnv { pos0: site.pos0, ref_base: site.ref_base, alt_base: base });
             }
         }
         out
@@ -357,12 +354,7 @@ pub fn run(
         let key: ReadKey = (name.to_vec(), flags.is_last_segment());
         let Some(truth_aln) = golden.get(&key) else { continue };
 
-        let expected = truth.expected_snvs(
-            &truth_aln.contig,
-            truth_aln.haplotype,
-            truth_aln.start0,
-            truth_aln.end0(),
-        );
+        let expected = truth.expected_for_read(truth_aln);
         if expected.is_empty() {
             continue;
         }
@@ -415,6 +407,9 @@ pub fn run(
 
 #[cfg(test)]
 mod tests {
+    use noodles::sam::alignment::record::cigar::op::{Kind, Op};
+    use noodles::sam::alignment::record_buf::Cigar;
+
     use super::*;
     use crate::vcf::genotype::{Genotype, VariantRecord};
 
@@ -457,37 +452,71 @@ mod tests {
         VariantTruth::from_parsed(&parsed)
     }
 
-    #[test]
-    fn expected_snvs_respects_phasing_per_haplotype() {
-        // 1|0 -> haplotype 0 carries the alt, haplotype 1 does not.
-        let truth = truth_from(vec![snv_record(100, "C", "T", "1|0")]);
-        let hap0 = truth.expected_snvs("chr1", 0, 0, 200);
-        assert_eq!(hap0.len(), 1);
-        assert_eq!((hap0[0].pos0, hap0[0].ref_base, hap0[0].alt_base), (100, b'C', b'T'));
-        assert!(truth.expected_snvs("chr1", 1, 0, 200).is_empty());
+    fn golden_read(start0: u32, seq: &[u8], ops: &[(Kind, usize)]) -> GoldenInfo {
+        let cigar = Cigar::from(ops.iter().map(|&(k, n)| Op::new(k, n)).collect::<Vec<_>>());
+        GoldenInfo {
+            contig: "chr1".to_string(),
+            start0,
+            ref_len: cigar::reference_len(&cigar),
+            nm: None,
+            md: None,
+            sequence: seq.to_vec(),
+            cigar,
+        }
     }
 
     #[test]
-    fn expected_snvs_skips_indels_and_honors_span() {
+    fn expected_reads_alt_from_golden_even_when_vcf_is_unphased() {
+        // SNV at ref 100 (ref C). The VCF is UNPHASED (0/1) — eval must not guess
+        // a haplotype; it reads the read's actual base from the golden sequence.
+        let truth = truth_from(vec![snv_record(100, "C", "T", "0/1")]);
+        // Golden read covering [90, 200) as 110M; base at ref 100 = offset 10 = T.
+        let mut seq = vec![b'A'; 110];
+        seq[10] = b'T';
+        let exp = truth.expected_for_read(&golden_read(90, &seq, &[(Kind::Match, 110)]));
+        assert_eq!(exp.len(), 1);
+        assert_eq!((exp[0].pos0, exp[0].ref_base, exp[0].alt_base), (100, b'C', b'T'));
+    }
+
+    #[test]
+    fn expected_skips_reads_carrying_the_reference_allele() {
+        // Same unphased site, but this golden read shows the REFERENCE base C at
+        // 100 — sequenced from the reference copy, so nothing is expected.
+        let truth = truth_from(vec![snv_record(100, "C", "T", "0/1")]);
+        let mut seq = vec![b'A'; 110];
+        seq[10] = b'C';
+        assert!(truth.expected_for_read(&golden_read(90, &seq, &[(Kind::Match, 110)])).is_empty());
+    }
+
+    #[test]
+    fn expected_honors_span_and_skips_indels() {
         let truth = truth_from(vec![
-            snv_record(50, "A", "G", "1|1"),
-            snv_record(100, "AT", "A", "1|1"), // deletion: not an SNV
-            snv_record(150, "C", "A", "0|1"),
+            snv_record(50, "A", "G", "1/1"),
+            snv_record(100, "AT", "A", "1/1"), // deletion: not an SNV site
+            snv_record(150, "C", "A", "0/1"),
         ]);
-        // Span [60, 200) excludes pos 50; indel at 100 dropped; 150 on hap1 kept.
-        let hap1 = truth.expected_snvs("chr1", 1, 60, 200);
-        assert_eq!(hap1.len(), 1);
-        assert_eq!(hap1[0].pos0, 150);
-        // hap0 in [0,60) sees only pos 50.
-        let hap0 = truth.expected_snvs("chr1", 0, 0, 60);
-        assert_eq!(hap0.len(), 1);
-        assert_eq!(hap0[0].pos0, 50);
+        // Golden read [60, 200) as 140M: pos 50 is before the span, the indel at
+        // 100 is dropped, only site 150 (offset 90 = alt A) remains.
+        let mut seq = vec![b'C'; 140];
+        seq[90] = b'A';
+        let exp = truth.expected_for_read(&golden_read(60, &seq, &[(Kind::Match, 140)]));
+        assert_eq!(exp.len(), 1);
+        assert_eq!((exp[0].pos0, exp[0].alt_base), (150, b'A'));
     }
 
     #[test]
-    fn expected_snvs_unknown_contig_is_empty() {
-        let truth = truth_from(vec![snv_record(10, "C", "T", "1|0")]);
-        assert!(truth.expected_snvs("chrX", 0, 0, 1000).is_empty());
+    fn expected_for_read_on_unknown_contig_is_empty() {
+        let truth = truth_from(vec![snv_record(10, "C", "T", "0/1")]);
+        let g = GoldenInfo {
+            contig: "chrX".to_string(),
+            start0: 0,
+            ref_len: 100,
+            nm: None,
+            md: None,
+            sequence: vec![b'T'; 100],
+            cigar: Cigar::from(vec![Op::new(Kind::Match, 100)]),
+        };
+        assert!(truth.expected_for_read(&g).is_empty());
     }
 
     #[test]

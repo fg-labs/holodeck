@@ -2,10 +2,11 @@
 //! variant / MD-tag concordance scoring.
 //!
 //! The golden BAM written by `holodeck simulate --golden-bam` carries the
-//! true alignment of every read (MAPQ 60, correct CIGAR), the source
-//! haplotype in the `hp:i` tag, and — for methylation runs — Bismark-style
-//! `NM:i` / `MD:Z` call tags. This module indexes those records by read end so
-//! the eval pass can look up each mapped read's truth in O(1).
+//! true alignment of every read (MAPQ 60, correct CIGAR, the sequence the read
+//! was given) and — for methylation runs — Bismark-style `NM:i` / `MD:Z` call
+//! tags. This module indexes those records by read end so the eval pass can
+//! look up each mapped read's truth in O(1), including the actual allele the
+//! read carries at any reference position (see [`GoldenInfo::base_at`]).
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -14,6 +15,7 @@ use anyhow::{Context, Result};
 use bstr::ByteSlice;
 use noodles::bam;
 use noodles::sam::alignment::record::data::field::Tag;
+use noodles::sam::alignment::record_buf::Cigar;
 use noodles::sam::alignment::record_buf::data::field::Value;
 
 use super::cigar;
@@ -31,12 +33,18 @@ pub struct GoldenInfo {
     pub start0: u32,
     /// Reference bases consumed by the true alignment.
     pub ref_len: u32,
-    /// Source haplotype index (`hp:i` tag; `0` if absent).
-    pub haplotype: usize,
     /// `NM:i` edit distance, if present.
     pub nm: Option<i64>,
     /// `MD:Z` string, if present.
     pub md: Option<String>,
+    /// Uppercased read sequence of the true alignment. Paired with `cigar` and
+    /// `start0`, this is the per-read oracle for which allele a read actually
+    /// carries at a variant site — making variant-representation scoring
+    /// independent of whether the truth VCF is phased.
+    pub sequence: Vec<u8>,
+    /// CIGAR of the true alignment, for mapping a reference position to a read
+    /// offset within `sequence`.
+    pub cigar: Cigar,
 }
 
 impl GoldenInfo {
@@ -44,6 +52,17 @@ impl GoldenInfo {
     #[must_use]
     pub fn end0(&self) -> u32 {
         self.start0 + self.ref_len
+    }
+
+    /// The uppercased base this read carries at 0-based reference position
+    /// `ref_pos0`, or `None` when that position is deleted, clipped, or outside
+    /// the alignment. This is read straight from the golden sequence, so it
+    /// reflects exactly what the simulator placed on this read (the alt allele
+    /// for a read sequenced from the alt copy, the reference base otherwise).
+    #[must_use]
+    pub fn base_at(&self, ref_pos0: u32) -> Option<u8> {
+        let offset = cigar::ref_pos_to_read_offset(&self.cigar, self.start0, ref_pos0)?;
+        self.sequence.get(offset).map(u8::to_ascii_uppercase)
     }
 }
 
@@ -73,15 +92,15 @@ pub fn load(path: &Path) -> Result<HashMap<ReadKey, GoldenInfo>> {
         let Some(start) = record.alignment_start() else { continue };
 
         let start0 = u32::try_from(usize::from(start).saturating_sub(1)).unwrap_or(0);
+        let cigar = record.cigar().clone();
         let info = GoldenInfo {
             contig: contig_name.to_str_lossy().into_owned(),
             start0,
-            ref_len: cigar::reference_len(record.cigar()),
-            haplotype: int_tag(&record, b'h', b'p')
-                .and_then(|n| usize::try_from(n).ok())
-                .unwrap_or(0),
+            ref_len: cigar::reference_len(&cigar),
             nm: int_tag(&record, b'N', b'M'),
             md: string_tag(&record, b'M', b'D'),
+            sequence: record.sequence().as_ref().to_vec(),
+            cigar,
         };
         map.insert((name.to_vec(), flags.is_last_segment()), info);
     }
