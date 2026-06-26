@@ -97,10 +97,17 @@ fn tally_aligner(mapped: &Path) -> Result<AlignerTally> {
         tally_read(&contig, record.cigar(), start0, xm.as_bytes(), &mut tally);
     }
 
-    // A BAM with mapped reads but no XM tags cannot be evaluated for
-    // methylation; surface that rather than reporting an empty correlation.
+    // A BAM with mapped reads but no XM tags carries no methylation calls — for
+    // example a plain bisulfite aligner like bwameth, where calling is a
+    // separate extractor (MethylDackel) step. Warn and return the empty tally so
+    // the correlation is reported as NA rather than failing the whole eval;
+    // placement and variant representation are still meaningful for such a BAM.
     if saw_mapped_primary && !saw_xm {
-        bail!("no XM methylation tags found in mapped primary records of {}", mapped.display());
+        log::warn!(
+            "no XM methylation tags in mapped primaries of {}; \
+             reporting NA methylation correlation",
+            mapped.display()
+        );
     }
     Ok(tally)
 }
