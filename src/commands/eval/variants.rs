@@ -29,7 +29,7 @@ use noodles::bam;
 use noodles::sam::alignment::RecordBuf;
 
 use super::cigar;
-use super::golden::{GoldenInfo, ReadKey, int_tag, string_tag};
+use super::golden::{GoldenInfo, ReadKey, contig_name, int_tag, string_tag};
 use crate::commands::command::output_path;
 use crate::sequence_dict::SequenceDictionary;
 use crate::vcf::{ParsedVariants, parse_variants_by_contig};
@@ -374,7 +374,7 @@ pub fn run(
 
         // The mapped record represents a variant only if it is aligned to the
         // variant's contig; otherwise (unmapped / mismapped) it cannot.
-        let mapped_contig = mapped_contig_name(&record, &header);
+        let mapped_contig = record.reference_sequence_id().and_then(|id| contig_name(&header, id));
         let mapped_start0 = record
             .alignment_start()
             .map(|p| u32::try_from(usize::from(p).saturating_sub(1)).unwrap_or(0));
@@ -411,13 +411,6 @@ pub fn run(
     }
 
     report.write_tsv(output_prefix)
-}
-
-/// Resolve a mapped record's reference contig name via the header.
-fn mapped_contig_name(record: &RecordBuf, header: &noodles::sam::Header) -> Option<String> {
-    let ref_id = record.reference_sequence_id()?;
-    let (name, _) = header.reference_sequences().get_index(ref_id)?;
-    Some(String::from_utf8_lossy(name.as_ref()).into_owned())
 }
 
 #[cfg(test)]

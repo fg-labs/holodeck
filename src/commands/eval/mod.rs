@@ -7,9 +7,12 @@
 //! - [`placement`] — placement accuracy (always; `<prefix>.eval.txt`).
 //! - [`variants`] — variant-representation accuracy (`--variants` + `--truth`;
 //!   `<prefix>.variants.tsv`).
+//! - [`meth`] — methylation-level correlation (`--cpg-truth`;
+//!   `<prefix>.meth.tsv`).
 
 mod cigar;
 mod golden;
+mod meth;
 mod placement;
 mod variants;
 
@@ -59,6 +62,11 @@ pub struct Eval {
     #[arg(long)]
     pub meth: bool,
 
+    /// Per-CpG truth bedGraph (`simulate --cpg-truth-bedgraph`). Enables
+    /// methylation-level correlation against the aligner's `XM` calls.
+    #[arg(long, value_name = "BEDGRAPH")]
+    pub cpg_truth: Option<PathBuf>,
+
     #[command(flatten)]
     pub output: OutputPrefixOptions,
 
@@ -88,6 +96,10 @@ impl Command for Eval {
             variants::run(&self.mapped, &golden, &truth, self.meth, &self.output.output)?;
         } else if self.truth.is_some() {
             log::warn!("--truth is only used with --variants; placement uses encoded read names");
+        }
+
+        if let Some(cpg_truth) = &self.cpg_truth {
+            meth::run(&self.mapped, cpg_truth, &self.output.output)?;
         }
 
         Ok(())

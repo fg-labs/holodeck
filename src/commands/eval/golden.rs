@@ -89,6 +89,12 @@ pub fn load(path: &Path) -> Result<HashMap<ReadKey, GoldenInfo>> {
     Ok(map)
 }
 
+/// Resolve a record's reference contig name via the header.
+pub(super) fn contig_name(header: &noodles::sam::Header, ref_id: usize) -> Option<String> {
+    let (name, _) = header.reference_sequences().get_index(ref_id)?;
+    Some(name.to_str_lossy().into_owned())
+}
+
 /// Read an integer auxiliary tag from a record buffer.
 pub(super) fn int_tag(record: &noodles::sam::alignment::RecordBuf, a: u8, b: u8) -> Option<i64> {
     record.data().get(&Tag::new(a, b)).and_then(Value::as_int)

@@ -81,6 +81,31 @@ pub fn ref_pos_to_read_offset(cigar: &Cigar, aln_start0: u32, target_ref0: u32) 
     None
 }
 
+/// Invoke `f(read_offset, ref_pos0)` for each aligned (`M`/`=`/`X`) base,
+/// walking the CIGAR from `aln_start0`. Insertions and soft-clips advance the
+/// read only; deletions and skips advance the reference only.
+pub fn for_each_aligned(cigar: &Cigar, aln_start0: u32, mut f: impl FnMut(usize, u32)) {
+    let mut ref_pos = aln_start0;
+    let mut read_pos: usize = 0;
+    for op in cigar.as_ref() {
+        let kind = op.kind();
+        let len = op.len();
+        let span = u32::try_from(len).unwrap_or(0);
+        match (consumes_reference(kind), consumes_query(kind)) {
+            (true, true) => {
+                for k in 0..len {
+                    f(read_pos + k, ref_pos + u32::try_from(k).unwrap_or(0));
+                }
+                ref_pos += span;
+                read_pos += len;
+            }
+            (true, false) => ref_pos += span,
+            (false, true) => read_pos += len,
+            (false, false) => {}
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
