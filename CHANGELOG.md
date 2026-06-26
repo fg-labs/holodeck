@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `eval` now scores accuracy against holodeck's own truth beyond placement.
+  With `--truth` (the golden BAM) it takes per-read true positions, spans, and
+  haplotypes from the golden alignment rather than only the encoded read name,
+  and `--variants` reports how faithfully aligned reads represent the simulated
+  substitutions: for every expected single-base substitution it walks the
+  mapped read's CIGAR to the variant position and checks the observed base,
+  accumulating the represented fraction with the read's MAPQ and alignment
+  score, plus per-read MD/NM concordance against the golden tags. `--meth`
+  breaks the results down by bisulfite substitution class, labelling the
+  conversion-confounded `C->T`/`G->A` cell as such. `--cpg-truth` correlates
+  the aligner's Bismark `XM` calls against the simulated cpg-truth bedGraph
+  (Pearson r and RMSE). Results are written to `<prefix>.variants.tsv` and
+  `<prefix>.meth.tsv` alongside the existing `<prefix>.eval.txt`.
+
 ### Fixed
 
 - `simulate` and `methylate` now tolerate VCFs that redeclare a header ID

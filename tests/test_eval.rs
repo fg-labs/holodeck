@@ -8,7 +8,10 @@ mod helpers;
 
 use std::path::PathBuf;
 
-use helpers::{BamRecordSpec, TestEnv, non_repetitive_seq, run_eval, run_simulate, write_bam};
+use helpers::{
+    BamRecordSpec, TestEnv, VcfVariant, methylate_to_vcf, non_repetitive_seq, run_eval,
+    run_simulate, write_bam,
+};
 use noodles::sam::alignment::record::Flags;
 
 /// Parse the eval output file and return (total, correct, mismapped, unmapped)
@@ -132,6 +135,186 @@ fn test_eval_perfect_alignment_paired_end() {
     assert_eq!(mismapped, 0, "No PE records should be mismapped against their own truth");
     assert_eq!(unmapped, 0, "No reads should be unmapped in a golden BAM");
     assert_eq!(correct, total, "All R1 and R2 records should be correct");
+}
+
+/// Read the `all` (non-meth) class row of a `.variants.tsv` and return
+/// `(n_expected, n_represented)`.
+fn parse_variants_all_row(path: &std::path::Path) -> (u64, u64) {
+    let contents = std::fs::read_to_string(path).unwrap();
+    for line in contents.lines() {
+        if let Some(rest) = line.strip_prefix("all\t") {
+            let fields: Vec<&str> = rest.split('\t').collect();
+            // class row: confounded, n_expected, n_represented, ...
+            return (fields[1].parse().unwrap(), fields[2].parse().unwrap());
+        }
+    }
+    panic!("`all` row not found in {}", path.display());
+}
+
+/// Read a `#key\tvalue` footer line from a TSV.
+fn parse_footer<'a>(contents: &'a str, key: &str) -> &'a str {
+    let needle = format!("#{key}\t");
+    contents
+        .lines()
+        .find_map(|l| l.strip_prefix(&needle))
+        .unwrap_or_else(|| panic!("footer #{key} not found"))
+}
+
+/// Simulate single-end reads carrying homozygous-alt SNVs with a golden BAM,
+/// then run eval with the golden BAM as the mapped BAM. Every variant-bearing
+/// read is perfectly placed, so all expected substitutions must be represented.
+#[test]
+fn test_eval_variant_representation_perfect() {
+    let seq = non_repetitive_seq(2_000);
+    let env = TestEnv::new(&[("chr1", &seq)]);
+
+    // Hom-alt SNVs at known positions; ref base read from the sequence so the
+    // VCF matches the reference, alt chosen to differ.
+    let positions = [400usize, 800, 1200, 1600];
+    let refs: Vec<String> = positions.iter().map(|&p| (seq[p] as char).to_string()).collect();
+    let alts: Vec<String> =
+        refs.iter().map(|r| if r == "A" { "C" } else { "A" }.to_string()).collect();
+    let alt_arrays: Vec<[&str; 1]> = alts.iter().map(|a| [a.as_str()]).collect();
+    let variants: Vec<VcfVariant<'_>> = positions
+        .iter()
+        .enumerate()
+        .map(|(i, &p)| VcfVariant {
+            chrom: "chr1",
+            pos_1based: p as u32 + 1,
+            ref_allele: refs[i].as_str(),
+            alt_alleles: &alt_arrays[i],
+            gt: "1|1",
+        })
+        .collect();
+    let vcf = env.write_vcf("sample", &[("chr1", 2_000)], &variants);
+
+    let sim_out = env.output_prefix();
+    let (ok, _, stderr) = run_simulate(&[
+        "simulate",
+        "-r",
+        env.fasta_path.to_str().unwrap(),
+        "-v",
+        vcf.to_str().unwrap(),
+        "-o",
+        sim_out.to_str().unwrap(),
+        "--coverage",
+        "30",
+        "--read-length",
+        "50",
+        "--fragment-mean",
+        "150",
+        "--fragment-stddev",
+        "20",
+        "--min-error-rate",
+        "0",
+        "--max-error-rate",
+        "0",
+        "--golden-bam",
+        "--single-end",
+        "--seed",
+        "42",
+    ]);
+    assert!(ok, "simulate failed: {stderr}");
+
+    let golden = PathBuf::from(format!("{}.golden.bam", sim_out.display()));
+    let eval_out = env.dir.path().join("eval");
+    let (ok, _, stderr) = run_eval(&[
+        "eval",
+        "--mapped",
+        golden.to_str().unwrap(),
+        "--truth",
+        golden.to_str().unwrap(),
+        "--variants",
+        vcf.to_str().unwrap(),
+        "-o",
+        eval_out.to_str().unwrap(),
+    ]);
+    assert!(ok, "eval failed: {stderr}");
+
+    let variants_tsv = PathBuf::from(format!("{}.variants.tsv", eval_out.display()));
+    let (n_expected, n_represented) = parse_variants_all_row(&variants_tsv);
+    assert!(n_expected > 0, "expected some variant-bearing reads");
+    assert_eq!(n_represented, n_expected, "golden alignment must represent every variant");
+
+    // A non-methylation golden BAM carries no MD/NM tags, so concordance has
+    // nothing to compare against and must report NA (not 0%).
+    let contents = std::fs::read_to_string(&variants_tsv).unwrap();
+    assert_eq!(parse_footer(&contents, "md_concordant_pct"), "NA");
+    assert_eq!(parse_footer(&contents, "nm_concordant_pct"), "NA");
+}
+
+/// Simulate EM-seq reads with a methylation golden BAM and a cpg-truth
+/// bedGraph, then correlate the golden BAM's own XM calls against that truth.
+/// Because both derive from the same methylation draws, the correlation is
+/// strong.
+#[test]
+fn test_eval_meth_correlation_on_golden() {
+    let seq = non_repetitive_seq(4_000);
+    let env = TestEnv::new(&[("chr1", &seq)]);
+    // Mixed methylation (rate 0.5) so truth levels vary across CpGs and the
+    // correlation is well-defined (a constant series would be undefined).
+    let vcf = methylate_to_vcf(&env, &env.fasta_path, 0.5, 7, "meth.vcf.gz");
+
+    let sim_out = env.output_prefix();
+    let bedgraph = env.dir.path().join("truth.bedGraph");
+    let (ok, _, stderr) = run_simulate(&[
+        "simulate",
+        "-r",
+        env.fasta_path.to_str().unwrap(),
+        "-v",
+        vcf.to_str().unwrap(),
+        "-o",
+        sim_out.to_str().unwrap(),
+        "--coverage",
+        "30",
+        "--read-length",
+        "50",
+        "--fragment-mean",
+        "150",
+        "--fragment-stddev",
+        "20",
+        "--min-error-rate",
+        "0",
+        "--max-error-rate",
+        "0",
+        "--methylation-mode",
+        "em-seq",
+        "--methylation-conversion-rate",
+        "1.0",
+        "--methylation-failure-rate",
+        "0.0",
+        "--cpg-truth-bedgraph",
+        bedgraph.to_str().unwrap(),
+        "--golden-bam",
+        "--seed",
+        "42",
+        "--threads",
+        "1",
+    ]);
+    assert!(ok, "simulate failed: {stderr}");
+
+    let golden = PathBuf::from(format!("{}.golden.bam", sim_out.display()));
+    let eval_out = env.dir.path().join("eval");
+    let (ok, _, stderr) = run_eval(&[
+        "eval",
+        "--mapped",
+        golden.to_str().unwrap(),
+        "--cpg-truth",
+        bedgraph.to_str().unwrap(),
+        "-o",
+        eval_out.to_str().unwrap(),
+    ]);
+    assert!(ok, "eval failed: {stderr}");
+
+    let meth_tsv = std::fs::read_to_string(format!("{}.meth.tsv", eval_out.display())).unwrap();
+    // Data row: n_cpg \t pearson_r \t rmse
+    let row = meth_tsv.lines().nth(1).expect("meth.tsv data row");
+    let fields: Vec<&str> = row.split('\t').collect();
+    let n_cpg: u64 = fields[0].parse().unwrap();
+    assert!(n_cpg > 0, "expected covered CpGs");
+    assert_ne!(fields[1], "NA", "pearson_r should be defined");
+    let r: f64 = fields[1].parse().unwrap();
+    assert!(r > 0.8, "golden XM should track truth strongly, got r={r}");
 }
 
 /// Create a BAM where all reads are unmapped.  Eval should report 100%
