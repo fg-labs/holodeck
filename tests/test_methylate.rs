@@ -528,12 +528,72 @@ fn methylate_applies_variants_from_input_vcf() {
     );
 }
 
+#[test]
+fn methylate_output_is_identical_across_thread_counts() {
+    // Several contigs of varied length so the per-contig parallel map spans
+    // multiple work units; non-repetitive sequence carries CpGs on each. The
+    // output must be byte-identical whether methylated on one thread or many:
+    // each contig's RNGs are seeded purely from `(seed, contig)` with no state
+    // carried between contigs, so processing order cannot affect the result.
+    let c1 = helpers::non_repetitive_seq(8000);
+    let c2 = helpers::non_repetitive_seq(5000);
+    let c3 = helpers::non_repetitive_seq(3000);
+    let c4 = helpers::non_repetitive_seq(1500);
+    let env = TestEnv::new(&[("chr1", &c1), ("chr2", &c2), ("chr3", &c3), ("chr4", &c4)]);
+
+    let run = |tag: &str, threads: usize| -> (String, Vec<u8>) {
+        let vcf = env.dir.path().join(format!("{tag}.vcf.gz"));
+        let bg = env.dir.path().join(format!("{tag}.bedgraph"));
+        let (ok, _, stderr) = run_methylate_with_threads(
+            threads,
+            &[
+                "methylate",
+                "--reference",
+                env.fasta_path.to_str().unwrap(),
+                "--output",
+                vcf.to_str().unwrap(),
+                "--bedgraph",
+                bg.to_str().unwrap(),
+                "--seed",
+                "42",
+            ],
+        );
+        assert!(ok, "methylate (threads={threads}) failed: {stderr}");
+        (strip_command_line(&decompress_vcf(&vcf)), std::fs::read(&bg).expect("read bedgraph"))
+    };
+
+    let (vcf_single, bg_single) = run("single", 1);
+    let (vcf_multi, bg_multi) = run("multi", 8);
+
+    assert_eq!(vcf_single, vcf_multi, "VCF content differs between 1 and 8 threads");
+    assert_eq!(bg_single, bg_multi, "bedGraph differs between 1 and 8 threads");
+    // Guard against a vacuous pass on two equal-but-empty outputs.
+    assert!(
+        vcf_single.lines().any(|l| l.starts_with("chr1\t") && l.contains("MT:MB")),
+        "expected CpG methylation rows in the output"
+    );
+}
+
 // ── Command runner ───────────────────────────────────────────────────────────
 
 /// Run `holodeck methylate` with the given arguments and return
 /// `(success, stdout, stderr)`.
 fn run_methylate(args: &[&str]) -> (bool, String, String) {
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_holodeck"))
+        .args(args)
+        .output()
+        .expect("Failed to run holodeck");
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    (output.status.success(), stdout, stderr)
+}
+
+/// Run `holodeck methylate` with `RAYON_NUM_THREADS` pinned, returning
+/// `(success, stdout, stderr)`. Used to prove per-contig parallelism does not
+/// change the output.
+fn run_methylate_with_threads(threads: usize, args: &[&str]) -> (bool, String, String) {
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_holodeck"))
+        .env("RAYON_NUM_THREADS", threads.to_string())
         .args(args)
         .output()
         .expect("Failed to run holodeck");

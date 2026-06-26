@@ -5,6 +5,7 @@
 use std::fs::File;
 use std::io::{BufWriter, Write as _};
 use std::path::PathBuf;
+use std::sync::Mutex;
 
 use anyhow::Result;
 use clap::Parser;
@@ -12,6 +13,12 @@ use rand::SeedableRng as _;
 
 use super::command::Command;
 use super::common::{ReferenceOptions, SeedOptions, VcfOptions};
+
+/// Serialized methylation output for one contig: its VCF body, and an optional
+/// bedGraph body (present only when a bedGraph was requested). Produced
+/// independently per contig so the per-contig work can run in parallel and the
+/// buffers be concatenated in dict order. See [`methylate_contig`].
+type ContigOutput = (Vec<u8>, Option<Vec<u8>>);
 
 /// Generate a methylation-annotated VCF.
 ///
@@ -112,13 +119,11 @@ impl Methylate {
 impl Command for Methylate {
     fn execute(&self) -> Result<()> {
         use crate::fasta::Fasta;
-        use crate::haplotype::build_haplotypes;
-        use crate::meth::ContigMethylation;
-        use crate::seed::{derive_seed, resolve_seed};
-        use crate::vcf::methylation::write_contig;
+        use crate::seed::resolve_seed;
         use crate::vcf::methylation::write_vcf_header;
         use crate::vcf::writer::VcfWriter;
         use crate::version::VERSION;
+        use rayon::prelude::*;
 
         // 1. Build and validate the methylation model from the per-context flags.
         let model = self.methylation_model();
@@ -141,8 +146,11 @@ impl Command for Methylate {
         let seed = resolve_seed(self.seed.seed, &seed_desc);
         log::info!("Using random seed: {seed}");
 
-        // 3. Open the reference and collect contig names.
-        let mut fasta = Fasta::from_path(&self.reference.reference)?;
+        // 3. Open the reference and collect contig names. Only the dictionary
+        //    is needed here; the per-contig sequence is loaded per worker below
+        //    (each opens its own handle, since `load_contig` seeks a shared
+        //    reader).
+        let fasta = Fasta::from_path(&self.reference.reference)?;
         let dict = fasta.dict().clone();
         let contig_names: Vec<String> = dict.names().into_iter().map(String::from).collect();
 
@@ -194,59 +202,96 @@ impl Command for Methylate {
         };
         let sample_ploidy = parsed_variants.as_ref().map_or(2, |p| p.sample_ploidy);
 
-        // 7. For each contig, build haplotypes, compute methylation, emit rows.
-        for contig_name in &contig_names {
-            // Per-contig deterministic seed for reference normalization.
-            // Use the bare contig name (no prefix) to match `simulate`'s
-            // `derive_seed(main_seed, contig_name)` at simulate.rs line ~578,
-            // so both commands resolve IUPAC codes identically for the same
-            // `--seed` and reference.
-            let ref_seed = derive_seed(seed, contig_name);
-            let mut ref_rng = rand::rngs::SmallRng::seed_from_u64(ref_seed);
-            let reference = fasta.load_contig(contig_name, &mut ref_rng)?;
+        // 7. Methylate every contig. Each contig is independent: its RNGs are
+        //    seeded purely from `(seed, contig)` with no state carried between
+        //    contigs (the methylation Markov chain runs within a single contig;
+        //    see `meth.rs`), so the loop is a work-stealing `par_iter` whose
+        //    output is identical to the sequential version regardless of thread
+        //    count. Each worker serializes its contig's VCF (and optional
+        //    bedGraph) into its own in-memory buffer; the buffers are written
+        //    out in dict order below so the VCF stays coordinate-sorted. Peak
+        //    memory therefore holds every contig's serialized output at once —
+        //    O(whole reference), not O(one contig) as the old streaming loop
+        //    did. That is fine for hg38-scale references on a multi-GB host
+        //    (a few GB resident); revisit with a bounded ordered-streaming
+        //    writer if a far larger reference must run on a constrained host.
+        //
+        //    Each worker thread reuses ONE FASTA handle across all of its
+        //    contigs rather than reopening per contig: `Fasta::from_path`
+        //    rebuilds the whole sequence dictionary, so per-contig opens are
+        //    O(contigs²) and dominate the run on references with thousands of
+        //    contigs (e.g. hs38DH's ~3.4k). The handle is only seeked+read by
+        //    `load_contig`, never shared across threads, so reuse is safe and
+        //    deterministic.
+        let want_bedgraph = self.bedgraph.is_some();
+        let ref_path = self.reference.reference.as_path();
 
-            // Look this contig's variants up from the once-parsed map. An
-            // absent key or `None` map (no VCF) both yield an empty slice.
-            let variants: &[crate::vcf::genotype::VariantRecord] = parsed_variants
-                .as_ref()
-                .and_then(|p| p.by_contig.get(contig_name))
-                .map_or(&[], Vec::as_slice);
+        // One lazily-opened FASTA handle per thread, indexed by
+        // `rayon::current_thread_index()`. `map_init` cannot be used for this:
+        // with `with_max_len(1)` below rayon splits the work into one job per
+        // contig, so `map_init`'s init closure fires once *per contig* rather
+        // than once per worker — reopening the reference on every contig, the
+        // exact O(contigs²) cost this handle reuse is meant to avoid. Each
+        // thread only ever touches its own slot, so every `Mutex` is
+        // uncontended; it is present solely to make the shared `Vec` `Sync`.
+        //
+        // A small workload may run entirely inline on the calling thread rather
+        // than on the pool, in which case `current_thread_index()` is `None`;
+        // the extra trailing slot is that caller's handle. Worker indices are
+        // `0..num_threads`, so they and the fallback slot never collide.
+        let num_threads = rayon::current_num_threads();
+        let fasta_handles: Vec<Mutex<Option<Fasta>>> =
+            std::iter::repeat_with(|| Mutex::new(None)).take(num_threads + 1).collect();
 
-            // Build haplotypes with their own deterministic sub-seed, sized
-            // by the whole-VCF `sample_ploidy` so variant-free contigs land
-            // the same number of haplotypes as variant-bearing ones.
-            let hap_seed = derive_seed(seed, &format!("haps@{contig_name}"));
-            let mut hap_rng = rand::rngs::SmallRng::seed_from_u64(hap_seed);
-            let haplotypes = build_haplotypes(variants, sample_ploidy, &mut hap_rng);
-
-            // Draw per-haplotype methylation with another deterministic sub-seed.
-            let meth_seed = derive_seed(seed, &format!("meth@{contig_name}"));
-            let mut meth_rng = rand::rngs::SmallRng::seed_from_u64(meth_seed);
-            let methylation =
-                ContigMethylation::from_haplotypes(&haplotypes, &reference, &model, &mut meth_rng);
-
-            write_contig(
-                &mut vcf_out,
-                contig_name,
-                &reference,
-                variants,
-                &methylation,
-                sample_ploidy,
-            )?;
-
-            // Append per-contig bedGraph records, if a bedGraph was requested.
-            // Pass `&haplotypes` so the writer can map every reference CpG
-            // through each haplotype's local coordinate system before reading
-            // the methylation bitmap; variant-shifted and variant-destroyed
-            // CpGs would otherwise be miscounted.
-            if let Some(bg) = bedgraph_writer.as_mut() {
-                crate::output::methylation_bedgraph::write_bedgraph_records(
-                    bg,
+        let contig_outputs: Vec<ContigOutput> = contig_names
+            .par_iter()
+            // One contig per job. Per-contig cost is wildly uneven (chr1 ≫ a
+            // 50 kb alt) and the large chromosomes sort first, so rayon's
+            // default contiguous, count-balanced chunking hands one worker the
+            // whole block of big contigs while the rest drain thousands of
+            // trivial alts and starve. Forcing single-item jobs lets every
+            // heavy contig be stolen independently across the pool.
+            .with_max_len(1)
+            .map(|contig_name| {
+                let slot = rayon::current_thread_index().unwrap_or(num_threads);
+                let mut handle =
+                    fasta_handles[slot].lock().expect("per-worker FASTA handle mutex poisoned");
+                // Open this thread's handle on first use, then reuse it across
+                // every contig the thread is assigned.
+                if handle.is_none() {
+                    *handle = Some(Fasta::from_path(ref_path)?);
+                }
+                let fasta = handle.as_mut().expect("handle initialized above");
+                // Look this contig's variants up from the once-parsed map.
+                // An absent key or `None` map (no VCF) both yield an empty
+                // slice.
+                let variants: &[crate::vcf::genotype::VariantRecord] = parsed_variants
+                    .as_ref()
+                    .and_then(|p| p.by_contig.get(contig_name))
+                    .map_or(&[], Vec::as_slice);
+                methylate_contig(
+                    fasta,
                     contig_name,
-                    &reference,
-                    &haplotypes,
-                    &methylation,
-                )?;
+                    seed,
+                    &model,
+                    variants,
+                    sample_ploidy,
+                    want_bedgraph,
+                )
+            })
+            // On a multi-contig failure rayon surfaces one failing contig's
+            // error, not deterministically the first in dict order, so the
+            // contig named in a fatal error may vary run to run. The job aborts
+            // either way, so this only affects which contig the message cites.
+            .collect::<Result<Vec<_>>>()?;
+
+        // Write each contig's serialized output in dict order, matching the
+        // sequential writer exactly: the VCF stays coordinate-sorted and the
+        // bedGraph contig-ordered.
+        for (vcf_buf, bedgraph_buf) in &contig_outputs {
+            vcf_out.write_all(vcf_buf)?;
+            if let (Some(bg), Some(buf)) = (bedgraph_writer.as_mut(), bedgraph_buf.as_ref()) {
+                bg.write_all(buf)?;
             }
         }
 
@@ -265,6 +310,78 @@ impl Command for Methylate {
         log::info!("Wrote methylation VCF to {}", self.output.display());
         Ok(())
     }
+}
+
+/// Methylate one contig and return its serialized VCF body (and optional
+/// bedGraph body) as in-memory buffers.
+///
+/// The contig sequence is loaded through the caller-supplied `fasta` handle
+/// (`Fasta::load_contig` seeks the underlying reader, so one handle may be
+/// reused across contigs — but a single handle cannot be shared across threads,
+/// hence the caller gives each worker its own; see [`Methylate::execute`]).
+/// Every RNG is seeded purely from `(seed, contig_name)` with no state carried
+/// in from any other contig, so the returned buffers depend only on
+/// `(seed, contig_name, model, variants, sample_ploidy)` — never on the handle's
+/// prior position or on processing order. Callers may therefore run this across
+/// contigs in any order — sequentially or in parallel — and concatenate the
+/// buffers in dict order for output identical to a single-threaded run.
+fn methylate_contig(
+    fasta: &mut crate::fasta::Fasta,
+    contig_name: &str,
+    seed: u64,
+    model: &crate::meth::MethylationModel,
+    variants: &[crate::vcf::genotype::VariantRecord],
+    sample_ploidy: usize,
+    want_bedgraph: bool,
+) -> Result<ContigOutput> {
+    use crate::haplotype::build_haplotypes;
+    use crate::meth::ContigMethylation;
+    use crate::seed::derive_seed;
+    use crate::vcf::methylation::write_contig;
+
+    // Per-contig deterministic seed for reference normalization. Use the bare
+    // contig name (no prefix) to match `simulate`'s `derive_seed(main_seed,
+    // contig_name)` at simulate.rs line ~578, so both commands resolve IUPAC
+    // codes identically for the same `--seed` and reference.
+    let ref_seed = derive_seed(seed, contig_name);
+    let mut ref_rng = rand::rngs::SmallRng::seed_from_u64(ref_seed);
+    let reference = fasta.load_contig(contig_name, &mut ref_rng)?;
+
+    // Build haplotypes with their own deterministic sub-seed, sized by the
+    // whole-VCF `sample_ploidy` so variant-free contigs land the same number of
+    // haplotypes as variant-bearing ones.
+    let hap_seed = derive_seed(seed, &format!("haps@{contig_name}"));
+    let mut hap_rng = rand::rngs::SmallRng::seed_from_u64(hap_seed);
+    let haplotypes = build_haplotypes(variants, sample_ploidy, &mut hap_rng);
+
+    // Draw per-haplotype methylation with another deterministic sub-seed.
+    let meth_seed = derive_seed(seed, &format!("meth@{contig_name}"));
+    let mut meth_rng = rand::rngs::SmallRng::seed_from_u64(meth_seed);
+    let methylation =
+        ContigMethylation::from_haplotypes(&haplotypes, &reference, model, &mut meth_rng);
+
+    let mut vcf_buf = Vec::new();
+    write_contig(&mut vcf_buf, contig_name, &reference, variants, &methylation, sample_ploidy)?;
+
+    // Append per-contig bedGraph records, if requested. Pass `&haplotypes` so
+    // the writer can map every reference CpG through each haplotype's local
+    // coordinate system before reading the methylation bitmap; variant-shifted
+    // and variant-destroyed CpGs would otherwise be miscounted.
+    let bedgraph_buf = if want_bedgraph {
+        let mut buf = Vec::new();
+        crate::output::methylation_bedgraph::write_bedgraph_records(
+            &mut buf,
+            contig_name,
+            &reference,
+            &haplotypes,
+            &methylation,
+        )?;
+        Some(buf)
+    } else {
+        None
+    };
+
+    Ok((vcf_buf, bedgraph_buf))
 }
 
 /// Capture the current process's command-line arguments as a space-joined

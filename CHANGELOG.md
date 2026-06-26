@@ -35,6 +35,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   are written to `<prefix>.variants.tsv` and `<prefix>.meth.tsv` alongside the
   existing `<prefix>.eval.txt`.
 
+### Changed
+
+- `methylate` now methylates contigs in parallel. Each contig is independent —
+  its RNGs are seeded purely from `(seed, contig)` with no state carried between
+  contigs (the methylation Markov chain runs within a single contig) — so the
+  per-contig loop runs as a work-stealing parallel map and the output is
+  byte-identical to the previous single-threaded version regardless of thread
+  count. Single-item jobs spread the wildly-uneven per-contig cost (chr1 ≫ a
+  50 kb alt) evenly across the pool, and one reused FASTA handle per worker
+  avoids re-parsing the sequence dictionary per contig. On a whole human genome
+  this is roughly 5× faster on a 12-core host (~110 s → ~25 s including BGZF
+  output); the thread count honors `RAYON_NUM_THREADS`.
+
 ### Fixed
 
 - `simulate` and `methylate` now tolerate VCFs that redeclare a header ID
