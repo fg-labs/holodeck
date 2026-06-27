@@ -173,7 +173,12 @@ fn classify_cpgs_with_haplotypes(
             var_hap_ranges.push((vi, hap_start, hap_end));
         }
 
-        // Scan materialized haplotype for CpG dinucleotides.
+        // Scan materialized haplotype for CpG dinucleotides. `var_cursor` walks
+        // `var_hap_ranges` (sorted, disjoint) in lock-step with the ascending
+        // scan so `base_source` is O(1) amortized rather than O(variants) per
+        // CpG; it is reset per haplotype because `var_hap_ranges` is rebuilt
+        // above.
+        let mut var_cursor = 0usize;
         for h in 0..len - 1 {
             let c0 = hap_bases[h].to_ascii_uppercase();
             let c1 = hap_bases[h + 1].to_ascii_uppercase();
@@ -186,9 +191,10 @@ fn classify_cpgs_with_haplotypes(
             #[expect(clippy::cast_possible_truncation, reason = "haplotype length fits in u32")]
             let hpos = h as u32;
 
-            // Determine source of each base: variant or reference.
-            let src_h = base_source(hpos, &var_hap_ranges);
-            let src_h1 = base_source(hpos + 1, &var_hap_ranges);
+            // Determine source of each base: variant or reference. Query `hpos`
+            // before `hpos + 1` so the shared cursor sees non-decreasing inputs.
+            let src_h = base_source(hpos, &var_hap_ranges, &mut var_cursor);
+            let src_h1 = base_source(hpos + 1, &var_hap_ranges, &mut var_cursor);
 
             let placement = match (src_h, src_h1) {
                 // Both bases come from reference → standalone at the ref
@@ -303,15 +309,101 @@ enum BaseSource {
 }
 
 /// Determine whether haplotype coordinate `h` falls inside any variant's
-/// alt-allele span. Returns `BaseSource::Variant` for the first matching
-/// range, or `BaseSource::Reference` if no variant spans `h`.
-fn base_source(h: u32, var_hap_ranges: &[(usize, u32, u32)]) -> BaseSource {
-    for &(vi, hap_start, hap_end) in var_hap_ranges {
-        if h >= hap_start && h < hap_end {
-            return BaseSource::Variant { variant_index: vi, hap_start };
-        }
+/// alt-allele span, returning `BaseSource::Variant` for the spanning range or
+/// `BaseSource::Reference` if none spans `h`.
+///
+/// `var_hap_ranges` is sorted by `hap_start` and the ranges are disjoint (one
+/// haplotype never carries two overlapping alt spans — enforced upstream by
+/// [`check_overlaps_on_shared_haplotypes`]). `cursor` is a monotonic index into
+/// `var_hap_ranges` that the caller threads across a strictly **non-decreasing**
+/// sequence of `h` queries: it advances past every range ending at or before
+/// `h` and never rewinds. This turns what would be an O(ranges) scan per query
+/// into O(1) amortized across a full CpG scan, so the per-haplotype CpG
+/// classification is O(haplotype length + variants) instead of O(CpGs ×
+/// variants).
+///
+/// The caller must (a) reset `cursor` to `0` before each independent ascending
+/// scan and (b) only ever pass `h` values that do not decrease within that
+/// scan. Querying `h` then `h + 1` within one loop iteration, with `h`
+/// incrementing by one across iterations, satisfies this.
+fn base_source(h: u32, var_hap_ranges: &[(usize, u32, u32)], cursor: &mut usize) -> BaseSource {
+    // Skip ranges that end at or before `h`; they can never contain `h` and,
+    // because queries are non-decreasing, can never contain any later query
+    // either, so dropping them permanently is safe.
+    while *cursor < var_hap_ranges.len() && var_hap_ranges[*cursor].2 <= h {
+        *cursor += 1;
+    }
+    if let Some(&(vi, hap_start, hap_end)) = var_hap_ranges.get(*cursor)
+        && h >= hap_start
+        && h < hap_end
+    {
+        return BaseSource::Variant { variant_index: vi, hap_start };
     }
     BaseSource::Reference
+}
+
+#[cfg(test)]
+mod base_source_cursor_tests {
+    //! The monotonic-cursor [`base_source`] must return exactly what a naive
+    //! linear scan would for the same query, under the real caller access
+    //! pattern (query `h` then `h + 1` per CpG, `h` ascending by one). This
+    //! pins the O(CpGs + variants) fast path to the O(CpGs × variants)
+    //! reference semantics it replaced.
+
+    use super::{BaseSource, base_source};
+    use rand::rngs::SmallRng;
+    use rand::{Rng as _, SeedableRng as _};
+
+    /// Naive reference implementation: the first (only, since disjoint) range
+    /// spanning `h`, as `(variant_index, hap_start)`.
+    fn naive(h: u32, ranges: &[(usize, u32, u32)]) -> Option<(usize, u32)> {
+        ranges.iter().find(|&&(_, s, e)| h >= s && h < e).map(|&(vi, s, _)| (vi, s))
+    }
+
+    fn to_pair(src: BaseSource) -> Option<(usize, u32)> {
+        match src {
+            BaseSource::Variant { variant_index, hap_start } => Some((variant_index, hap_start)),
+            BaseSource::Reference => None,
+        }
+    }
+
+    #[test]
+    fn cursor_matches_linear_scan_under_real_access_pattern() {
+        let mut rng = SmallRng::seed_from_u64(0xC0FF_EE99);
+        for _ in 0..500 {
+            // Build random disjoint, ascending ranges shaped like the
+            // per-haplotype alt spans `var_hap_ranges` holds: gaps of reference
+            // between spans, each span at least one base wide.
+            let n = rng.random_range(0..12usize);
+            let mut ranges: Vec<(usize, u32, u32)> = Vec::new();
+            let mut pos = 0u32;
+            for vi in 0..n {
+                let start = pos + rng.random_range(0..5u32);
+                let end = start + rng.random_range(1..6u32);
+                ranges.push((vi, start, end));
+                pos = end;
+            }
+            let max_h = pos + 6;
+
+            // One cursor threaded across the whole ascending scan, querying
+            // `h` then `h + 1` per step exactly as `classify_cpgs_with_haplotypes`
+            // does.
+            let mut cursor = 0usize;
+            for h in 0..max_h {
+                assert_eq!(
+                    to_pair(base_source(h, &ranges, &mut cursor)),
+                    naive(h, &ranges),
+                    "query h={h} ranges={ranges:?}",
+                );
+                assert_eq!(
+                    to_pair(base_source(h + 1, &ranges, &mut cursor)),
+                    naive(h + 1, &ranges),
+                    "query h+1={} ranges={ranges:?}",
+                    h + 1,
+                );
+            }
+        }
+    }
 }
 
 /// Compute a sort key for a [`CpgPlacement`] so that placements are ordered
@@ -691,7 +783,10 @@ fn per_variant_per_hap_cpg_offsets_with_haplotypes(
         }
 
         // Scan for CpG dinucleotides and assign them to the owning variant
-        // using the same upstream-wins rule as classify_cpgs.
+        // using the same upstream-wins rule as classify_cpgs. `var_cursor`
+        // advances with the ascending scan to keep `base_source` O(1) amortized;
+        // reset per haplotype alongside the rebuilt `var_hap_ranges`.
+        let mut var_cursor = 0usize;
         for h in 0..len - 1 {
             let c0 = hap_bases[h].to_ascii_uppercase();
             let c1 = hap_bases[h + 1].to_ascii_uppercase();
@@ -702,8 +797,10 @@ fn per_variant_per_hap_cpg_offsets_with_haplotypes(
             #[expect(clippy::cast_possible_truncation, reason = "haplotype length fits in u32")]
             let hpos = h as u32;
 
-            let src_h = base_source(hpos, &var_hap_ranges);
-            let src_h1 = base_source(hpos + 1, &var_hap_ranges);
+            // Query `hpos` before `hpos + 1` so the shared cursor advances over
+            // non-decreasing inputs.
+            let src_h = base_source(hpos, &var_hap_ranges, &mut var_cursor);
+            let src_h1 = base_source(hpos + 1, &var_hap_ranges, &mut var_cursor);
 
             // Determine the owning variant index using the same upstream-wins
             // rule as classify_cpgs. None means both bases are from reference
