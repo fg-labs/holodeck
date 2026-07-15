@@ -35,8 +35,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   are written to `<prefix>.variants.tsv` and `<prefix>.meth.tsv` alongside the
   existing `<prefix>.eval.txt`.
 
+### Changed
+
+- `methylate` now methylates contigs in parallel. Each contig is independent —
+  its RNGs are seeded purely from `(seed, contig)` with no state carried between
+  contigs (the methylation Markov chain runs within a single contig) — so the
+  per-contig loop runs as a work-stealing parallel map and the output is
+  byte-identical to the previous single-threaded version regardless of thread
+  count. Single-item jobs spread the wildly-uneven per-contig cost (chr1 ≫ a
+  50 kb alt) evenly across the pool, and one reused FASTA handle per worker
+  avoids re-parsing the sequence dictionary per contig. On a whole human genome
+  this is roughly 5× faster on a 12-core host (~110 s → ~25 s including BGZF
+  output); the thread count honors `RAYON_NUM_THREADS`.
+
 ### Fixed
 
+- `methylate --vcf` (allele-specific methylation) no longer slows down
+  quadratically with variant density. The per-haplotype CpG classifier looked
+  up each CpG's variant/reference source with a linear scan over every variant
+  on the contig, making it O(CpGs × variants) per haplotype — on a whole human
+  genome with a few-million-variant VCF this was ~100× the work of the
+  reference-only path (≈43 min vs ≈25 s). Because the alt spans are sorted and
+  disjoint and the CpG scan is ascending, a single monotonic cursor now resolves
+  each lookup in O(1) amortized, making classification O(haplotype length +
+  variants); output is byte-identical. The reference-only path was already fast
+  and is unchanged.
 - `simulate` and `methylate` now tolerate VCFs that redeclare a header ID
   (e.g. `duplicate INFO ID: BREAKSIMLENGTH`). Such duplicates are common in
   files from upstream tools and are accepted by bcftools; holodeck drops the
