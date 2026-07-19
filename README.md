@@ -3,6 +3,7 @@
 [![Documentation at docs.rs](https://img.shields.io/docsrs/holodeck)](https://docs.rs/holodeck)
 [![Bioconda](https://img.shields.io/conda/vn/bioconda/holodeck.svg?label=bioconda)](https://bioconda.github.io/recipes/holodeck/README.html)
 [![License](http://img.shields.io/badge/license-MIT-blue.svg)](https://github.com/fg-labs/holodeck/blob/main/LICENSE)
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.21445789.svg)](https://doi.org/10.5281/zenodo.21445789)
 
 # Holodeck
 
