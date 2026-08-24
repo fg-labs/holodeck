@@ -440,11 +440,16 @@ holodeck mutate -r ref.fa -o mutations.vcf -b targets.bed
 
 ## Eval
 
-Evaluate alignment accuracy by comparing mapped positions against truth positions encoded in read names.  Reports accuracy stratified by MAPQ bin.
+Evaluate alignment accuracy against holodeck's own truth. Placement accuracy (mapped vs true position, stratified by MAPQ bin) is always reported in `<prefix>.eval.txt`. Two further metrics are opt-in: variant representation needs the truth VCF and golden BAM (`--variants` + `--truth`), and methylation correlation needs the per-CpG truth bedGraph (`--cpg-truth`). Each writes its own TSV.
 
 ```bash
+# Placement only (truth from encoded read names).
 holodeck eval --mapped aligned.bam -o eval_results
-holodeck eval --mapped aligned.bam -o eval_results --wiggle 10
+
+# Placement from the golden BAM, plus variant-representation and methylation
+# correlation. Use --meth to break variants down by bisulfite substitution class.
+holodeck eval --mapped aligned.bam --truth golden.bam \
+    --variants truth.vcf --cpg-truth truth.bedGraph --meth -o eval_results
 ```
 
 **Key options:**
@@ -452,8 +457,21 @@ holodeck eval --mapped aligned.bam -o eval_results --wiggle 10
 | Option | Default | Description |
 |--------|---------|-------------|
 | `-m, --mapped` | required | BAM file of mapped reads |
-| `-o, --output` | required | Output prefix (writes `.eval.txt`) |
+| `-o, --output` | required | Output prefix |
+| `--truth` | — | Golden BAM (`simulate --golden-bam`) supplying each read's true span, sequence, and (for `--meth`) bisulfite conversion strand. Becomes the placement-truth source and is required by `--variants`. NM/MD concordance is recomputed from the reference when `--reference` is supplied, not read from golden tags. |
+| `--variants` | — | Truth VCF (`mutate`/`methylate`); scores how faithfully aligned reads represent the simulated substitutions. Writes `.variants.tsv`. |
+| `--cpg-truth` | — | Per-CpG truth bedGraph (`simulate --cpg-truth-bedgraph`); correlates the aligner's `XM` methylation calls against truth. Writes `.meth.tsv`. |
+| `--meth` | off | Break `--variants` results down by bisulfite substitution class (conversion, mirror, transversion, other). The conversion class is flagged confounded. |
+| `--sample` | first | Sample whose genotypes to resolve in the truth VCF |
 | `--wiggle` | 5 | Max distance (bp) for a correct mapping |
+
+**Output files:**
+
+| File | Produced when | Columns |
+|------|---------------|---------|
+| `<prefix>.eval.txt` | always | placement accuracy per MAPQ bin |
+| `<prefix>.variants.tsv` | `--variants` | one row per substitution class (a single `all` row unless `--meth` splits it into conversion/mirror/transversion/other): `n_expected`, `n_represented`, `represented_pct`, `mean_mapq`, `mean_as`; footer with per-read MD/NM concordance |
+| `<prefix>.meth.tsv` | `--cpg-truth` | `n_cpg`, `pearson_r`, `rmse` of aligner vs truth methylation level |
 
 ## Features
 
