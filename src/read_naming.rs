@@ -144,9 +144,10 @@ pub enum ReadNaming<'a> {
 ///
 /// Generated deterministically from the simulation seed so that different
 /// seeds produce different instrument/run/flowcell identities. Tile and
-/// spatial coordinates are also derived from this seed so that independent
-/// simulation runs produce distinct physical locations for the same read
-/// number.
+/// spatial coordinates are assigned via a bijective linear map so that
+/// each read number maps to a unique tile/X/Y triple, matching real
+/// Illumina behavior where each cluster occupies a distinct physical
+/// location.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IlluminaHeader {
     /// Instrument ID (e.g. `A00588`, `VH00123`).
@@ -157,9 +158,11 @@ pub struct IlluminaHeader {
     flowcell: String,
     /// Lane number (1–4).
     lane: u8,
-    /// Seed mixed into per-read coordinate derivation so that different
-    /// simulation runs produce different tile/X/Y for the same read number.
-    coord_seed: u64,
+    /// Multiplier for the bijective coordinate map, coprime with
+    /// [`COORD_SPACE_SIZE`].
+    coord_multiplier: u64,
+    /// Offset for the bijective coordinate map.
+    coord_offset: u64,
 }
 
 impl IlluminaHeader {
@@ -167,7 +170,9 @@ impl IlluminaHeader {
     ///
     /// The instrument ID, run number, flowcell barcode, and lane are all
     /// derived deterministically from the seed. The tile layout and
-    /// coordinate ranges model a NovaSeq-style flowcell.
+    /// coordinate ranges model a NovaSeq-style flowcell. Coordinate
+    /// assignment uses a bijective linear map so every read number below
+    /// [`COORD_SPACE_SIZE`] maps to a unique tile/X/Y triple.
     #[must_use]
     pub fn from_seed(seed: u64) -> Self {
         let mut rng = SmallRng::seed_from_u64(derive_seed(seed, "illumina-header"));
@@ -180,17 +185,17 @@ impl IlluminaHeader {
         let run: u16 = rng.random_range(1..=999);
         let flowcell = generate_flowcell_id(&mut rng);
         let lane: u8 = rng.random_range(1..=4);
-        let coord_seed = derive_seed(seed, "illumina-coords");
+        let coord_multiplier = derive_coprime_multiplier(seed);
+        let coord_offset = derive_seed(seed, "illumina-offset") % COORD_SPACE_SIZE;
 
-        Self { instrument, run, flowcell, lane, coord_seed }
+        Self { instrument, run, flowcell, lane, coord_multiplier, coord_offset }
     }
 
     /// Format a read name in Illumina style.
     ///
-    /// The tile, X, and Y coordinates are derived deterministically from
-    /// the read number and the simulation seed so that names are
-    /// reproducible, spatially spread across the tile layout, and unique
-    /// across independent simulation runs.
+    /// Each read number maps to a unique tile/X/Y coordinate within the
+    /// flowcell, reproducing the one-cluster-per-location property of real
+    /// Illumina data.
     #[must_use]
     pub fn format_name(&self, read_num: u64) -> String {
         let (tile, x, y) = self.tile_coords(read_num);
@@ -200,15 +205,22 @@ impl IlluminaHeader {
         )
     }
 
-    /// Derive deterministic tile + X/Y coordinates from a read number,
-    /// mixing in the simulation seed so independent runs diverge.
+    /// Map a read number to a unique tile/X/Y triple via a bijective
+    /// linear congruential map: `index = (a * read_num + b) mod n` where
+    /// `a` is coprime with `n`.
     fn tile_coords(&self, read_num: u64) -> (u16, u32, u32) {
-        let mut rng = SmallRng::seed_from_u64(derive_seed(self.coord_seed, &read_num.to_string()));
-        let tile_idx = rng.random_range(0..NUM_TILES);
-        let tile = tile_id_from_index(tile_idx);
-        let x = rng.random_range(0..=MAX_X);
-        let y = rng.random_range(0..=MAX_Y);
-        (tile, x, y)
+        let index = self.coord_multiplier.wrapping_mul(read_num).wrapping_add(self.coord_offset)
+            % COORD_SPACE_SIZE;
+
+        let xy_size = (u64::from(MAX_X) + 1) * (u64::from(MAX_Y) + 1);
+        #[expect(clippy::cast_possible_truncation, reason = "index / xy_size < NUM_TILES fits u16")]
+        let tile_idx = (index / xy_size) as u16;
+        let rem = index % xy_size;
+        #[expect(clippy::cast_possible_truncation, reason = "rem / (MAX_Y+1) ≤ MAX_X fits u32")]
+        let x = (rem / (u64::from(MAX_Y) + 1)) as u32;
+        #[expect(clippy::cast_possible_truncation, reason = "rem % (MAX_Y+1) ≤ MAX_Y fits u32")]
+        let y = (rem % (u64::from(MAX_Y) + 1)) as u32;
+        (tile_id_from_index(tile_idx), x, y)
     }
 }
 
@@ -224,6 +236,41 @@ const MAX_X: u32 = 45000;
 
 /// Maximum Y coordinate on a tile (NovaSeq-scale).
 const MAX_Y: u32 = 65000;
+
+/// Total number of distinct tile/X/Y coordinate triples. As long as the
+/// number of simulated reads stays below this (~912 billion), every read
+/// is guaranteed a unique position.
+const COORD_SPACE_SIZE: u64 =
+    NUM_TILES as u64 * (MAX_X as u64 + 1) * (MAX_Y as u64 + 1);
+
+/// Derive a multiplier coprime with [`COORD_SPACE_SIZE`] from a seed.
+///
+/// The linear map `(multiplier * x + offset) mod n` is bijective iff
+/// `gcd(multiplier, n) == 1`. We derive a candidate from the seed and
+/// nudge it until the coprimality condition holds (typically 1–3 steps).
+fn derive_coprime_multiplier(seed: u64) -> u64 {
+    let mut m = derive_seed(seed, "illumina-multiplier") % COORD_SPACE_SIZE;
+    if m == 0 {
+        m = 1;
+    }
+    while gcd(m, COORD_SPACE_SIZE) != 1 {
+        m += 1;
+        if m >= COORD_SPACE_SIZE {
+            m = 1;
+        }
+    }
+    m
+}
+
+/// Euclidean greatest common divisor.
+fn gcd(mut a: u64, mut b: u64) -> u64 {
+    while b != 0 {
+        let t = b;
+        b = a % b;
+        a = t;
+    }
+    a
+}
 
 /// Generate a 9-character alphanumeric flowcell barcode.
 fn generate_flowcell_id(rng: &mut impl Rng) -> String {
@@ -544,11 +591,13 @@ mod tests {
     }
 
     #[test]
-    fn illumina_name_varies_across_reads() {
+    fn illumina_names_unique_across_reads() {
         let header = IlluminaHeader::from_seed(42);
-        let a = header.format_name(1);
-        let b = header.format_name(2);
-        assert_ne!(a, b, "different read numbers should produce different tile/x/y");
+        let mut seen = std::collections::HashSet::new();
+        for read_num in 0..10_000 {
+            let name = header.format_name(read_num);
+            assert!(seen.insert(name), "duplicate name at read_num={read_num}");
+        }
     }
 
     #[test]
@@ -579,6 +628,15 @@ mod tests {
             suffix(&n2),
             "same read_num with different seeds must produce different tile/x/y"
         );
+    }
+
+    #[test]
+    fn derive_coprime_multiplier_is_coprime() {
+        for seed in [0, 1, 42, 999, u64::MAX] {
+            let m = derive_coprime_multiplier(seed);
+            assert_eq!(gcd(m, COORD_SPACE_SIZE), 1, "multiplier from seed={seed} not coprime");
+            assert!(m > 0 && m < COORD_SPACE_SIZE);
+        }
     }
 
     #[test]
