@@ -1,14 +1,24 @@
 //! Read naming schemes for simulated reads.
 //!
-//! Supports two modes: **encoded** names that embed truth coordinates
-//! (contig, position, strand, haplotype, fragment length, error count) for
-//! downstream evaluation, and **simple** names that are just sequential
-//! identifiers.
+//! Supports three modes:
 //!
-//! Fields are separated by `::` (double colon). Contig names may legally
-//! contain single `:` characters (e.g. HLA contigs like `HLA-A*01:01:01:01`);
-//! using `::` as the separator keeps parsing unambiguous without requiring
-//! right-to-left tricks.
+//! - **Encoded** names embed truth coordinates (contig, position, strand,
+//!   haplotype, fragment length, error count) for downstream evaluation.
+//! - **Simple** names are just sequential identifiers (`holodeck::N`).
+//! - **Illumina** names mimic a real Illumina read name
+//!   (`instrument:run:flowcell:lane:tile:x:y`) so that tools which key on
+//!   these fields (e.g. optical duplicate detection) work correctly on
+//!   simulated data.
+//!
+//! Encoded and simple names use `::` (double colon) as the field separator.
+//! Contig names may legally contain single `:` characters (e.g. HLA contigs
+//! like `HLA-A*01:01:01:01`); using `::` keeps parsing unambiguous without
+//! requiring right-to-left tricks.
+
+use rand::rngs::SmallRng;
+use rand::{Rng, SeedableRng};
+
+use crate::seed::derive_seed;
 
 /// Truth alignment data for a single read, used to encode position
 /// information into the read name.
@@ -98,6 +108,189 @@ pub fn encoded_se_name(read_num: u64, r1: &TruthAlignment) -> String {
 #[must_use]
 pub fn simple_name(read_num: u64) -> String {
     format!("{PREFIX}{SEP}{read_num}")
+}
+
+/// CLI-facing read-name format selector.
+///
+/// Used as a `clap::ValueEnum` for the `--read-names` argument. The
+/// simulation code converts this into a [`ReadNaming`] value that bundles
+/// any required state (e.g. an [`IlluminaHeader`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum ReadNameFormat {
+    /// Truth coordinates packed into the name for downstream evaluation.
+    Encoded,
+    /// Sequential identifier only (`holodeck::N`).
+    Simple,
+    /// Realistic Illumina-style name (`instrument:run:flowcell:lane:tile:x:y`).
+    Illumina,
+}
+
+/// Read-naming strategy passed to the read-generation pipeline.
+///
+/// Unlike [`ReadNameFormat`] (the CLI enum), this carries any state the
+/// chosen format requires, making invalid combinations unrepresentable
+/// (e.g. `Illumina` without an [`IlluminaHeader`]).
+#[derive(Debug, Clone)]
+pub enum ReadNaming<'a> {
+    /// Truth coordinates packed into the name for downstream evaluation.
+    Encoded,
+    /// Sequential identifier only (`holodeck::N`).
+    Simple,
+    /// Realistic Illumina-style name with a shared per-run header.
+    Illumina(&'a IlluminaHeader),
+}
+
+/// Per-run Illumina header fields shared by every read in a simulation.
+///
+/// Generated deterministically from the simulation seed so that different
+/// seeds produce different instrument/run/flowcell identities. Tile and
+/// spatial coordinates are assigned via a bijective linear map so that
+/// each read number maps to a unique tile/X/Y triple, matching real
+/// Illumina behavior where each cluster occupies a distinct physical
+/// location.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IlluminaHeader {
+    /// Instrument ID (e.g. `A00588`, `VH00123`).
+    instrument: String,
+    /// Sequencing run number.
+    run: u16,
+    /// Flowcell barcode (9-character alphanumeric).
+    flowcell: String,
+    /// Lane number (1–4).
+    lane: u8,
+    /// Multiplier for the bijective coordinate map, coprime with
+    /// [`COORD_SPACE_SIZE`].
+    coord_multiplier: u64,
+    /// Offset for the bijective coordinate map.
+    coord_offset: u64,
+}
+
+impl IlluminaHeader {
+    /// Generate realistic Illumina header fields from a simulation seed.
+    ///
+    /// The instrument ID, run number, flowcell barcode, and lane are all
+    /// derived deterministically from the seed. The tile layout and
+    /// coordinate ranges model a NovaSeq-style flowcell. Coordinate
+    /// assignment uses a bijective linear map so every read number below
+    /// [`COORD_SPACE_SIZE`] maps to a unique tile/X/Y triple.
+    #[must_use]
+    pub fn from_seed(seed: u64) -> Self {
+        let mut rng = SmallRng::seed_from_u64(derive_seed(seed, "illumina-header"));
+
+        let instrument = format!(
+            "{}{:05}",
+            INSTRUMENT_PREFIXES[rng.random_range(0..INSTRUMENT_PREFIXES.len())],
+            rng.random_range(1..=99999u32)
+        );
+        let run: u16 = rng.random_range(1..=999);
+        let flowcell = generate_flowcell_id(&mut rng);
+        let lane: u8 = rng.random_range(1..=4);
+        let coord_multiplier = derive_coprime_multiplier(seed);
+        let coord_offset = derive_seed(seed, "illumina-offset") % COORD_SPACE_SIZE;
+
+        Self { instrument, run, flowcell, lane, coord_multiplier, coord_offset }
+    }
+
+    /// Format a read name in Illumina style.
+    ///
+    /// Each read number maps to a unique tile/X/Y coordinate within the
+    /// flowcell, reproducing the one-cluster-per-location property of real
+    /// Illumina data.
+    #[must_use]
+    pub fn format_name(&self, read_num: u64) -> String {
+        let (tile, x, y) = self.tile_coords(read_num);
+        format!(
+            "{}:{}:{}:{}:{}:{}:{}",
+            self.instrument, self.run, self.flowcell, self.lane, tile, x, y,
+        )
+    }
+
+    /// Map a read number to a unique tile/X/Y triple via a bijective
+    /// linear congruential map: `index = (a * read_num + b) mod n` where
+    /// `a` is coprime with `n`.
+    fn tile_coords(&self, read_num: u64) -> (u16, u32, u32) {
+        let index = self.coord_multiplier.wrapping_mul(read_num).wrapping_add(self.coord_offset)
+            % COORD_SPACE_SIZE;
+
+        let xy_size = (u64::from(MAX_X) + 1) * (u64::from(MAX_Y) + 1);
+        #[expect(clippy::cast_possible_truncation, reason = "index / xy_size < NUM_TILES fits u16")]
+        let tile_idx = (index / xy_size) as u16;
+        let rem = index % xy_size;
+        #[expect(clippy::cast_possible_truncation, reason = "rem / (MAX_Y+1) ≤ MAX_X fits u32")]
+        let x = (rem / (u64::from(MAX_Y) + 1)) as u32;
+        #[expect(clippy::cast_possible_truncation, reason = "rem % (MAX_Y+1) ≤ MAX_Y fits u32")]
+        let y = (rem % (u64::from(MAX_Y) + 1)) as u32;
+        (tile_id_from_index(tile_idx), x, y)
+    }
+}
+
+/// Instrument ID prefixes observed on common Illumina platforms.
+const INSTRUMENT_PREFIXES: &[&str] = &["A", "SL", "VH", "LH", "M", "NB"];
+
+/// Number of tiles to spread reads across (models a 2-surface,
+/// 2-swath, 78-row layout like a NovaSeq S4 lane).
+const NUM_TILES: u16 = 2 * 2 * 78; // 312 tiles
+
+/// Maximum X coordinate on a tile (NovaSeq-scale).
+const MAX_X: u32 = 45000;
+
+/// Maximum Y coordinate on a tile (NovaSeq-scale).
+const MAX_Y: u32 = 65000;
+
+/// Total number of distinct tile/X/Y coordinate triples. As long as the
+/// number of simulated reads stays below this (~912 billion), every read
+/// is guaranteed a unique position.
+const COORD_SPACE_SIZE: u64 =
+    NUM_TILES as u64 * (MAX_X as u64 + 1) * (MAX_Y as u64 + 1);
+
+/// Derive a multiplier coprime with [`COORD_SPACE_SIZE`] from a seed.
+///
+/// The linear map `(multiplier * x + offset) mod n` is bijective iff
+/// `gcd(multiplier, n) == 1`. We derive a candidate from the seed and
+/// nudge it until the coprimality condition holds (typically 1–3 steps).
+fn derive_coprime_multiplier(seed: u64) -> u64 {
+    let mut m = derive_seed(seed, "illumina-multiplier") % COORD_SPACE_SIZE;
+    if m == 0 {
+        m = 1;
+    }
+    while gcd(m, COORD_SPACE_SIZE) != 1 {
+        m += 1;
+        if m >= COORD_SPACE_SIZE {
+            m = 1;
+        }
+    }
+    m
+}
+
+/// Euclidean greatest common divisor.
+fn gcd(mut a: u64, mut b: u64) -> u64 {
+    while b != 0 {
+        let t = b;
+        b = a % b;
+        a = t;
+    }
+    a
+}
+
+/// Generate a 9-character alphanumeric flowcell barcode.
+fn generate_flowcell_id(rng: &mut impl Rng) -> String {
+    const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+    (0..9).map(|_| CHARS[rng.random_range(0..CHARS.len())] as char).collect()
+}
+
+/// Convert a 0-based tile index to a standard Illumina tile ID.
+///
+/// Tile IDs are formatted as `SRCC` where S=surface (1–2), R=swath
+/// (1–2), CC=column (01–78). The index is laid out as
+/// `surface * (swaths * columns) + swath * columns + column`.
+fn tile_id_from_index(idx: u16) -> u16 {
+    let columns: u16 = 78;
+    let swaths: u16 = 2;
+    let surface = idx / (swaths * columns);
+    let rem = idx % (swaths * columns);
+    let swath = rem / columns;
+    let column = rem % columns;
+    (surface + 1) * 1000 + (swath + 1) * 100 + (column + 1)
 }
 
 /// Panic in debug builds if `contig` contains characters that would corrupt
@@ -362,5 +555,139 @@ mod tests {
         let r1 = make_truth("bad::contig", 1, true, 0, 100, 0);
         let r2 = make_truth("bad::contig", 20, false, 0, 100, 0);
         let _ = encoded_pe_name(1, &r1, &r2);
+    }
+
+    // --- Illumina read name tests ---
+
+    #[test]
+    fn illumina_header_is_deterministic() {
+        let h1 = IlluminaHeader::from_seed(42);
+        let h2 = IlluminaHeader::from_seed(42);
+        assert_eq!(h1, h2);
+    }
+
+    #[test]
+    fn illumina_header_varies_with_seed() {
+        let h1 = IlluminaHeader::from_seed(1);
+        let h2 = IlluminaHeader::from_seed(2);
+        assert_ne!(h1.instrument, h2.instrument);
+        assert_ne!(h1.flowcell, h2.flowcell);
+    }
+
+    #[test]
+    fn illumina_name_has_seven_colon_separated_fields() {
+        let header = IlluminaHeader::from_seed(42);
+        let name = header.format_name(1);
+        let fields: Vec<&str> = name.split(':').collect();
+        assert_eq!(fields.len(), 7, "expected 7 fields in Illumina name, got: {name}");
+    }
+
+    #[test]
+    fn illumina_name_is_deterministic_per_read() {
+        let header = IlluminaHeader::from_seed(42);
+        let a = header.format_name(100);
+        let b = header.format_name(100);
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn illumina_names_unique_across_reads() {
+        let header = IlluminaHeader::from_seed(42);
+        let mut seen = std::collections::HashSet::new();
+        for read_num in 0..10_000 {
+            let name = header.format_name(read_num);
+            assert!(seen.insert(name), "duplicate name at read_num={read_num}");
+        }
+    }
+
+    #[test]
+    fn illumina_header_prefix_constant_across_reads() {
+        let header = IlluminaHeader::from_seed(42);
+        let prefix =
+            |name: &str| -> String { name.split(':').take(4).collect::<Vec<_>>().join(":") };
+        let base = prefix(&header.format_name(1));
+        for read_num in 2..=50 {
+            assert_eq!(
+                prefix(&header.format_name(read_num)),
+                base,
+                "instrument:run:flowcell:lane must be constant across reads"
+            );
+        }
+    }
+
+    #[test]
+    fn illumina_coords_differ_across_seeds() {
+        let h1 = IlluminaHeader::from_seed(1);
+        let h2 = IlluminaHeader::from_seed(2);
+        let n1 = h1.format_name(42);
+        let n2 = h2.format_name(42);
+        let suffix =
+            |name: &str| -> String { name.split(':').skip(4).collect::<Vec<_>>().join(":") };
+        assert_ne!(
+            suffix(&n1),
+            suffix(&n2),
+            "same read_num with different seeds must produce different tile/x/y"
+        );
+    }
+
+    #[test]
+    fn derive_coprime_multiplier_is_coprime() {
+        for seed in [0, 1, 42, 999, u64::MAX] {
+            let m = derive_coprime_multiplier(seed);
+            assert_eq!(gcd(m, COORD_SPACE_SIZE), 1, "multiplier from seed={seed} not coprime");
+            assert!(m > 0 && m < COORD_SPACE_SIZE);
+        }
+    }
+
+    #[test]
+    fn illumina_tile_id_format_is_valid() {
+        let header = IlluminaHeader::from_seed(42);
+        let name = header.format_name(1);
+        let fields: Vec<&str> = name.split(':').collect();
+        let tile: u16 = fields[4].parse().expect("tile should be numeric");
+        let surface = tile / 1000;
+        let swath = (tile % 1000) / 100;
+        let column = tile % 100;
+        assert!((1..=2).contains(&surface), "surface {surface} out of range");
+        assert!((1..=2).contains(&swath), "swath {swath} out of range");
+        assert!((1..=78).contains(&column), "column {column} out of range");
+    }
+
+    #[test]
+    fn illumina_xy_within_bounds() {
+        let header = IlluminaHeader::from_seed(42);
+        for read_num in 1..=100 {
+            let name = header.format_name(read_num);
+            let fields: Vec<&str> = name.split(':').collect();
+            let x: u32 = fields[5].parse().unwrap();
+            let y: u32 = fields[6].parse().unwrap();
+            assert!(x <= MAX_X, "x={x} exceeds MAX_X={MAX_X}");
+            assert!(y <= MAX_Y, "y={y} exceeds MAX_Y={MAX_Y}");
+        }
+    }
+
+    #[test]
+    fn illumina_lane_in_range() {
+        let header = IlluminaHeader::from_seed(42);
+        let name = header.format_name(1);
+        let fields: Vec<&str> = name.split(':').collect();
+        let lane: u8 = fields[3].parse().unwrap();
+        assert!((1..=4).contains(&lane), "lane {lane} out of range");
+    }
+
+    #[test]
+    fn tile_id_from_index_first_and_last() {
+        assert_eq!(tile_id_from_index(0), 1101, "first tile: surface 1, swath 1, column 01");
+        assert_eq!(
+            tile_id_from_index(NUM_TILES - 1),
+            2278,
+            "last tile: surface 2, swath 2, column 78"
+        );
+    }
+
+    #[test]
+    fn tile_id_from_index_surface_boundary() {
+        // Index 156 = first tile on surface 2 (2 swaths * 78 columns = 156 per surface).
+        assert_eq!(tile_id_from_index(156), 2101);
     }
 }
