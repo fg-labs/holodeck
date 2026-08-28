@@ -16,7 +16,9 @@ use crate::fragment::{
 use crate::meth::{
     ConversionType, MethylationAnnotation, MethylationConfig, apply_methylation_conversion,
 };
-use crate::read_naming::{TruthAlignment, encoded_pe_name, encoded_se_name, simple_name};
+use crate::read_naming::{
+    ReadNaming, TruthAlignment, encoded_pe_name, encoded_se_name, simple_name,
+};
 
 /// A single simulated read with bases, quality scores, and metadata.
 #[derive(Debug, Clone)]
@@ -205,7 +207,8 @@ fn build_mate(
 /// * `max_n_frac` — Reject the pair if R1 or R2 has a lowercase fraction
 ///   exceeding this threshold. Use `1.0` to disable.
 /// * `error_model` — Error model to apply.
-/// * `simple_names` — Use simple names instead of encoded truth names.
+/// * `naming` — Read-naming strategy (encoded truth, simple sequential,
+///   or Illumina-style with a shared header).
 /// * `methylation` — Optional methylation chemistry configuration. When
 ///   `Some`, the qualifying class of cytosines (unmethylated under em-seq,
 ///   methylated under TAPS) in the genomic portion of each read is
@@ -215,7 +218,8 @@ fn build_mate(
 ///   capture the pre-conversion bases of each mate for the `YS:Z` golden-BAM
 ///   tag. Has no effect when `methylation` is `None`.
 /// * `rng` — Random number generator.
-#[allow(clippy::too_many_arguments)] // Orchestrator for the read-pair pipeline
+///
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)] // Orchestrator for the read-pair pipeline
 pub fn generate_read_pair(
     fragment: &Fragment,
     contig_name: &str,
@@ -226,7 +230,7 @@ pub fn generate_read_pair(
     adapter_r2: &[u8],
     max_n_frac: f64,
     model: &impl ErrorModel,
-    simple_names: bool,
+    naming: &ReadNaming,
     methylation: Option<&MethylationConfig>,
     capture_pre_conversion: bool,
     rng: &mut impl Rng,
@@ -301,8 +305,11 @@ pub fn generate_read_pair(
     );
 
     if !paired {
-        let name =
-            if simple_names { simple_name(read_num) } else { encoded_se_name(read_num, &r1.truth) };
+        let name = match naming {
+            ReadNaming::Encoded => encoded_se_name(read_num, &r1.truth),
+            ReadNaming::Simple => simple_name(read_num),
+            ReadNaming::Illumina(header) => header.format_name(read_num),
+        };
 
         let methylation_annotation = methylation.map(|_| MethylationAnnotation {
             conversion_type: ConversionType::from_strand(fragment.is_forward),
@@ -339,10 +346,10 @@ pub fn generate_read_pair(
         rng,
     );
 
-    let name = if simple_names {
-        simple_name(read_num)
-    } else {
-        encoded_pe_name(read_num, &r1.truth, &r2.truth)
+    let name = match naming {
+        ReadNaming::Encoded => encoded_pe_name(read_num, &r1.truth, &r2.truth),
+        ReadNaming::Simple => simple_name(read_num),
+        ReadNaming::Illumina(header) => header.format_name(read_num),
     };
 
     let methylation_annotation = methylation.map(|_| MethylationAnnotation {
@@ -578,8 +585,19 @@ mod tests {
         let mut rng = SmallRng::seed_from_u64(42);
 
         let pair = generate_read_pair(
-            &fragment, "chr1", 1, 10, true, b"ADAPTER", b"ADAPTER", 1.0, &model, false, None,
-            false, &mut rng,
+            &fragment,
+            "chr1",
+            1,
+            10,
+            true,
+            b"ADAPTER",
+            b"ADAPTER",
+            1.0,
+            &model,
+            &ReadNaming::Encoded,
+            None,
+            false,
+            &mut rng,
         )
         .expect("no ambiguous bases — should not reject");
 
@@ -598,8 +616,19 @@ mod tests {
         let mut rng = SmallRng::seed_from_u64(42);
 
         let pair = generate_read_pair(
-            &fragment, "chr1", 5, 10, false, b"ADAPTER", b"ADAPTER", 1.0, &model, false, None,
-            false, &mut rng,
+            &fragment,
+            "chr1",
+            5,
+            10,
+            false,
+            b"ADAPTER",
+            b"ADAPTER",
+            1.0,
+            &model,
+            &ReadNaming::Encoded,
+            None,
+            false,
+            &mut rng,
         )
         .unwrap();
 
@@ -617,7 +646,18 @@ mod tests {
         let mut rng = SmallRng::seed_from_u64(42);
 
         let pair = generate_read_pair(
-            &fragment, "chr1", 1, 5, true, b"TTTTT", b"GGGGG", 1.0, &model, false, None, false,
+            &fragment,
+            "chr1",
+            1,
+            5,
+            true,
+            b"TTTTT",
+            b"GGGGG",
+            1.0,
+            &model,
+            &ReadNaming::Encoded,
+            None,
+            false,
             &mut rng,
         )
         .unwrap();
@@ -633,7 +673,19 @@ mod tests {
         let mut rng = SmallRng::seed_from_u64(42);
 
         let pair = generate_read_pair(
-            &fragment, "chr1", 42, 4, true, b"A", b"A", 1.0, &model, true, None, false, &mut rng,
+            &fragment,
+            "chr1",
+            42,
+            4,
+            true,
+            b"A",
+            b"A",
+            1.0,
+            &model,
+            &ReadNaming::Simple,
+            None,
+            false,
+            &mut rng,
         )
         .unwrap();
 
@@ -647,7 +699,19 @@ mod tests {
         let mut rng = SmallRng::seed_from_u64(42);
 
         let pair = generate_read_pair(
-            &fragment, "chr1", 1, 10, true, b"A", b"A", 1.0, &model, false, None, false, &mut rng,
+            &fragment,
+            "chr1",
+            1,
+            10,
+            true,
+            b"A",
+            b"A",
+            1.0,
+            &model,
+            &ReadNaming::Encoded,
+            None,
+            false,
+            &mut rng,
         )
         .unwrap();
 
@@ -666,8 +730,19 @@ mod tests {
         let mut rng = SmallRng::seed_from_u64(42);
 
         let pair = generate_read_pair(
-            &fragment, "chr1", 1, 10, true, b"ADAPTER", b"ADAPTER", 0.5, &model, false, None,
-            false, &mut rng,
+            &fragment,
+            "chr1",
+            1,
+            10,
+            true,
+            b"ADAPTER",
+            b"ADAPTER",
+            0.5,
+            &model,
+            &ReadNaming::Encoded,
+            None,
+            false,
+            &mut rng,
         );
 
         assert!(pair.is_none(), "all-lowercase fragment should be rejected at threshold 0.5");
@@ -682,8 +757,19 @@ mod tests {
         let mut rng = SmallRng::seed_from_u64(42);
 
         let pair = generate_read_pair(
-            &fragment, "chr1", 1, 10, true, b"ADAPTER", b"ADAPTER", 0.5, &model, false, None,
-            false, &mut rng,
+            &fragment,
+            "chr1",
+            1,
+            10,
+            true,
+            b"ADAPTER",
+            b"ADAPTER",
+            0.5,
+            &model,
+            &ReadNaming::Encoded,
+            None,
+            false,
+            &mut rng,
         )
         .expect("0.3 < 0.5 — should accept");
 
@@ -727,7 +813,7 @@ mod tests {
             b"ADAPTER",
             1.0,
             &model,
-            false,
+            &ReadNaming::Encoded,
             Some(&mc),
             true,
             &mut rng,
@@ -796,7 +882,7 @@ mod tests {
             b"ADAPTER",
             1.0,
             &model,
-            false,
+            &ReadNaming::Encoded,
             Some(&mc),
             true,
             &mut rng,
@@ -868,7 +954,7 @@ mod tests {
             b"ADAPTER",
             1.0,
             &model,
-            false,
+            &ReadNaming::Encoded,
             Some(&mc),
             false,
             &mut rng,
@@ -922,7 +1008,7 @@ mod tests {
             b"ADAPTER",
             1.0,
             &model,
-            false,
+            &ReadNaming::Encoded,
             Some(&mc),
             false,
             &mut rng,
@@ -966,7 +1052,7 @@ mod tests {
             b"TTTTTTTTTT",
             0.5,
             &model,
-            false,
+            &ReadNaming::Encoded,
             None,
             false,
             &mut rng_a,
@@ -982,7 +1068,7 @@ mod tests {
             b"TTTTTTTTTT",
             0.5,
             &model,
-            false,
+            &ReadNaming::Encoded,
             None,
             false,
             &mut rng_a,
@@ -1001,7 +1087,7 @@ mod tests {
             b"TTTTTTTTTT",
             0.5,
             &model,
-            false,
+            &ReadNaming::Encoded,
             None,
             false,
             &mut rng_b,
@@ -1016,5 +1102,53 @@ mod tests {
             after_reject.read2.as_ref().unwrap().bases,
             direct.read2.as_ref().unwrap().bases
         );
+    }
+
+    // --- Illumina naming integration tests ---
+
+    #[test]
+    fn test_illumina_name_pe() {
+        use crate::read_naming::IlluminaHeader;
+
+        let fragment = test_fragment(b"ACGTACGTACGTACGTACGT", 100);
+        let model = IlluminaErrorModel::new(10, 0.0, 0.0);
+        let mut rng = SmallRng::seed_from_u64(42);
+        let header = IlluminaHeader::from_seed(99);
+        let naming = ReadNaming::Illumina(&header);
+
+        let pair = generate_read_pair(
+            &fragment, "chr1", 1, 10, true, b"ADAPTER", b"ADAPTER", 1.0, &model, &naming, None,
+            false, &mut rng,
+        )
+        .unwrap();
+
+        let fields: Vec<&str> = pair.read1.name.split(':').collect();
+        assert_eq!(fields.len(), 7, "Illumina PE name must have 7 colon-separated fields");
+        assert_eq!(
+            pair.read1.name,
+            pair.read2.as_ref().unwrap().name,
+            "R1 and R2 must share the same name"
+        );
+    }
+
+    #[test]
+    fn test_illumina_name_se() {
+        use crate::read_naming::IlluminaHeader;
+
+        let fragment = test_fragment(b"ACGTACGTAC", 100);
+        let model = IlluminaErrorModel::new(10, 0.0, 0.0);
+        let mut rng = SmallRng::seed_from_u64(42);
+        let header = IlluminaHeader::from_seed(99);
+        let naming = ReadNaming::Illumina(&header);
+
+        let pair = generate_read_pair(
+            &fragment, "chr1", 5, 10, false, b"ADAPTER", b"ADAPTER", 1.0, &model, &naming, None,
+            false, &mut rng,
+        )
+        .unwrap();
+
+        let fields: Vec<&str> = pair.read1.name.split(':').collect();
+        assert_eq!(fields.len(), 7, "Illumina SE name must have 7 colon-separated fields");
+        assert!(pair.read2.is_none());
     }
 }

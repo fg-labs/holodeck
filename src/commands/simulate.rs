@@ -19,6 +19,7 @@ use crate::haplotype::build_haplotypes;
 use crate::output::fastq::FastqWriter;
 use crate::output::golden_bam::{GoldenBamMetadata, GoldenBamWriter};
 use crate::read::generate_read_pair;
+use crate::read_naming::{IlluminaHeader, ReadNameFormat, ReadNaming};
 use crate::seed::{derive_seed, resolve_seed};
 use crate::sequence_dict::SequenceDictionary;
 use crate::version::VERSION;
@@ -177,10 +178,14 @@ pub struct Simulate {
     #[arg(long)]
     pub golden_vcf: bool,
 
-    /// Use simple read names (`holodeck::N`) instead of encoding truth
-    /// coordinates in the read name.
-    #[arg(long)]
-    pub simple_names: bool,
+    /// Read name format. `encoded` (default) packs truth coordinates into
+    /// the name for downstream evaluation. `simple` emits sequential
+    /// identifiers (`holodeck::N`). `illumina` produces realistic
+    /// Illumina-style names (`instrument:run:flowcell:lane:tile:x:y`) for
+    /// testing tools that key on these fields (e.g. optical duplicate
+    /// detection).
+    #[arg(long, value_enum, default_value_t = ReadNameFormat::Encoded, value_name = "FORMAT")]
+    pub read_names: ReadNameFormat,
 
     /// BGZF compression level (0-12). Lower values are faster with larger
     /// output files; higher values produce smaller files at the cost of speed.
@@ -328,6 +333,21 @@ impl Simulate {
         let mut rng = SmallRng::seed_from_u64(seed);
         log::info!("Using random seed: {seed}");
 
+        let illumina_header = match self.read_names {
+            ReadNameFormat::Illumina => {
+                let header = IlluminaHeader::from_seed(seed);
+                log::info!("Illumina read names: {}", header.format_name(1));
+                Some(header)
+            }
+            _ => None,
+        };
+        let naming = match (&self.read_names, &illumina_header) {
+            (ReadNameFormat::Encoded, _) => ReadNaming::Encoded,
+            (ReadNameFormat::Simple, _) => ReadNaming::Simple,
+            (ReadNameFormat::Illumina, Some(h)) => ReadNaming::Illumina(h),
+            (ReadNameFormat::Illumina, None) => unreachable!(),
+        };
+
         let mut fasta = Fasta::from_path(&self.reference.reference)?;
         let dict = fasta.dict().clone();
         log::info!(
@@ -467,6 +487,7 @@ impl Simulate {
                 sample_ploidy,
                 cpg_truth.as_mut(),
                 methylation_records.as_ref(),
+                &naming,
                 read_num,
                 seed,
                 &mut rng,
@@ -609,6 +630,7 @@ impl Simulate {
         sample_ploidy: usize,
         cpg_truth: Option<&mut crate::output::cpg_truth::CpgTruthTally>,
         methylation_records: Option<&crate::vcf::methylation::MethylationVcfRecords>,
+        naming: &ReadNaming,
         start_read_num: u64,
         main_seed: u64,
         rng: &mut SmallRng,
@@ -797,7 +819,7 @@ impl Simulate {
                 adapter_r2,
                 self.max_n_frac,
                 error_model,
-                self.simple_names,
+                naming,
                 methylation_config.as_ref(),
                 // Pre-conversion bases are only consumed by the golden BAM's
                 // YS:Z tag — skip the per-mate clone when no golden BAM is
@@ -932,7 +954,7 @@ mod tests {
             cpg_truth_bedgraph: None,
             golden_bam: false,
             golden_vcf: false,
-            simple_names: false,
+            read_names: ReadNameFormat::Encoded,
             compression: 1,
             threads: 4,
         }
