@@ -133,7 +133,7 @@ holodeck simulate -r ref.fa -v methylated.vcf.gz -o output_taps \
 | `--golden-bam` | off | Write ground-truth BAM |
 | `--golden-vcf` | off | Reserved for a coverage-annotated ground-truth VCF; **not yet implemented** (logs a warning and is otherwise a no-op) |
 | `--single-end` | off | Generate SE instead of PE reads |
-| `--simple-names` | off | Use `holodeck::N` names instead of encoded truth |
+| `--read-names` | `encoded` | Read name format: `encoded` (truth coordinates), `simple` (sequential `holodeck::N`), or `illumina` (realistic `instrument:run:flowcell:lane:tile:x:y`) |
 | `--compression` | 1 | BGZF compression level (0-12) |
 | `-t, --threads` | 4 | Threads for BGZF compression |
 | `--seed` | auto | Random seed (deterministic by default) |
@@ -489,10 +489,19 @@ Fields: read number, source fragment length (bp), contig, R1 position (1-based) 
 
 Fields are separated by `::` (double colon) so contig names that legally contain single `:` characters (e.g. HLA alleles like `HLA-A*01:01:01:01`) parse unambiguously. Contig names must not contain `@` (the FASTQ header prefix) or `::`; both are rejected by a debug assertion in the read-name formatter.
 
-**Simple format** (`--simple-names`):
+**Simple format** (`--read-names simple`):
 ```text
 @holodeck::42
 ```
+
+**Illumina format** (`--read-names illumina`):
+```text
+@A00588:61:HHMTFDSXX:1:1147:23456:41200
+```
+
+Produces realistic Illumina-style read names with instrument ID, run number, flowcell barcode, lane, tile, and X/Y coordinates. All fields are generated deterministically from the simulation seed: different seeds produce different instrument/run/flowcell/lane identities, and tile/X/Y coordinates vary per read. This format is useful for testing tools that key on these fields, such as optical duplicate detectors that use `instrument:run:flowcell:lane` to identify physical sequencing units and `tile:x:y` for spatial proximity.
+
+Note: Illumina-format names do not encode truth coordinates, so `holodeck eval` cannot parse them. Use a golden BAM (`--golden-bam`) for evaluation when using this format.
 
 ## Performance
 

@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- New `--read-names illumina` option for `simulate` that produces realistic
+  Illumina-style read names (`instrument:run:flowcell:lane:tile:x:y`). All
+  header fields are generated deterministically from the simulation seed.
+  Useful for testing tools that key on these fields, such as optical duplicate
+  detectors.
+
+### Changed
+
+- **Breaking:** The `--simple-names` flag on `simulate` has been replaced by
+  `--read-names {encoded, simple, illumina}` (default `encoded`). Use
+  `--read-names simple` for the old `--simple-names` behavior.
+
 ### Fixed
 
 - `simulate` and `methylate` now tolerate VCFs that redeclare a header ID

@@ -281,7 +281,8 @@ fn test_simulate_simple_names() {
         "100",
         "--fragment-stddev",
         "20",
-        "--simple-names",
+        "--read-names",
+        "simple",
     ]);
 
     assert!(ok, "simulate failed: {stderr}");
@@ -290,6 +291,104 @@ fn test_simulate_simple_names() {
     let r1_contents = read_gzipped(&r1_path);
     let first_name = r1_contents.lines().next().unwrap();
     assert_eq!(first_name, "@holodeck::1", "Simple name should be holodeck::N");
+}
+
+#[test]
+fn test_simulate_illumina_names() {
+    let env = simple_env();
+    let out = env.output_prefix();
+
+    let (ok, _, stderr) = run_simulate(&[
+        "simulate",
+        "-r",
+        env.fasta_path.to_str().unwrap(),
+        "-o",
+        out.to_str().unwrap(),
+        "--coverage",
+        "5",
+        "--read-length",
+        "50",
+        "--fragment-mean",
+        "100",
+        "--fragment-stddev",
+        "20",
+        "--read-names",
+        "illumina",
+    ]);
+
+    assert!(ok, "simulate failed: {stderr}");
+
+    let r1_path = std::path::PathBuf::from(format!("{}.r1.fastq.gz", out.display()));
+    let r1_contents = read_gzipped(&r1_path);
+    let lines: Vec<&str> = r1_contents.lines().collect();
+    assert!(!lines.is_empty(), "expected non-empty FASTQ");
+
+    // Every read name (lines 0, 4, 8, ...) must have 7 colon-separated fields.
+    let mut header_prefix: Option<String> = None;
+    for (i, line) in lines.iter().enumerate() {
+        if i % 4 != 0 {
+            continue;
+        }
+        let name = line.strip_prefix('@').unwrap_or(line);
+        let fields: Vec<&str> = name.split(':').collect();
+        assert_eq!(
+            fields.len(),
+            7,
+            "Illumina name must have 7 colon-separated fields, got {}: {name}",
+            fields.len()
+        );
+
+        // instrument:run:flowcell:lane must be constant across all reads.
+        let prefix = fields[..4].join(":");
+        match &header_prefix {
+            None => header_prefix = Some(prefix),
+            Some(expected) => assert_eq!(
+                &prefix, expected,
+                "instrument:run:flowcell:lane must be constant across reads"
+            ),
+        }
+    }
+}
+
+#[test]
+fn test_simulate_illumina_names_deterministic() {
+    let env = simple_env();
+    let out1 = env.dir.path().join("run1");
+    let out2 = env.dir.path().join("run2");
+
+    let args = |out: &std::path::Path| {
+        vec![
+            "simulate".to_string(),
+            "-r".to_string(),
+            env.fasta_path.to_str().unwrap().to_string(),
+            "-o".to_string(),
+            out.to_str().unwrap().to_string(),
+            "--coverage".to_string(),
+            "5".to_string(),
+            "--read-length".to_string(),
+            "50".to_string(),
+            "--fragment-mean".to_string(),
+            "100".to_string(),
+            "--fragment-stddev".to_string(),
+            "20".to_string(),
+            "--read-names".to_string(),
+            "illumina".to_string(),
+            "--seed".to_string(),
+            "42".to_string(),
+        ]
+    };
+
+    let args1 = args(&out1);
+    let (ok1, _, stderr1) = run_simulate(&args1.iter().map(String::as_str).collect::<Vec<_>>());
+    assert!(ok1, "run1 failed: {stderr1}");
+
+    let args2 = args(&out2);
+    let (ok2, _, stderr2) = run_simulate(&args2.iter().map(String::as_str).collect::<Vec<_>>());
+    assert!(ok2, "run2 failed: {stderr2}");
+
+    let r1_1 = read_gzipped(&PathBuf::from(format!("{}.r1.fastq.gz", out1.display())));
+    let r1_2 = read_gzipped(&PathBuf::from(format!("{}.r1.fastq.gz", out2.display())));
+    assert_eq!(r1_1, r1_2, "same seed must produce identical output");
 }
 
 #[test]
@@ -3421,7 +3520,8 @@ fn test_simulate_max_n_frac_zero_avoids_ambiguous_regions() {
         "0",
         "--max-n-frac",
         "0.0",
-        "--simple-names",
+        "--read-names",
+        "simple",
         "--golden-bam",
     ]);
     assert!(ok, "simulate failed: {stderr}");
