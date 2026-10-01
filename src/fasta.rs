@@ -1,8 +1,8 @@
 use std::fs::File;
 use std::io::{Seek, SeekFrom};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use noodles::core::Region;
 use noodles::fasta;
 use rand::Rng;
@@ -27,8 +27,27 @@ impl Fasta {
     /// The `.fai` file must exist alongside the FASTA (e.g. `ref.fa.fai`).
     ///
     /// # Errors
-    /// Returns an error if the FASTA or its index cannot be read.
+    /// Returns an error if the FASTA or its index cannot be read. A missing
+    /// FASTA or a missing `.fai` is reported by name, the latter with the
+    /// command that creates it. A path that cannot be checked (for example,
+    /// permission denied) is reported with the underlying OS error.
     pub fn from_path(path: &Path) -> Result<Self> {
+        // `try_exists` is `Err` when existence cannot be determined; only a
+        // definite `Ok(false)` is reported as missing, and anything else falls
+        // through to the reader so its OS error is kept.
+        if matches!(path.try_exists(), Ok(false)) {
+            bail!("Reference FASTA not found: {}", path.display());
+        }
+        let fai_path = fai_path(path);
+        if matches!(fai_path.try_exists(), Ok(false)) {
+            bail!(
+                "FASTA index not found: {}\n  holodeck needs an indexed reference. Create the \
+                 index with:\n    samtools faidx {}",
+                fai_path.display(),
+                shell_quote(&path.display().to_string())
+            );
+        }
+
         let reader = fasta::io::indexed_reader::Builder::default()
             .build_from_path(path)
             .with_context(|| format!("Failed to open indexed FASTA: {}", path.display()))?;
@@ -96,6 +115,26 @@ impl Fasta {
     #[must_use]
     pub fn contig_names(&self) -> Vec<&str> {
         self.dict.names()
+    }
+}
+
+/// The `.fai` index path for `fasta_path`: the FASTA path with `.fai`
+/// appended, which is where noodles' indexed reader looks for it.
+fn fai_path(fasta_path: &Path) -> PathBuf {
+    let mut path = fasta_path.as_os_str().to_owned();
+    path.push(".fai");
+    PathBuf::from(path)
+}
+
+/// Quote `arg` for a POSIX shell when it contains anything other than
+/// characters that are always safe unquoted, so a suggested command can be
+/// copied and run as is.
+fn shell_quote(arg: &str) -> String {
+    let is_safe = |c: char| c.is_ascii_alphanumeric() || "_-./+,:=@%".contains(c);
+    if !arg.is_empty() && arg.chars().all(is_safe) {
+        arg.to_string()
+    } else {
+        format!("'{}'", arg.replace('\'', "'\\''"))
     }
 }
 
@@ -259,6 +298,86 @@ mod tests {
 
         let seq1 = fasta.load_contig("chr1", &mut test_rng()).unwrap();
         assert_eq!(&seq1, b"AAAA");
+    }
+
+    #[test]
+    fn test_from_path_missing_index_names_the_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_test_fasta(dir.path(), &[("chr1", b"ACGT")]);
+        let fai_path = dir.path().join("ref.fa.fai");
+        std::fs::remove_file(&fai_path).unwrap();
+
+        let err = Fasta::from_path(&path).err().unwrap();
+
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "FASTA index not found: {}\n  holodeck needs an indexed reference. Create the \
+                 index with:\n    samtools faidx {}",
+                fai_path.display(),
+                path.display()
+            )
+        );
+    }
+
+    #[test]
+    fn test_from_path_missing_index_quotes_a_path_with_spaces() {
+        let dir = tempfile::tempdir().unwrap();
+        let sub = dir.path().join("my refs");
+        std::fs::create_dir(&sub).unwrap();
+        let path = write_test_fasta(&sub, &[("chr1", b"ACGT")]);
+        std::fs::remove_file(sub.join("ref.fa.fai")).unwrap();
+
+        let err = Fasta::from_path(&path).err().unwrap();
+
+        assert!(
+            err.to_string().ends_with(&format!("\n    samtools faidx '{}'", path.display())),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_shell_quote_leaves_a_safe_path_unquoted() {
+        assert_eq!(shell_quote("/data/refs/hg38.fa"), "/data/refs/hg38.fa");
+    }
+
+    #[test]
+    fn test_shell_quote_escapes_an_embedded_single_quote() {
+        assert_eq!(shell_quote("/data/bob's refs/hg38.fa"), "'/data/bob'\\''s refs/hg38.fa'");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_from_path_unreadable_directory_reports_the_os_error() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let sub = dir.path().join("locked");
+        std::fs::create_dir(&sub).unwrap();
+        let path = write_test_fasta(&sub, &[("chr1", b"ACGT")]);
+        std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o000)).unwrap();
+        // Root can still traverse the directory, so there is nothing to test.
+        let readable = std::fs::metadata(&path).is_ok();
+
+        let result = Fasta::from_path(&path);
+        std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        if readable {
+            return;
+        }
+
+        let err = result.err().unwrap();
+        assert_eq!(err.to_string(), format!("Failed to open indexed FASTA: {}", path.display()));
+        assert!(format!("{err:#}").contains("Permission denied"), "unexpected error: {err:#}");
+    }
+
+    #[test]
+    fn test_from_path_missing_fasta_names_the_fasta() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("missing.fa");
+
+        let err = Fasta::from_path(&path).err().unwrap();
+
+        assert_eq!(err.to_string(), format!("Reference FASTA not found: {}", path.display()));
     }
 
     #[test]
