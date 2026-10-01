@@ -22,6 +22,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   always wrote BGZF (so a `*.vcf` output was a BGZF stream the reader treated as
   plain text). Both now round-trip through `simulate`/`methylate` regardless of
   name.
+- A reference FASTA without a `.fai` index now fails with an error that names
+  the missing index and the `samtools faidx` command that creates it, instead
+  of `Failed to open indexed FASTA: ref.fa` followed by `No such file or
+  directory`, which read as though the FASTA itself were missing. A missing
+  FASTA is likewise reported by name.
 
 ## [0.3.0] - 2026-06-13
 
