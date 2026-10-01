@@ -9,16 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- `methylate --vcf` (allele-specific methylation) no longer slows down
-  quadratically with variant density. The per-haplotype CpG classifier looked
-  up each CpG's variant/reference source with a linear scan over every variant
-  on the contig, making it O(CpGs × variants) per haplotype — on a whole human
-  genome with a few-million-variant VCF this was ~100× the work of the
-  reference-only path (≈43 min vs ≈25 s). Because the alt spans are sorted and
-  disjoint and the CpG scan is ascending, a single monotonic cursor now resolves
-  each lookup in O(1) amortized, making classification O(haplotype length +
-  variants); output is byte-identical. The reference-only path was already fast
-  and is unchanged.
+- `methylate --vcf` no longer slows down in proportion to the number of
+  variants on a contig. Each CpG's variant lookup scanned every variant on the
+  contig; it now takes constant time, so run time is close to that of
+  `methylate` without a VCF (on human chr22 with 42,000 variants, 87 s before
+  and under 3 s after). Output is unchanged.
 - `simulate` and `methylate` now tolerate VCFs that redeclare a header ID
   (e.g. `duplicate INFO ID: BREAKSIMLENGTH`). Such duplicates are common in
   files from upstream tools and are accepted by bcftools; holodeck drops the

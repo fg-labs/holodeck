@@ -173,12 +173,8 @@ fn classify_cpgs_with_haplotypes(
             var_hap_ranges.push((vi, hap_start, hap_end));
         }
 
-        // Scan materialized haplotype for CpG dinucleotides. `var_cursor` walks
-        // `var_hap_ranges` (sorted, disjoint) in lock-step with the ascending
-        // scan so `base_source` is O(1) amortized rather than O(variants) per
-        // CpG; it is reset per haplotype because `var_hap_ranges` is rebuilt
-        // above.
-        let mut var_cursor = 0usize;
+        // Scan materialized haplotype for CpG dinucleotides.
+        let mut alt_spans = AltSpanCursor::new(&var_hap_ranges);
         for h in 0..len - 1 {
             let c0 = hap_bases[h].to_ascii_uppercase();
             let c1 = hap_bases[h + 1].to_ascii_uppercase();
@@ -191,10 +187,9 @@ fn classify_cpgs_with_haplotypes(
             #[expect(clippy::cast_possible_truncation, reason = "haplotype length fits in u32")]
             let hpos = h as u32;
 
-            // Determine source of each base: variant or reference. Query `hpos`
-            // before `hpos + 1` so the shared cursor sees non-decreasing inputs.
-            let src_h = base_source(hpos, &var_hap_ranges, &mut var_cursor);
-            let src_h1 = base_source(hpos + 1, &var_hap_ranges, &mut var_cursor);
+            // Determine source of each base: variant or reference.
+            let src_h = alt_spans.source_at(hpos);
+            let src_h1 = alt_spans.source_at(hpos + 1);
 
             let placement = match (src_h, src_h1) {
                 // Both bases come from reference → standalone at the ref
@@ -308,100 +303,41 @@ enum BaseSource {
     Variant { variant_index: usize, hap_start: u32 },
 }
 
-/// Determine whether haplotype coordinate `h` falls inside any variant's
-/// alt-allele span, returning `BaseSource::Variant` for the spanning range or
-/// `BaseSource::Reference` if none spans `h`.
+/// Forward-only lookup of the [`BaseSource`] at successive haplotype
+/// coordinates.
 ///
-/// `var_hap_ranges` is sorted by `hap_start` and the ranges are disjoint (one
-/// haplotype never carries two overlapping alt spans — enforced upstream by
-/// [`check_overlaps_on_shared_haplotypes`]). `cursor` is a monotonic index into
-/// `var_hap_ranges` that the caller threads across a strictly **non-decreasing**
-/// sequence of `h` queries: it advances past every range ending at or before
-/// `h` and never rewinds. This turns what would be an O(ranges) scan per query
-/// into O(1) amortized across a full CpG scan, so the per-haplotype CpG
-/// classification is O(haplotype length + variants) instead of O(CpGs ×
-/// variants).
-///
-/// The caller must (a) reset `cursor` to `0` before each independent ascending
-/// scan and (b) only ever pass `h` values that do not decrease within that
-/// scan. Querying `h` then `h + 1` within one loop iteration, with `h`
-/// incrementing by one across iterations, satisfies this.
-fn base_source(h: u32, var_hap_ranges: &[(usize, u32, u32)], cursor: &mut usize) -> BaseSource {
-    // Skip ranges that end at or before `h`; they can never contain `h` and,
-    // because queries are non-decreasing, can never contain any later query
-    // either, so dropping them permanently is safe.
-    while *cursor < var_hap_ranges.len() && var_hap_ranges[*cursor].2 <= h {
-        *cursor += 1;
-    }
-    if let Some(&(vi, hap_start, hap_end)) = var_hap_ranges.get(*cursor)
-        && h >= hap_start
-        && h < hap_end
-    {
-        return BaseSource::Variant { variant_index: vi, hap_start };
-    }
-    BaseSource::Reference
+/// Scanning a haplotype for CpGs asks for the source of every C and G in
+/// ascending coordinate order, so the cursor only ever moves forward through
+/// the alt spans and a whole scan costs O(queries + spans). Searching the spans
+/// afresh for each query is O(spans) per CpG, which is prohibitive for a
+/// whole-chromosome VCF.
+struct AltSpanCursor<'a> {
+    /// `(variant_index, hap_start, hap_end_exclusive)` for each alt allele the
+    /// haplotype carries, ordered by `hap_start`.
+    spans: &'a [(usize, u32, u32)],
+    /// Index of the first span that ends after the most recent query.
+    next: usize,
 }
 
-#[cfg(test)]
-mod base_source_cursor_tests {
-    //! The monotonic-cursor [`base_source`] must return exactly what a naive
-    //! linear scan would for the same query, under the real caller access
-    //! pattern (query `h` then `h + 1` per CpG, `h` ascending by one). This
-    //! pins the O(CpGs + variants) fast path to the O(CpGs × variants)
-    //! reference semantics it replaced.
-
-    use super::{BaseSource, base_source};
-    use rand::rngs::SmallRng;
-    use rand::{Rng as _, SeedableRng as _};
-
-    /// Naive reference implementation: the first (only, since disjoint) range
-    /// spanning `h`, as `(variant_index, hap_start)`.
-    fn naive(h: u32, ranges: &[(usize, u32, u32)]) -> Option<(usize, u32)> {
-        ranges.iter().find(|&&(_, s, e)| h >= s && h < e).map(|&(vi, s, _)| (vi, s))
+impl<'a> AltSpanCursor<'a> {
+    /// Creates a cursor positioned before the first of `spans`, which must be
+    /// ordered by `hap_start`.
+    fn new(spans: &'a [(usize, u32, u32)]) -> Self {
+        debug_assert!(spans.is_sorted_by_key(|&(_, hap_start, _)| hap_start));
+        Self { spans, next: 0 }
     }
 
-    fn to_pair(src: BaseSource) -> Option<(usize, u32)> {
-        match src {
-            BaseSource::Variant { variant_index, hap_start } => Some((variant_index, hap_start)),
-            BaseSource::Reference => None,
+    /// Returns the source of the base at haplotype coordinate `h`. Successive
+    /// calls must pass non-decreasing values of `h`.
+    fn source_at(&mut self, h: u32) -> BaseSource {
+        while self.spans.get(self.next).is_some_and(|&(_, _, hap_end)| hap_end <= h) {
+            self.next += 1;
         }
-    }
-
-    #[test]
-    fn cursor_matches_linear_scan_under_real_access_pattern() {
-        let mut rng = SmallRng::seed_from_u64(0xC0FF_EE99);
-        for _ in 0..500 {
-            // Build random disjoint, ascending ranges shaped like the
-            // per-haplotype alt spans `var_hap_ranges` holds: gaps of reference
-            // between spans, each span at least one base wide.
-            let n = rng.random_range(0..12usize);
-            let mut ranges: Vec<(usize, u32, u32)> = Vec::new();
-            let mut pos = 0u32;
-            for vi in 0..n {
-                let start = pos + rng.random_range(0..5u32);
-                let end = start + rng.random_range(1..6u32);
-                ranges.push((vi, start, end));
-                pos = end;
+        match self.spans.get(self.next) {
+            Some(&(variant_index, hap_start, _)) if hap_start <= h => {
+                BaseSource::Variant { variant_index, hap_start }
             }
-            let max_h = pos + 6;
-
-            // One cursor threaded across the whole ascending scan, querying
-            // `h` then `h + 1` per step exactly as `classify_cpgs_with_haplotypes`
-            // does.
-            let mut cursor = 0usize;
-            for h in 0..max_h {
-                assert_eq!(
-                    to_pair(base_source(h, &ranges, &mut cursor)),
-                    naive(h, &ranges),
-                    "query h={h} ranges={ranges:?}",
-                );
-                assert_eq!(
-                    to_pair(base_source(h + 1, &ranges, &mut cursor)),
-                    naive(h + 1, &ranges),
-                    "query h+1={} ranges={ranges:?}",
-                    h + 1,
-                );
-            }
+            _ => BaseSource::Reference,
         }
     }
 }
@@ -783,10 +719,8 @@ fn per_variant_per_hap_cpg_offsets_with_haplotypes(
         }
 
         // Scan for CpG dinucleotides and assign them to the owning variant
-        // using the same upstream-wins rule as classify_cpgs. `var_cursor`
-        // advances with the ascending scan to keep `base_source` O(1) amortized;
-        // reset per haplotype alongside the rebuilt `var_hap_ranges`.
-        let mut var_cursor = 0usize;
+        // using the same upstream-wins rule as classify_cpgs.
+        let mut alt_spans = AltSpanCursor::new(&var_hap_ranges);
         for h in 0..len - 1 {
             let c0 = hap_bases[h].to_ascii_uppercase();
             let c1 = hap_bases[h + 1].to_ascii_uppercase();
@@ -797,10 +731,8 @@ fn per_variant_per_hap_cpg_offsets_with_haplotypes(
             #[expect(clippy::cast_possible_truncation, reason = "haplotype length fits in u32")]
             let hpos = h as u32;
 
-            // Query `hpos` before `hpos + 1` so the shared cursor advances over
-            // non-decreasing inputs.
-            let src_h = base_source(hpos, &var_hap_ranges, &mut var_cursor);
-            let src_h1 = base_source(hpos + 1, &var_hap_ranges, &mut var_cursor);
+            let src_h = alt_spans.source_at(hpos);
+            let src_h1 = alt_spans.source_at(hpos + 1);
 
             // Determine the owning variant index using the same upstream-wins
             // rule as classify_cpgs. None means both bases are from reference
@@ -1525,6 +1457,95 @@ pub fn load_contig_methylation_from_records(
         .map_err(|e| anyhow::anyhow!("failed to parse MT/MB for {contig_name}: {e}"))?;
     log::debug!("Loaded methylation truth for {contig_name} from VCF MT/MB");
     Ok(Some(cm))
+}
+
+#[cfg(test)]
+mod alt_span_cursor_tests {
+    use super::{AltSpanCursor, BaseSource};
+
+    /// Collapses a [`BaseSource`] to the index of the variant it names, if any.
+    fn variant_index(source: BaseSource) -> Option<usize> {
+        match source {
+            BaseSource::Variant { variant_index, .. } => Some(variant_index),
+            BaseSource::Reference => None,
+        }
+    }
+
+    #[test]
+    fn no_spans_is_always_reference() {
+        let mut cursor = AltSpanCursor::new(&[]);
+        assert_eq!(variant_index(cursor.source_at(0)), None);
+        assert_eq!(variant_index(cursor.source_at(100)), None);
+    }
+
+    #[test]
+    fn coordinate_before_first_span_is_reference() {
+        let spans = [(0, 10, 12)];
+        let mut cursor = AltSpanCursor::new(&spans);
+        assert_eq!(variant_index(cursor.source_at(9)), None);
+    }
+
+    #[test]
+    fn span_start_is_inclusive_and_end_is_exclusive() {
+        let spans = [(0, 10, 12)];
+        let mut cursor = AltSpanCursor::new(&spans);
+        assert_eq!(variant_index(cursor.source_at(10)), Some(0));
+        assert_eq!(variant_index(cursor.source_at(11)), Some(0));
+        assert_eq!(variant_index(cursor.source_at(12)), None);
+    }
+
+    #[test]
+    fn variant_source_reports_the_span_start() {
+        let spans = [(7, 10, 13)];
+        let mut cursor = AltSpanCursor::new(&spans);
+        let BaseSource::Variant { variant_index, hap_start } = cursor.source_at(12) else {
+            panic!("coordinate 12 lies inside the span");
+        };
+        assert_eq!((variant_index, hap_start), (7, 10));
+    }
+
+    #[test]
+    fn coordinate_between_spans_is_reference() {
+        let spans = [(0, 10, 12), (1, 20, 21)];
+        let mut cursor = AltSpanCursor::new(&spans);
+        assert_eq!(variant_index(cursor.source_at(11)), Some(0));
+        assert_eq!(variant_index(cursor.source_at(15)), None);
+        assert_eq!(variant_index(cursor.source_at(20)), Some(1));
+    }
+
+    #[test]
+    fn adjacent_spans_resolve_to_their_own_variants() {
+        let spans = [(0, 10, 12), (1, 12, 13)];
+        let mut cursor = AltSpanCursor::new(&spans);
+        assert_eq!(variant_index(cursor.source_at(11)), Some(0));
+        assert_eq!(variant_index(cursor.source_at(12)), Some(1));
+        assert_eq!(variant_index(cursor.source_at(13)), None);
+    }
+
+    #[test]
+    fn one_query_can_skip_several_spans() {
+        let spans = [(0, 10, 11), (1, 20, 21), (2, 30, 31), (3, 40, 42)];
+        let mut cursor = AltSpanCursor::new(&spans);
+        assert_eq!(variant_index(cursor.source_at(41)), Some(3));
+    }
+
+    #[test]
+    fn repeating_a_coordinate_gives_the_same_source() {
+        // A CpG scan asks about `h + 1` and then, at the next CpG, may ask
+        // about that same coordinate again as its `h`.
+        let spans = [(0, 10, 12)];
+        let mut cursor = AltSpanCursor::new(&spans);
+        assert_eq!(variant_index(cursor.source_at(11)), Some(0));
+        assert_eq!(variant_index(cursor.source_at(11)), Some(0));
+    }
+
+    #[test]
+    fn coordinate_after_last_span_is_reference() {
+        let spans = [(0, 10, 12)];
+        let mut cursor = AltSpanCursor::new(&spans);
+        assert_eq!(variant_index(cursor.source_at(50)), None);
+        assert_eq!(variant_index(cursor.source_at(51)), None);
+    }
 }
 
 #[cfg(test)]
