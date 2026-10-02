@@ -13,16 +13,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   sequence. `N`s and other ambiguity codes are resolved to random bases, which
   contain a `CG` about every 16 bases, and each of these was written as a CpG
   record; on hs38DH they were 26% of all records. A `CG` now counts as a CpG
-  only when both bases are real reference or variant bases. The same rule
-  applies to `simulate`'s CpG truth bedGraph. For a given `--seed`, methylation
-  values differ from earlier versions on any reference that contains ambiguity
-  codes; VCFs written by earlier versions are still read.
+  only when both bases are real reference or variant bases. `simulate` applies
+  the same rule to its CpG truth bedGraph and to the `XM`/`YM` tags in the
+  golden BAM. For a given `--seed`, methylation values differ from earlier
+  versions on any reference that contains ambiguity codes. Methylation VCFs
+  written by earlier versions should be regenerated: most still load, but one
+  with a variant next to an ambiguity code is rejected with an MT/MB length
+  mismatch.
 - `methylate` is faster and, without an input VCF, uses less memory. On hs38DH,
   single-threaded: 87 s to 24 s and 2.1 GB to 0.6 GB without a VCF; 126 s to
   49 s with a 3.5-million-variant VCF. Part of this comes from the change
-  above; the rest leaves the output unchanged.
-- Lowercase alleles in an input VCF are now uppercased when read, so they are
-  treated as real bases and not as ambiguous reference positions.
+  above; the rest leaves the output unchanged. `simulate` shares the faster
+  haplotype fragment extraction.
+- Lowercase bases in a VCF alternate allele are treated as real bases, not as
+  ambiguous reference positions, when `simulate` filters reads with
+  `--max-n-frac`.
 
 ### Fixed
 

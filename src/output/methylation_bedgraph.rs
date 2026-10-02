@@ -133,8 +133,9 @@ pub fn write_bedgraph_records<W: Write>(
         }
     }
 
-    // Each haplotype contributed its CpGs in ascending order; a stable sort
-    // merges those runs, leaving one entry per haplotype for each CpG adjacent.
+    // Each haplotype contributed its CpGs in ascending order, and `sort_by_key`
+    // merges such pre-sorted runs in linear time. Afterwards the entries for
+    // one CpG, one per haplotype that has it, are adjacent.
     per_haplotype.sort_by_key(|counts| counts.top_c);
     for cpg in per_haplotype.chunk_by(|a, b| a.top_c == b.top_c) {
         let total = CpgCounts {

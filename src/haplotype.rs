@@ -298,7 +298,10 @@ pub fn build_haplotypes(
                 ref_pos: vr.position,
                 #[expect(clippy::cast_possible_truncation, reason = "ref allele < 4 GB")]
                 ref_len: vr.ref_allele.len() as u32,
-                alt_bases: alt_bases.to_vec(),
+                // Uppercased because a lowercase base in a haplotype means one
+                // synthesized from a reference ambiguity code (see
+                // `Fasta::load_contig`), which a VCF allele is not.
+                alt_bases: alt_bases.to_ascii_uppercase(),
             };
 
             let target_hap = hap_permutation[allele_idx];
@@ -441,6 +444,37 @@ mod tests {
 
         let (bases, _, _) = haps[1].extract_fragment(reference, 0, 8);
         assert_eq!(&bases, b"ACGTATAC");
+    }
+
+    #[test]
+    fn test_lowercase_alt_allele_is_uppercased_in_the_haplotype() {
+        let reference = b"AAAAAAAA";
+        let variants = vec![snp(3, b'A', b't', "1|1")];
+        let haps = build_haplotypes(&variants, 2, &mut rand::rng());
+        assert_eq!(haps[0].sequence(reference).as_ref(), b"AAATAAAA");
+    }
+
+    #[test]
+    fn test_sequence_borrows_the_reference_without_variants() {
+        let reference = b"ACGTACGT";
+        let haps = build_haplotypes(&[], 2, &mut rand::rng());
+        assert!(haps[0].is_reference());
+        assert!(matches!(haps[0].sequence(reference), Cow::Borrowed(_)));
+    }
+
+    #[test]
+    fn test_sequence_includes_bases_added_by_insertions() {
+        // A 3-base insertion makes the haplotype longer than the reference.
+        let reference = b"AAAAAAAA";
+        let variants = vec![VariantRecord {
+            position: 3,
+            ref_allele: b"A".to_vec(),
+            alt_alleles: vec![b"ACGT".to_vec()],
+            genotype: Genotype::parse("1|1").unwrap(),
+        }];
+        let haps = build_haplotypes(&variants, 2, &mut rand::rng());
+        assert!(!haps[0].is_reference());
+        assert_eq!(haps[0].sequence(reference).as_ref(), b"AAAACGTAAAA");
     }
 
     #[test]
