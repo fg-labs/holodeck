@@ -1461,6 +1461,8 @@ pub fn load_contig_methylation_from_records(
 
 #[cfg(test)]
 mod alt_span_cursor_tests {
+    //! Boundary cases for [`AltSpanCursor`]'s forward-only span lookup.
+
     use super::{AltSpanCursor, BaseSource};
 
     /// Collapses a [`BaseSource`] to the index of the variant it names, if any.
