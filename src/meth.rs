@@ -294,8 +294,7 @@ impl MethylationTable {
         if cpg_top_c.is_empty() {
             return table;
         }
-        let island = island_mask(&hap_bases);
-        let contexts = classify_cpg_contexts(&cpg_top_c, &island);
+        let contexts = classify_cpg_contexts(&cpg_top_c, &island_runs(&hap_bases));
 
         let mut prev_state: Option<bool> = None;
         let mut prev_pos: u32 = 0;
@@ -508,26 +507,26 @@ pub(crate) fn find_reference_cpgs(reference: &[u8]) -> Vec<u32> {
     cpg_positions(reference).map(|i| i as u32).collect()
 }
 
-/// Per-base CpG-island mask: `mask[p]` is `true` iff position `p` lies in a
-/// window that satisfies the Gardiner-Garden island criteria
-/// ([`ISLAND_MIN_WINDOW_BP`]-bp window with GC fraction > [`ISLAND_MIN_GC`]
-/// and observed/expected CpG ratio > [`ISLAND_MIN_OE_RATIO`]).
+/// CpG islands in `seq`, as ascending, disjoint `[start, end)` runs.
 ///
-/// `O(len)`: a single rolling window maintains C, G, and CpG counts, and
-/// qualifying windows are painted into the mask with a monotone cursor so each
-/// base is written at most once. Only uppercase `C` and `G` count (see
-/// [`cpg_positions`]); every other byte is neither GC nor CpG. Sequences shorter than the window yield an all-`false`
-/// mask (no island can be called).
+/// A base is in an island iff it lies in some [`ISLAND_MIN_WINDOW_BP`]-bp
+/// window that satisfies the Gardiner-Garden criteria (GC fraction >
+/// [`ISLAND_MIN_GC`] and observed/expected CpG ratio > [`ISLAND_MIN_OE_RATIO`]),
+/// so each run is the union of overlapping or abutting qualifying windows.
+///
+/// `O(len)`: a single rolling window maintains C, G, and CpG counts. Only
+/// uppercase `C` and `G` count (see [`cpg_positions`]); every other byte is
+/// neither GC nor CpG. Sequences shorter than the window have no islands.
 #[expect(
     clippy::similar_names,
     reason = "is_c/is_g and n_c/n_g/n_cg mirror the C/G/CpG quantities they track"
 )]
-fn island_mask(seq: &[u8]) -> BitVec {
+fn island_runs(seq: &[u8]) -> Vec<(u32, u32)> {
     let len = seq.len();
     let window = ISLAND_MIN_WINDOW_BP;
-    let mut mask = BitVec::repeat(false, len);
+    let mut runs: Vec<(u32, u32)> = Vec::new();
     if len < window {
-        return mask;
+        return runs;
     }
 
     let is_c = |j: usize| seq[j] == b'C';
@@ -542,7 +541,6 @@ fn island_mask(seq: &[u8]) -> BitVec {
     let mut n_cg = (0..window - 1).filter(|&j| is_cg(j)).count();
 
     let window_f = window as f64;
-    let mut painted_end = 0usize;
     for a in 0..=(len - window) {
         let gc_ok = (n_c + n_g) as f64 > ISLAND_MIN_GC * window_f;
         // observed/expected = n_cg / (n_c * n_g / window) > threshold, written
@@ -551,11 +549,12 @@ fn island_mask(seq: &[u8]) -> BitVec {
             && n_g > 0
             && (n_cg as f64) * window_f > ISLAND_MIN_OE_RATIO * (n_c as f64) * (n_g as f64);
         if gc_ok && oe_ok {
-            let start = painted_end.max(a);
-            for p in start..(a + window) {
-                mask.set(p, true);
+            #[expect(clippy::cast_possible_truncation, reason = "positions fit u32")]
+            let (start, end) = (a as u32, (a + window) as u32);
+            match runs.last_mut() {
+                Some(last) if start <= last.1 => last.1 = end,
+                _ => runs.push((start, end)),
             }
-            painted_end = a + window;
         }
         // Slide to the window starting at `a + 1`, covering [a+1, a+window+1).
         if a < len - window {
@@ -567,61 +566,26 @@ fn island_mask(seq: &[u8]) -> BitVec {
             n_cg = n_cg + usize::from(is_cg(s + window - 2)) - usize::from(is_cg(s - 1));
         }
     }
-    mask
-}
-
-/// Contiguous `[start, end)` runs of `true` bits in an island mask, ascending.
-fn island_runs(mask: &BitVec) -> Vec<(u32, u32)> {
-    let mut runs = Vec::new();
-    let mut start: Option<usize> = None;
-    for i in 0..mask.len() {
-        if mask[i] {
-            start.get_or_insert(i);
-        } else if let Some(s) = start.take() {
-            #[expect(clippy::cast_possible_truncation, reason = "positions fit u32")]
-            runs.push((s as u32, i as u32));
-        }
-    }
-    if let Some(s) = start {
-        #[expect(clippy::cast_possible_truncation, reason = "positions fit u32")]
-        runs.push((s as u32, mask.len() as u32));
-    }
     runs
 }
 
-/// Whether `c` is within [`SHORE_WIDTH_BP`] (inclusive) of any island run, but
-/// not inside one — callers test the mask for `Island` first. `runs` are
-/// ascending and disjoint, so only the run immediately left and right of `c`
-/// can be the nearest.
-fn near_island(c: u32, runs: &[(u32, u32)]) -> bool {
-    // First run whose start is strictly greater than `c` (the right neighbor).
-    let idx = runs.partition_point(|&(s, _)| s <= c);
-    if let Some(&(rs, _)) = runs.get(idx)
-        && rs - c <= SHORE_WIDTH_BP
-    {
-        return true;
-    }
-    if idx > 0 {
-        let (_, re) = runs[idx - 1];
-        // `re` is exclusive; the last island base is `re - 1`. `c >= re` here
-        // (otherwise `c` would be inside the run → classified Island already).
-        if c >= re && c - (re - 1) <= SHORE_WIDTH_BP {
-            return true;
-        }
-    }
-    false
-}
-
 /// Classify each CpG (given its top-strand C position) as island / shore /
-/// open-sea using the island `mask` produced by [`island_mask`].
-fn classify_cpg_contexts(cpg_top_c: &[u32], mask: &BitVec) -> Vec<CpgContext> {
-    let runs = island_runs(mask);
+/// open-sea relative to the island `runs` produced by [`island_runs`]: inside
+/// a run is an island, within [`SHORE_WIDTH_BP`] of one is a shore.
+fn classify_cpg_contexts(cpg_top_c: &[u32], runs: &[(u32, u32)]) -> Vec<CpgContext> {
     cpg_top_c
         .iter()
         .map(|&c| {
-            if mask.get(c as usize).is_some_and(|b| *b) {
+            // Runs are ascending and disjoint, so only the last run starting at
+            // or before `c` and the first run starting after it can be nearest.
+            let next = runs.partition_point(|&(start, _)| start <= c);
+            let previous_end = next.checked_sub(1).map(|i| runs[i].1);
+            if previous_end.is_some_and(|end| c < end) {
                 CpgContext::Island
-            } else if near_island(c, &runs) {
+            } else if runs.get(next).is_some_and(|&(start, _)| start - c <= SHORE_WIDTH_BP)
+                // `end` is exclusive; the last island base is `end - 1`.
+                || previous_end.is_some_and(|end| c - (end - 1) <= SHORE_WIDTH_BP)
+            {
                 CpgContext::Shore
             } else {
                 CpgContext::OpenSea
@@ -1363,24 +1327,39 @@ mod tests {
     // --- CpG-island detector tests ---
 
     #[test]
-    fn test_island_mask_detects_gc_cpg_dense_block() {
+    fn test_island_runs_cover_a_gc_cpg_dense_block() {
         // 300 bp "CG" island flanked by AT-rich sequence.
         let mut seq = b"AT".repeat(400); // 800 bp AT
         let island_start = seq.len();
         seq.extend_from_slice(&b"CG".repeat(150)); // 300 bp island
         let island_end = seq.len();
         seq.extend_from_slice(&b"AT".repeat(400));
-        let mask = island_mask(&seq);
-        // Interior of the CG block is island; AT flanks are not.
-        assert!(mask[island_start + 150], "CG-dense interior should be island");
-        assert!(!mask[10], "AT-rich flank should not be island");
-        assert!(!mask[island_end + 400], "far AT flank should not be island");
+        let runs = island_runs(&seq);
+        // One run, containing the interior of the CG block and stopping short
+        // of the far ends of the AT flanks.
+        assert_eq!(runs.len(), 1);
+        let (start, end) = (runs[0].0 as usize, runs[0].1 as usize);
+        assert!(start <= island_start + 150 && island_start + 150 < end);
+        assert!(start > 10, "AT-rich flank should not be island");
+        assert!(end <= island_end + 400, "far AT flank should not be island");
     }
 
     #[test]
-    fn test_island_mask_none_in_at_rich_or_short() {
-        assert!(island_mask(&b"AT".repeat(500)).not_any(), "AT-rich → no island");
-        assert!(island_mask(b"CGCGCG").not_any(), "sub-window sequence → no island");
+    fn test_island_runs_merge_overlapping_windows_and_keep_distant_ones_apart() {
+        // Two 300 bp CG blocks separated by 1 kb of AT: every qualifying window
+        // within a block merges into one run, and the blocks stay separate.
+        let mut seq = b"CG".repeat(150);
+        seq.extend_from_slice(&b"AT".repeat(500));
+        seq.extend_from_slice(&b"CG".repeat(150));
+        let runs = island_runs(&seq);
+        assert_eq!(runs.len(), 2);
+        assert!(runs[0].1 < runs[1].0);
+    }
+
+    #[test]
+    fn test_island_runs_none_in_at_rich_or_short() {
+        assert!(island_runs(&b"AT".repeat(500)).is_empty(), "AT-rich → no island");
+        assert!(island_runs(b"CGCGCG").is_empty(), "sub-window sequence → no island");
     }
 
     #[test]
@@ -1390,8 +1369,7 @@ mod tests {
         let island_end = seq.len();
         seq.extend_from_slice(&b"AATTCGAATT".repeat(1000)); // CpGs every 10 bp out to ~10 kb
         let cpgs = find_reference_cpgs(&seq);
-        let mask = island_mask(&seq);
-        let contexts = classify_cpg_contexts(&cpgs, &mask);
+        let contexts = classify_cpg_contexts(&cpgs, &island_runs(&seq));
         // First CpG (inside island) is Island.
         assert_eq!(contexts[0], CpgContext::Island);
         // A CpG ~1 kb past the island is Shore; one ~5 kb past is OpenSea.
