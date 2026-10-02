@@ -263,43 +263,20 @@ impl MethylationTable {
         model: &MethylationModel,
         rng: &mut impl Rng,
     ) -> Self {
-        assert!(model.validate().is_ok(), "invalid MethylationModel: {model:?}");
-        // Materialize the entire haplotype as one large fragment. The cap
-        // passed to `extract_fragment` is BOTH a pre-allocation hint AND a
-        // truncation limit on the output base count, so it must be large
-        // enough to hold the full materialized haplotype — including all
-        // net-positive insertions. Using a tighter cap (e.g.
-        // `reference.len() + 1`) silently drops haplotype suffix bases when
-        // the haplotype contains insertions adding more than one base, which
-        // can lose CpG sites entirely.
-        //
-        // `hap_position_for(reference.len())` returns the haplotype-coordinate
-        // length of the materialized haplotype (sum of `(alt_len - ref_len)`
-        // across all variants whose `var_end <= reference.len()`, plus
-        // `reference.len()` itself), giving the exact required capacity for
-        // sane VCFs whose variants do not extend past the chromosome end.
-        #[expect(clippy::cast_possible_truncation, reason = "reference length fits in u32")]
-        let cap = haplotype.hap_position_for(reference.len() as u32) as usize;
-        let (hap_bases, _ref_positions, _hap_start) = haplotype.extract_fragment(reference, 0, cap);
-        let len = hap_bases.len();
-        let mut table = Self::with_len(len);
-        if len < 2 {
-            return table;
-        }
+        let sequence = haplotype.sequence(reference);
+        Self::draw(sequence.len(), &CpgSites::find(&sequence), model, rng)
+    }
 
-        // CpG list (top-strand C positions) on this haplotype's sequence, then
-        // per-CpG context from the same materialized bases so variant-created
-        // / -destroyed CpGs and indel shifts are handled in haplotype coords.
-        let cpg_top_c = find_reference_cpgs(&hap_bases);
-        if cpg_top_c.is_empty() {
-            return table;
-        }
-        let contexts = classify_cpg_contexts(&cpg_top_c, &island_runs(&hap_bases));
+    /// Draw the methylation state of every CpG in `sites` for a haplotype of
+    /// `len` bases, as described on [`Self::from_haplotype`].
+    fn draw(len: usize, sites: &CpgSites, model: &MethylationModel, rng: &mut impl Rng) -> Self {
+        assert!(model.validate().is_ok(), "invalid MethylationModel: {model:?}");
+        let mut table = Self::with_len(len);
 
         let mut prev_state: Option<bool> = None;
         let mut prev_pos: u32 = 0;
-        for (k, &c) in cpg_top_c.iter().enumerate() {
-            let params = model.params_for(contexts[k]);
+        for (&c, &context) in sites.positions.iter().zip(&sites.contexts) {
+            let params = model.params_for(context);
             let state = match prev_state {
                 None => rng.random::<f64>() < params.rate,
                 Some(prev) => {
@@ -390,9 +367,19 @@ impl ContigMethylation {
         model: &MethylationModel,
         rng: &mut impl Rng,
     ) -> Self {
+        // Haplotypes without variants all have the reference's CpGs, so those
+        // are found once and shared; only the draw differs per haplotype.
+        let mut reference_sites: Option<CpgSites> = None;
         let per_haplotype = haplotypes
             .iter()
-            .map(|hap| MethylationTable::from_haplotype(hap, reference, model, rng))
+            .map(|hap| {
+                if hap.is_reference() {
+                    let sites = reference_sites.get_or_insert_with(|| CpgSites::find(reference));
+                    MethylationTable::draw(reference.len(), sites, model, rng)
+                } else {
+                    MethylationTable::from_haplotype(hap, reference, model, rng)
+                }
+            })
             .collect();
         Self { per_haplotype }
     }
@@ -483,6 +470,25 @@ pub struct MethylationConfig<'a> {
     /// which is a deliberate consequence of pinning the failed rate to
     /// `1.0 - conversion_rate`, not a special case.
     pub failure_rate: f64,
+}
+
+/// The CpGs of one haplotype sequence.
+struct CpgSites {
+    /// Position of each CpG's top-strand C, ascending.
+    positions: Vec<u32>,
+    /// Island / shore / open-sea context of each CpG in `positions`.
+    contexts: Vec<CpgContext>,
+}
+
+impl CpgSites {
+    /// Finds the CpGs in `sequence` and classifies each one's context from the
+    /// same bases, so CpGs created or destroyed by variants, and positions
+    /// shifted by indels, are handled in haplotype coordinates.
+    fn find(sequence: &[u8]) -> Self {
+        let positions = find_reference_cpgs(sequence);
+        let contexts = classify_cpg_contexts(&positions, &island_runs(sequence));
+        Self { positions, contexts }
+    }
 }
 
 /// Positions of the `C` of every `CG` dinucleotide in `seq`, ascending.

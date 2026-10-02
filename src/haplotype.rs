@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+
 use coitrees::{COITree, Interval, IntervalTree};
 
 use crate::vcf::genotype::VariantRecord;
@@ -48,6 +50,27 @@ impl Haplotype {
     #[must_use]
     pub fn allele_index(&self) -> usize {
         self.allele_index
+    }
+
+    /// Whether this haplotype carries no variants, i.e. its sequence is the
+    /// reference.
+    #[must_use]
+    pub fn is_reference(&self) -> bool {
+        self.variant_data.is_empty()
+    }
+
+    /// The whole haplotype sequence for the contig whose reference sequence is
+    /// `reference`. Borrows `reference` when the haplotype carries no variants.
+    #[must_use]
+    pub fn sequence<'a>(&self, reference: &'a [u8]) -> Cow<'a, [u8]> {
+        if self.is_reference() {
+            return Cow::Borrowed(reference);
+        }
+        // The fragment length passed to `extract_fragment` truncates its
+        // output, so it must be the full haplotype length, insertions included.
+        #[expect(clippy::cast_possible_truncation, reason = "reference length fits in u32")]
+        let len = self.hap_position_for(reference.len() as u32) as usize;
+        Cow::Owned(self.extract_fragment(reference, 0, len).0)
     }
 
     /// Extract a fragment from this haplotype at the given reference
