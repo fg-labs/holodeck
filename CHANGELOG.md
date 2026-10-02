@@ -14,11 +14,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   contain a `CG` about every 16 bases, and each of these was written as a CpG
   record; on hs38DH they were 26% of all records. A `CG` now counts as a CpG
   only when both bases are real reference or variant bases. The same rule
-  applies to `simulate`'s CpG truth bedGraph. Whole-genome `methylate` on hs38DH
-  is about 1.7× faster (87 s to 52 s) and its outputs are about a quarter
-  smaller. For a given `--seed`, methylation values differ from earlier versions
-  on any reference that contains ambiguity codes; VCFs written by earlier
-  versions are still read.
+  applies to `simulate`'s CpG truth bedGraph. For a given `--seed`, methylation
+  values differ from earlier versions on any reference that contains ambiguity
+  codes; VCFs written by earlier versions are still read.
+- `methylate` is faster and, without an input VCF, uses less memory. On hs38DH,
+  single-threaded: 87 s to 24 s and 2.1 GB to 0.6 GB without a VCF; 126 s to
+  49 s with a 3.5-million-variant VCF. Part of this comes from the change
+  above; the rest leaves the output unchanged.
 - Lowercase alleles in an input VCF are now uppercased when read, so they are
   treated as real bases and not as ambiguous reference positions.
 
