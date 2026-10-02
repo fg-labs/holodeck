@@ -164,10 +164,16 @@ impl Haplotype {
         let hap_start = self.hap_position_for(ref_pos as u32);
 
         while bases.len() < fragment_len && ref_pos < reference.len() {
+            // Reference bases run up to the next variant start, the end of the
+            // fragment, or the end of the contig, whichever comes first.
+            let mut run_end = reference.len().min(ref_pos + (fragment_len - bases.len()));
+
             // Check if the current reference position is a variant start.
             if var_idx < overlapping_indices.len() {
                 let var = &self.variant_data[overlapping_indices[var_idx] as usize];
-                if var.ref_pos as usize == ref_pos {
+                if var.ref_pos as usize > ref_pos {
+                    run_end = run_end.min(var.ref_pos as usize);
+                } else if var.ref_pos as usize == ref_pos {
                     // Emit alt allele bases.
                     for &b in &var.alt_bases {
                         if bases.len() >= fragment_len {
@@ -187,11 +193,11 @@ impl Haplotype {
                 }
             }
 
-            // Emit reference base.
-            bases.push(reference[ref_pos]);
+            // Emit the run of reference bases.
+            bases.extend_from_slice(&reference[ref_pos..run_end]);
             #[expect(clippy::cast_possible_truncation, reason = "ref positions fit in u32")]
-            ref_positions.push(ref_pos as u32);
-            ref_pos += 1;
+            ref_positions.extend(ref_pos as u32..run_end as u32);
+            ref_pos = run_end;
         }
 
         // Truncate to exact fragment length (alt alleles may have added extra).
