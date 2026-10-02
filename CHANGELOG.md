@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `methylate --vcf` no longer slows down in proportion to the number of
+  variants on a contig. Each CpG's variant lookup scanned every variant on the
+  contig; it now takes constant time, so run time is close to that of
+  `methylate` without a VCF (on human chr22 with 42,000 variants, 87 s before
+  and under 3 s after). Output is unchanged.
 - `simulate` and `methylate` now tolerate VCFs that redeclare a header ID
   (e.g. `duplicate INFO ID: BREAKSIMLENGTH`). Such duplicates are common in
   files from upstream tools and are accepted by bcftools; holodeck drops the
