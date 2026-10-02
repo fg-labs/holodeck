@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+
 use coitrees::{COITree, Interval, IntervalTree};
 
 use crate::vcf::genotype::VariantRecord;
@@ -48,6 +50,27 @@ impl Haplotype {
     #[must_use]
     pub fn allele_index(&self) -> usize {
         self.allele_index
+    }
+
+    /// Whether this haplotype carries no variants, i.e. its sequence is the
+    /// reference.
+    #[must_use]
+    pub fn is_reference(&self) -> bool {
+        self.variant_data.is_empty()
+    }
+
+    /// The whole haplotype sequence for the contig whose reference sequence is
+    /// `reference`. Borrows `reference` when the haplotype carries no variants.
+    #[must_use]
+    pub fn sequence<'a>(&self, reference: &'a [u8]) -> Cow<'a, [u8]> {
+        if self.is_reference() {
+            return Cow::Borrowed(reference);
+        }
+        // The fragment length passed to `extract_fragment` truncates its
+        // output, so it must be the full haplotype length, insertions included.
+        #[expect(clippy::cast_possible_truncation, reason = "reference length fits in u32")]
+        let len = self.hap_position_for(reference.len() as u32) as usize;
+        Cow::Owned(self.extract_fragment(reference, 0, len).0)
     }
 
     /// Extract a fragment from this haplotype at the given reference
@@ -141,10 +164,16 @@ impl Haplotype {
         let hap_start = self.hap_position_for(ref_pos as u32);
 
         while bases.len() < fragment_len && ref_pos < reference.len() {
+            // Reference bases run up to the next variant start, the end of the
+            // fragment, or the end of the contig, whichever comes first.
+            let mut run_end = reference.len().min(ref_pos + (fragment_len - bases.len()));
+
             // Check if the current reference position is a variant start.
             if var_idx < overlapping_indices.len() {
                 let var = &self.variant_data[overlapping_indices[var_idx] as usize];
-                if var.ref_pos as usize == ref_pos {
+                if var.ref_pos as usize > ref_pos {
+                    run_end = run_end.min(var.ref_pos as usize);
+                } else if var.ref_pos as usize == ref_pos {
                     // Emit alt allele bases.
                     for &b in &var.alt_bases {
                         if bases.len() >= fragment_len {
@@ -164,11 +193,11 @@ impl Haplotype {
                 }
             }
 
-            // Emit reference base.
-            bases.push(reference[ref_pos]);
+            // Emit the run of reference bases.
+            bases.extend_from_slice(&reference[ref_pos..run_end]);
             #[expect(clippy::cast_possible_truncation, reason = "ref positions fit in u32")]
-            ref_positions.push(ref_pos as u32);
-            ref_pos += 1;
+            ref_positions.extend(ref_pos as u32..run_end as u32);
+            ref_pos = run_end;
         }
 
         // Truncate to exact fragment length (alt alleles may have added extra).
@@ -269,7 +298,10 @@ pub fn build_haplotypes(
                 ref_pos: vr.position,
                 #[expect(clippy::cast_possible_truncation, reason = "ref allele < 4 GB")]
                 ref_len: vr.ref_allele.len() as u32,
-                alt_bases: alt_bases.to_vec(),
+                // Uppercased because a lowercase base in a haplotype means one
+                // synthesized from a reference ambiguity code (see
+                // `Fasta::load_contig`), which a VCF allele is not.
+                alt_bases: alt_bases.to_ascii_uppercase(),
             };
 
             let target_hap = hap_permutation[allele_idx];
@@ -412,6 +444,37 @@ mod tests {
 
         let (bases, _, _) = haps[1].extract_fragment(reference, 0, 8);
         assert_eq!(&bases, b"ACGTATAC");
+    }
+
+    #[test]
+    fn test_lowercase_alt_allele_is_uppercased_in_the_haplotype() {
+        let reference = b"AAAAAAAA";
+        let variants = vec![snp(3, b'A', b't', "1|1")];
+        let haps = build_haplotypes(&variants, 2, &mut rand::rng());
+        assert_eq!(haps[0].sequence(reference).as_ref(), b"AAATAAAA");
+    }
+
+    #[test]
+    fn test_sequence_borrows_the_reference_without_variants() {
+        let reference = b"ACGTACGT";
+        let haps = build_haplotypes(&[], 2, &mut rand::rng());
+        assert!(haps[0].is_reference());
+        assert!(matches!(haps[0].sequence(reference), Cow::Borrowed(_)));
+    }
+
+    #[test]
+    fn test_sequence_includes_bases_added_by_insertions() {
+        // A 3-base insertion makes the haplotype longer than the reference.
+        let reference = b"AAAAAAAA";
+        let variants = vec![VariantRecord {
+            position: 3,
+            ref_allele: b"A".to_vec(),
+            alt_alleles: vec![b"ACGT".to_vec()],
+            genotype: Genotype::parse("1|1").unwrap(),
+        }];
+        let haps = build_haplotypes(&variants, 2, &mut rand::rng());
+        assert!(!haps[0].is_reference());
+        assert_eq!(haps[0].sequence(reference).as_ref(), b"AAAACGTAAAA");
     }
 
     #[test]

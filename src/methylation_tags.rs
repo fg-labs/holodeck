@@ -79,6 +79,10 @@ impl CpgContext {
 /// is not enough flanking reference to classify (e.g. the C is the last
 /// base of the contig).
 ///
+/// Only uppercase bases match: a lowercase reference base was synthesized
+/// from an ambiguity code (see [`crate::fasta::Fasta::load_contig`]), so it is
+/// neither a cytosine nor part of a CpG, matching [`crate::meth::cpg_positions`].
+///
 /// On the top strand, a cytosine is the literal base `C` and context
 /// reads forward (`ref[i+1]`, `ref[i+2]`).
 ///
@@ -92,35 +96,35 @@ impl CpgContext {
 fn classify_context(ref_bytes: &[u8], ref_idx: usize, is_top_strand: bool) -> Option<CpgContext> {
     if is_top_strand {
         let here = ref_bytes.get(ref_idx)?;
-        if !here.eq_ignore_ascii_case(&b'C') {
+        if *here != b'C' {
             return None;
         }
         let next1 = *ref_bytes.get(ref_idx + 1)?;
-        if next1.eq_ignore_ascii_case(&b'G') {
+        if next1 == b'G' {
             return Some(CpgContext::Cpg);
         }
         let next2 = *ref_bytes.get(ref_idx + 2)?;
-        if next2.eq_ignore_ascii_case(&b'G') {
+        if next2 == b'G' {
             return Some(CpgContext::Chg);
         }
         Some(CpgContext::Chh)
     } else {
         let here = ref_bytes.get(ref_idx)?;
-        if !here.eq_ignore_ascii_case(&b'G') {
+        if *here != b'G' {
             return None;
         }
         if ref_idx == 0 {
             return None;
         }
         let prev1 = ref_bytes[ref_idx - 1];
-        if prev1.eq_ignore_ascii_case(&b'C') {
+        if prev1 == b'C' {
             return Some(CpgContext::Cpg);
         }
         if ref_idx < 2 {
             return None;
         }
         let prev2 = ref_bytes[ref_idx - 2];
-        if prev2.eq_ignore_ascii_case(&b'C') {
+        if prev2 == b'C' {
             return Some(CpgContext::Chg);
         }
         Some(CpgContext::Chh)
@@ -470,6 +474,16 @@ mod tests {
     fn test_classify_context_top_chh() {
         // CAA: 'C' at 0, 'A' at 1, 'A' at 2 → CHH.
         assert_eq!(classify_context(b"CAA", 0, true), Some(CpgContext::Chh));
+    }
+
+    #[test]
+    fn test_classify_context_ignores_lowercase_bases() {
+        // A lowercase base is synthesized, so it is not a cytosine and does
+        // not complete a CpG on either strand.
+        assert_eq!(classify_context(b"AcGT", 1, true), None);
+        assert_eq!(classify_context(b"ACgT", 1, true), Some(CpgContext::Chh));
+        assert_eq!(classify_context(b"ACgT", 2, false), None);
+        assert_eq!(classify_context(b"AcGT", 2, false), Some(CpgContext::Chh));
     }
 
     #[test]

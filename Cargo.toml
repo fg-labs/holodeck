@@ -38,6 +38,7 @@ chrono = "0.4"
 # Vec<bool> would cost 8x the memory at whole-chromosome scale. See
 # MethylationTable in src/meth.rs.
 bitvec = "1"
+memchr = "2"
 
 [dev-dependencies]
 tempfile = "3"

@@ -175,13 +175,7 @@ fn classify_cpgs_with_haplotypes(
 
         // Scan materialized haplotype for CpG dinucleotides.
         let mut alt_spans = AltSpanCursor::new(&var_hap_ranges);
-        for h in 0..len - 1 {
-            let c0 = hap_bases[h].to_ascii_uppercase();
-            let c1 = hap_bases[h + 1].to_ascii_uppercase();
-            if c0 != b'C' || c1 != b'G' {
-                continue;
-            }
-
+        for h in crate::meth::cpg_positions(&hap_bases) {
             // Cast the loop index to u32 once. Haplotype lengths are bounded
             // by reference length + net indel size, both of which fit in u32.
             #[expect(clippy::cast_possible_truncation, reason = "haplotype length fits in u32")]
@@ -721,13 +715,7 @@ fn per_variant_per_hap_cpg_offsets_with_haplotypes(
         // Scan for CpG dinucleotides and assign them to the owning variant
         // using the same upstream-wins rule as classify_cpgs.
         let mut alt_spans = AltSpanCursor::new(&var_hap_ranges);
-        for h in 0..len - 1 {
-            let c0 = hap_bases[h].to_ascii_uppercase();
-            let c1 = hap_bases[h + 1].to_ascii_uppercase();
-            if c0 != b'C' || c1 != b'G' {
-                continue;
-            }
-
+        for h in crate::meth::cpg_positions(&hap_bases) {
             #[expect(clippy::cast_possible_truncation, reason = "haplotype length fits in u32")]
             let hpos = h as u32;
 

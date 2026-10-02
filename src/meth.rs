@@ -263,44 +263,20 @@ impl MethylationTable {
         model: &MethylationModel,
         rng: &mut impl Rng,
     ) -> Self {
-        assert!(model.validate().is_ok(), "invalid MethylationModel: {model:?}");
-        // Materialize the entire haplotype as one large fragment. The cap
-        // passed to `extract_fragment` is BOTH a pre-allocation hint AND a
-        // truncation limit on the output base count, so it must be large
-        // enough to hold the full materialized haplotype — including all
-        // net-positive insertions. Using a tighter cap (e.g.
-        // `reference.len() + 1`) silently drops haplotype suffix bases when
-        // the haplotype contains insertions adding more than one base, which
-        // can lose CpG sites entirely.
-        //
-        // `hap_position_for(reference.len())` returns the haplotype-coordinate
-        // length of the materialized haplotype (sum of `(alt_len - ref_len)`
-        // across all variants whose `var_end <= reference.len()`, plus
-        // `reference.len()` itself), giving the exact required capacity for
-        // sane VCFs whose variants do not extend past the chromosome end.
-        #[expect(clippy::cast_possible_truncation, reason = "reference length fits in u32")]
-        let cap = haplotype.hap_position_for(reference.len() as u32) as usize;
-        let (hap_bases, _ref_positions, _hap_start) = haplotype.extract_fragment(reference, 0, cap);
-        let len = hap_bases.len();
-        let mut table = Self::with_len(len);
-        if len < 2 {
-            return table;
-        }
+        let sequence = haplotype.sequence(reference);
+        Self::draw(sequence.len(), &CpgSites::find(&sequence), model, rng)
+    }
 
-        // CpG list (top-strand C positions) on this haplotype's sequence, then
-        // per-CpG context from the same materialized bases so variant-created
-        // / -destroyed CpGs and indel shifts are handled in haplotype coords.
-        let cpg_top_c = find_reference_cpgs(&hap_bases);
-        if cpg_top_c.is_empty() {
-            return table;
-        }
-        let island = island_mask(&hap_bases);
-        let contexts = classify_cpg_contexts(&cpg_top_c, &island);
+    /// Draw the methylation state of every CpG in `sites` for a haplotype of
+    /// `len` bases, as described on [`Self::from_haplotype`].
+    fn draw(len: usize, sites: &CpgSites, model: &MethylationModel, rng: &mut impl Rng) -> Self {
+        assert!(model.validate().is_ok(), "invalid MethylationModel: {model:?}");
+        let mut table = Self::with_len(len);
 
         let mut prev_state: Option<bool> = None;
         let mut prev_pos: u32 = 0;
-        for (k, &c) in cpg_top_c.iter().enumerate() {
-            let params = model.params_for(contexts[k]);
+        for (&c, &context) in sites.positions.iter().zip(&sites.contexts) {
+            let params = model.params_for(context);
             let state = match prev_state {
                 None => rng.random::<f64>() < params.rate,
                 Some(prev) => {
@@ -391,9 +367,19 @@ impl ContigMethylation {
         model: &MethylationModel,
         rng: &mut impl Rng,
     ) -> Self {
+        // Haplotypes without variants all have the reference's CpGs, so those
+        // are found once and shared; only the draw differs per haplotype.
+        let mut reference_sites: Option<CpgSites> = None;
         let per_haplotype = haplotypes
             .iter()
-            .map(|hap| MethylationTable::from_haplotype(hap, reference, model, rng))
+            .map(|hap| {
+                if hap.is_reference() {
+                    let sites = reference_sites.get_or_insert_with(|| CpgSites::find(reference));
+                    MethylationTable::draw(reference.len(), sites, model, rng)
+                } else {
+                    MethylationTable::from_haplotype(hap, reference, model, rng)
+                }
+            })
             .collect();
         Self { per_haplotype }
     }
@@ -486,53 +472,71 @@ pub struct MethylationConfig<'a> {
     pub failure_rate: f64,
 }
 
+/// The CpGs of one haplotype sequence.
+struct CpgSites {
+    /// Position of each CpG's top-strand C, ascending.
+    positions: Vec<u32>,
+    /// Island / shore / open-sea context of each CpG in `positions`.
+    contexts: Vec<CpgContext>,
+}
+
+impl CpgSites {
+    /// Finds the CpGs in `sequence` and classifies each one's context from the
+    /// same bases, so CpGs created or destroyed by variants, and positions
+    /// shifted by indels, are handled in haplotype coordinates.
+    fn find(sequence: &[u8]) -> Self {
+        let positions = find_reference_cpgs(sequence);
+        let contexts = classify_cpg_contexts(&positions, &island_runs(sequence));
+        Self { positions, contexts }
+    }
+}
+
+/// Positions of the `C` of every `CG` dinucleotide in `seq`, ascending.
+///
+/// Only uppercase `CG` matches. A lowercase base is one that
+/// [`crate::fasta::Fasta::load_contig`] synthesized from an `N` or other
+/// ambiguity code, so a dinucleotide containing one is not a CpG of the real
+/// sequence and gets no methylation state.
+pub(crate) fn cpg_positions(seq: &[u8]) -> impl Iterator<Item = usize> + '_ {
+    memchr::memmem::find_iter(seq, b"CG")
+}
+
 /// Reference CpG positions: the 0-based position of the top-strand `C` in
-/// each `CG` dinucleotide (case-insensitive), returned in ascending order.
+/// each `CG` dinucleotide found by [`cpg_positions`], in ascending order.
 ///
 /// Shared by the CpG-truth tally ([`crate::output::cpg_truth`]) and the
 /// MT/MB classifier ([`crate::vcf::methylation`]); both need the identical
 /// scan over an unmodified reference.
 #[must_use]
 pub(crate) fn find_reference_cpgs(reference: &[u8]) -> Vec<u32> {
-    let mut out = Vec::new();
-    if reference.len() < 2 {
-        return out;
-    }
-    for i in 0..reference.len() - 1 {
-        let c0 = reference[i].to_ascii_uppercase();
-        let c1 = reference[i + 1].to_ascii_uppercase();
-        if c0 == b'C' && c1 == b'G' {
-            #[expect(clippy::cast_possible_truncation, reason = "ref position fits u32")]
-            out.push(i as u32);
-        }
-    }
-    out
+    #[expect(clippy::cast_possible_truncation, reason = "ref position fits u32")]
+    cpg_positions(reference).map(|i| i as u32).collect()
 }
 
-/// Per-base CpG-island mask: `mask[p]` is `true` iff position `p` lies in a
-/// window that satisfies the Gardiner-Garden island criteria
-/// ([`ISLAND_MIN_WINDOW_BP`]-bp window with GC fraction > [`ISLAND_MIN_GC`]
-/// and observed/expected CpG ratio > [`ISLAND_MIN_OE_RATIO`]).
+/// CpG islands in `seq`, as ascending, disjoint `[start, end)` runs.
 ///
-/// `O(len)`: a single rolling window maintains C, G, and CpG counts, and
-/// qualifying windows are painted into the mask with a monotone cursor so each
-/// base is written at most once. Case-insensitive; non-`ACGT` bases count as
-/// neither GC nor CpG. Sequences shorter than the window yield an all-`false`
-/// mask (no island can be called).
+/// A base is in an island iff it lies in some [`ISLAND_MIN_WINDOW_BP`]-bp
+/// window that satisfies the Gardiner-Garden criteria (GC fraction >
+/// [`ISLAND_MIN_GC`] and observed/expected CpG ratio > [`ISLAND_MIN_OE_RATIO`]),
+/// so each run is the union of overlapping or abutting qualifying windows.
+///
+/// `O(len)`: a single rolling window maintains C, G, and CpG counts. Only
+/// uppercase `C` and `G` count (see [`cpg_positions`]); every other byte is
+/// neither GC nor CpG. Sequences shorter than the window have no islands.
 #[expect(
     clippy::similar_names,
     reason = "is_c/is_g and n_c/n_g/n_cg mirror the C/G/CpG quantities they track"
 )]
-fn island_mask(seq: &[u8]) -> BitVec {
+fn island_runs(seq: &[u8]) -> Vec<(u32, u32)> {
     let len = seq.len();
     let window = ISLAND_MIN_WINDOW_BP;
-    let mut mask = BitVec::repeat(false, len);
+    let mut runs: Vec<(u32, u32)> = Vec::new();
     if len < window {
-        return mask;
+        return runs;
     }
 
-    let is_c = |j: usize| seq[j].eq_ignore_ascii_case(&b'C');
-    let is_g = |j: usize| seq[j].eq_ignore_ascii_case(&b'G');
+    let is_c = |j: usize| seq[j] == b'C';
+    let is_g = |j: usize| seq[j] == b'G';
     // A CpG occupies `j` and `j + 1`; both must exist.
     let is_cg = |j: usize| j + 1 < len && is_c(j) && is_g(j + 1);
 
@@ -543,7 +547,6 @@ fn island_mask(seq: &[u8]) -> BitVec {
     let mut n_cg = (0..window - 1).filter(|&j| is_cg(j)).count();
 
     let window_f = window as f64;
-    let mut painted_end = 0usize;
     for a in 0..=(len - window) {
         let gc_ok = (n_c + n_g) as f64 > ISLAND_MIN_GC * window_f;
         // observed/expected = n_cg / (n_c * n_g / window) > threshold, written
@@ -552,11 +555,12 @@ fn island_mask(seq: &[u8]) -> BitVec {
             && n_g > 0
             && (n_cg as f64) * window_f > ISLAND_MIN_OE_RATIO * (n_c as f64) * (n_g as f64);
         if gc_ok && oe_ok {
-            let start = painted_end.max(a);
-            for p in start..(a + window) {
-                mask.set(p, true);
+            #[expect(clippy::cast_possible_truncation, reason = "positions fit u32")]
+            let (start, end) = (a as u32, (a + window) as u32);
+            match runs.last_mut() {
+                Some(last) if start <= last.1 => last.1 = end,
+                _ => runs.push((start, end)),
             }
-            painted_end = a + window;
         }
         // Slide to the window starting at `a + 1`, covering [a+1, a+window+1).
         if a < len - window {
@@ -568,61 +572,26 @@ fn island_mask(seq: &[u8]) -> BitVec {
             n_cg = n_cg + usize::from(is_cg(s + window - 2)) - usize::from(is_cg(s - 1));
         }
     }
-    mask
-}
-
-/// Contiguous `[start, end)` runs of `true` bits in an island mask, ascending.
-fn island_runs(mask: &BitVec) -> Vec<(u32, u32)> {
-    let mut runs = Vec::new();
-    let mut start: Option<usize> = None;
-    for i in 0..mask.len() {
-        if mask[i] {
-            start.get_or_insert(i);
-        } else if let Some(s) = start.take() {
-            #[expect(clippy::cast_possible_truncation, reason = "positions fit u32")]
-            runs.push((s as u32, i as u32));
-        }
-    }
-    if let Some(s) = start {
-        #[expect(clippy::cast_possible_truncation, reason = "positions fit u32")]
-        runs.push((s as u32, mask.len() as u32));
-    }
     runs
 }
 
-/// Whether `c` is within [`SHORE_WIDTH_BP`] (inclusive) of any island run, but
-/// not inside one — callers test the mask for `Island` first. `runs` are
-/// ascending and disjoint, so only the run immediately left and right of `c`
-/// can be the nearest.
-fn near_island(c: u32, runs: &[(u32, u32)]) -> bool {
-    // First run whose start is strictly greater than `c` (the right neighbor).
-    let idx = runs.partition_point(|&(s, _)| s <= c);
-    if let Some(&(rs, _)) = runs.get(idx)
-        && rs - c <= SHORE_WIDTH_BP
-    {
-        return true;
-    }
-    if idx > 0 {
-        let (_, re) = runs[idx - 1];
-        // `re` is exclusive; the last island base is `re - 1`. `c >= re` here
-        // (otherwise `c` would be inside the run → classified Island already).
-        if c >= re && c - (re - 1) <= SHORE_WIDTH_BP {
-            return true;
-        }
-    }
-    false
-}
-
 /// Classify each CpG (given its top-strand C position) as island / shore /
-/// open-sea using the island `mask` produced by [`island_mask`].
-fn classify_cpg_contexts(cpg_top_c: &[u32], mask: &BitVec) -> Vec<CpgContext> {
-    let runs = island_runs(mask);
+/// open-sea relative to the island `runs` produced by [`island_runs`]: inside
+/// a run is an island, within [`SHORE_WIDTH_BP`] of one is a shore.
+fn classify_cpg_contexts(cpg_top_c: &[u32], runs: &[(u32, u32)]) -> Vec<CpgContext> {
     cpg_top_c
         .iter()
         .map(|&c| {
-            if mask.get(c as usize).is_some_and(|b| *b) {
+            // Runs are ascending and disjoint, so only the last run starting at
+            // or before `c` and the first run starting after it can be nearest.
+            let next = runs.partition_point(|&(start, _)| start <= c);
+            let previous_end = next.checked_sub(1).map(|i| runs[i].1);
+            if previous_end.is_some_and(|end| c < end) {
                 CpgContext::Island
-            } else if near_island(c, &runs) {
+            } else if runs.get(next).is_some_and(|&(start, _)| start - c <= SHORE_WIDTH_BP)
+                // `end` is exclusive; the last island base is `end - 1`.
+                || previous_end.is_some_and(|end| c - (end - 1) <= SHORE_WIDTH_BP)
+            {
                 CpgContext::Shore
             } else {
                 CpgContext::OpenSea
@@ -852,8 +821,10 @@ mod tests {
     }
 
     #[test]
-    fn test_find_reference_cpgs_case_insensitive() {
-        assert_eq!(find_reference_cpgs(b"acgTaCg"), vec![1, 5]);
+    fn test_find_reference_cpgs_skips_dinucleotides_with_a_lowercase_base() {
+        // Lowercase marks a base synthesized from an ambiguity code: `cg`,
+        // `Cg` and `cG` are not CpGs, only the final `CG` is.
+        assert_eq!(find_reference_cpgs(b"AcgTCgTcGTCG"), vec![10]);
     }
 
     #[test]
@@ -1114,17 +1085,18 @@ mod tests {
     }
 
     #[test]
-    fn test_from_haplotype_case_insensitive() {
-        // Lowercase "acgt" should still detect a CpG at (1, 2).
-        let reference = b"acgt";
+    fn test_from_haplotype_ignores_cpgs_with_a_lowercase_base() {
+        // Lowercase bases were synthesized from ambiguity codes, so "cg" is not
+        // a CpG even at a methylation rate of 1.0; the uppercase "CG" is.
+        let reference = b"acgtACGT";
         let hap = ref_haplotype();
         let mut rng = SmallRng::seed_from_u64(42);
         let table =
             MethylationTable::from_haplotype(&hap, reference, &uniform_model(1.0), &mut rng);
-        assert!(table.is_methylated(1, false), "lowercase 'cg' must register top-strand C");
-        assert!(table.is_methylated(2, true), "lowercase 'cg' must register bottom-strand C");
-        assert!(!table.is_methylated(0, false));
-        assert!(!table.is_methylated(3, true));
+        assert!(!table.is_methylated(1, false), "lowercase 'cg' must not be methylated");
+        assert!(!table.is_methylated(2, true), "lowercase 'cg' must not be methylated");
+        assert!(table.is_methylated(5, false), "uppercase 'CG' registers its top-strand C");
+        assert!(table.is_methylated(6, true), "uppercase 'CG' registers its bottom-strand C");
     }
 
     #[test]
@@ -1361,24 +1333,39 @@ mod tests {
     // --- CpG-island detector tests ---
 
     #[test]
-    fn test_island_mask_detects_gc_cpg_dense_block() {
+    fn test_island_runs_cover_a_gc_cpg_dense_block() {
         // 300 bp "CG" island flanked by AT-rich sequence.
         let mut seq = b"AT".repeat(400); // 800 bp AT
         let island_start = seq.len();
         seq.extend_from_slice(&b"CG".repeat(150)); // 300 bp island
         let island_end = seq.len();
         seq.extend_from_slice(&b"AT".repeat(400));
-        let mask = island_mask(&seq);
-        // Interior of the CG block is island; AT flanks are not.
-        assert!(mask[island_start + 150], "CG-dense interior should be island");
-        assert!(!mask[10], "AT-rich flank should not be island");
-        assert!(!mask[island_end + 400], "far AT flank should not be island");
+        let runs = island_runs(&seq);
+        // One run, containing the interior of the CG block and stopping short
+        // of the far ends of the AT flanks.
+        assert_eq!(runs.len(), 1);
+        let (start, end) = (runs[0].0 as usize, runs[0].1 as usize);
+        assert!(start <= island_start + 150 && island_start + 150 < end);
+        assert!(start > 10, "AT-rich flank should not be island");
+        assert!(end <= island_end + 400, "far AT flank should not be island");
     }
 
     #[test]
-    fn test_island_mask_none_in_at_rich_or_short() {
-        assert!(island_mask(&b"AT".repeat(500)).not_any(), "AT-rich → no island");
-        assert!(island_mask(b"CGCGCG").not_any(), "sub-window sequence → no island");
+    fn test_island_runs_merge_overlapping_windows_and_keep_distant_ones_apart() {
+        // Two 300 bp CG blocks separated by 1 kb of AT: every qualifying window
+        // within a block merges into one run, and the blocks stay separate.
+        let mut seq = b"CG".repeat(150);
+        seq.extend_from_slice(&b"AT".repeat(500));
+        seq.extend_from_slice(&b"CG".repeat(150));
+        let runs = island_runs(&seq);
+        assert_eq!(runs.len(), 2);
+        assert!(runs[0].1 < runs[1].0);
+    }
+
+    #[test]
+    fn test_island_runs_none_in_at_rich_or_short() {
+        assert!(island_runs(&b"AT".repeat(500)).is_empty(), "AT-rich → no island");
+        assert!(island_runs(b"CGCGCG").is_empty(), "sub-window sequence → no island");
     }
 
     #[test]
@@ -1388,8 +1375,7 @@ mod tests {
         let island_end = seq.len();
         seq.extend_from_slice(&b"AATTCGAATT".repeat(1000)); // CpGs every 10 bp out to ~10 kb
         let cpgs = find_reference_cpgs(&seq);
-        let mask = island_mask(&seq);
-        let contexts = classify_cpg_contexts(&cpgs, &mask);
+        let contexts = classify_cpg_contexts(&cpgs, &island_runs(&seq));
         // First CpG (inside island) is Island.
         assert_eq!(contexts[0], CpgContext::Island);
         // A CpG ~1 kb past the island is Shore; one ~5 kb past is OpenSea.

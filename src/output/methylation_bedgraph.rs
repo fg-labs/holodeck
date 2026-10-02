@@ -14,7 +14,7 @@ use std::io::Write;
 use anyhow::{Result, ensure};
 
 use crate::haplotype::Haplotype;
-use crate::meth::ContigMethylation;
+use crate::meth::{ContigMethylation, MethylationTable};
 use crate::sequence_dict::SequenceDictionary;
 
 /// Write the `track` header line for a MethylDackel-format population-fraction
@@ -83,114 +83,109 @@ pub fn write_bedgraph_records<W: Write>(
         haplotypes.len(),
         methylation.len(),
     );
-    if reference.len() < 2 {
+    if reference.len() < 2 || methylation.is_empty() {
         return Ok(());
     }
 
-    // Aggregate per reference CpG. `BTreeMap` so emit order is the sorted
-    // top-C reference position, matching MethylDackel's output and the
-    // previous loop's natural order. Each value is `(n_meth, n_unmeth)`.
-    let mut by_ref_pos: std::collections::BTreeMap<u32, (u32, u32)> =
-        std::collections::BTreeMap::new();
+    // With no variants every haplotype is the reference, so haplotype and
+    // reference coordinates coincide and each CpG's counts are complete as soon
+    // as it is found.
+    if haplotypes.iter().all(Haplotype::is_reference) {
+        for top_c in crate::meth::cpg_positions(reference) {
+            #[expect(clippy::cast_possible_truncation, reason = "ref pos fits u32")]
+            let top_c = top_c as u32;
+            let mut counts = CpgCounts { top_c, n_meth: 0, n_unmeth: 0 };
+            for hap_idx in 0..methylation.len() {
+                counts.add(methylation.table_for(hap_idx), top_c);
+            }
+            counts.write(writer, chrom)?;
+        }
+        return Ok(());
+    }
 
-    if haplotypes.is_empty() {
-        // No variants → ref == hap. Walk the reference once.
-        for i in 0..reference.len() - 1 {
-            if !reference[i].eq_ignore_ascii_case(&b'C')
-                || !reference[i + 1].eq_ignore_ascii_case(&b'G')
+    // Variants present → materialize each haplotype, walk its bases looking
+    // for CpGs, and map each one back to a reference position via the per-base
+    // `ref_positions` returned by `extract_fragment`.
+    let mut per_haplotype: Vec<CpgCounts> = Vec::new();
+    for (hap_idx, hap) in haplotypes.iter().enumerate() {
+        #[expect(clippy::cast_possible_truncation, reason = "ref length fits u32")]
+        let hap_len = hap.hap_position_for(reference.len() as u32) as usize;
+        let (hap_bases, ref_positions, _hap_start) = hap.extract_fragment(reference, 0, hap_len);
+        let table = methylation.table_for(hap_idx);
+        for h in crate::meth::cpg_positions(&hap_bases) {
+            // Only count haplotype CpGs that correspond to a true ref CpG at
+            // adjacent ref positions. A CpG formed across an insertion
+            // (`ref_positions[h+1] == ref_positions[h]`) has no reference
+            // coordinate to attribute it to — MethylDackel wouldn't see it
+            // either, and we want output parity.
+            let top_c = ref_positions[h];
+            let bottom_c = ref_positions[h + 1];
+            if bottom_c != top_c + 1
+                || reference.get(top_c as usize) != Some(&b'C')
+                || reference.get(bottom_c as usize) != Some(&b'G')
             {
                 continue;
             }
-            #[expect(clippy::cast_possible_truncation, reason = "ref pos fits u32")]
-            let top_c = i as u32;
-            let entry = by_ref_pos.entry(top_c).or_insert((0, 0));
-            for hap_idx in 0..methylation.len() {
-                let table = methylation.table_for(hap_idx);
-                if table.is_methylated(top_c, false) {
-                    entry.0 += 1;
-                } else {
-                    entry.1 += 1;
-                }
-                if table.is_methylated(top_c + 1, true) {
-                    entry.0 += 1;
-                } else {
-                    entry.1 += 1;
-                }
-            }
+            let mut counts = CpgCounts { top_c, n_meth: 0, n_unmeth: 0 };
+            #[expect(clippy::cast_possible_truncation, reason = "hap pos fits u32")]
+            counts.add(table, h as u32);
+            per_haplotype.push(counts);
         }
-    } else {
-        // Variants present → materialize each haplotype once, walk its
-        // bases looking for CpGs, map each haplotype CpG back to a ref
-        // position via the per-base `ref_positions` returned by
-        // `extract_fragment`. The per-CpG `extract_fragment(..., 2)` call
-        // we used to do per ref CpG × haplotype is gone; this is O(L + V)
-        // per haplotype instead of O(C × log V).
-        for (hap_idx, hap) in haplotypes.iter().enumerate() {
-            #[expect(clippy::cast_possible_truncation, reason = "ref length fits u32")]
-            let hap_len = hap.hap_position_for(reference.len() as u32) as usize;
-            let (hap_bases, ref_positions, _hap_start) =
-                hap.extract_fragment(reference, 0, hap_len);
-            if hap_bases.len() < 2 {
-                continue;
-            }
-            let table = methylation.table_for(hap_idx);
-            for h in 0..hap_bases.len() - 1 {
-                if !hap_bases[h].eq_ignore_ascii_case(&b'C')
-                    || !hap_bases[h + 1].eq_ignore_ascii_case(&b'G')
-                {
-                    continue;
-                }
-                // Only count haplotype CpGs that correspond to a true ref
-                // CpG at adjacent ref positions. A CpG formed across an
-                // insertion (`ref_positions[h+1] == ref_positions[h]`) has
-                // no reference coordinate to attribute it to — MethylDackel
-                // wouldn't see it either, and we want output parity.
-                let ref_top_c = ref_positions[h];
-                let ref_bot_c = ref_positions[h + 1];
-                if ref_bot_c != ref_top_c + 1 {
-                    continue;
-                }
-                let ref_top_idx = ref_top_c as usize;
-                let ref_bot_idx = ref_bot_c as usize;
-                if ref_bot_idx >= reference.len()
-                    || !reference[ref_top_idx].eq_ignore_ascii_case(&b'C')
-                    || !reference[ref_bot_idx].eq_ignore_ascii_case(&b'G')
-                {
-                    continue;
-                }
-                #[expect(clippy::cast_possible_truncation, reason = "hap pos fits u32")]
-                let hap_top = h as u32;
-                let entry = by_ref_pos.entry(ref_top_c).or_insert((0, 0));
-                if table.is_methylated(hap_top, false) {
-                    entry.0 += 1;
-                } else {
-                    entry.1 += 1;
-                }
-                if table.is_methylated(hap_top + 1, true) {
-                    entry.0 += 1;
-                } else {
-                    entry.1 += 1;
-                }
+    }
+
+    // Each haplotype contributed its CpGs in ascending order, and `sort_by_key`
+    // merges such pre-sorted runs in linear time. Afterwards the entries for
+    // one CpG, one per haplotype that has it, are adjacent.
+    per_haplotype.sort_by_key(|counts| counts.top_c);
+    for cpg in per_haplotype.chunk_by(|a, b| a.top_c == b.top_c) {
+        let total = CpgCounts {
+            top_c: cpg[0].top_c,
+            n_meth: cpg.iter().map(|c| c.n_meth).sum(),
+            n_unmeth: cpg.iter().map(|c| c.n_unmeth).sum(),
+        };
+        total.write(writer, chrom)?;
+    }
+    Ok(())
+}
+
+/// Methylated and unmethylated (haplotype × strand) counts at one reference
+/// CpG.
+struct CpgCounts {
+    /// Reference position of the CpG's top-strand C.
+    top_c: u32,
+    n_meth: u32,
+    n_unmeth: u32,
+}
+
+impl CpgCounts {
+    /// Adds both strands of the CpG whose top-strand C is at `hap_top_c` in the
+    /// coordinates of `table`'s haplotype.
+    fn add(&mut self, table: &MethylationTable, hap_top_c: u32) {
+        for is_methylated in
+            [table.is_methylated(hap_top_c, false), table.is_methylated(hap_top_c + 1, true)]
+        {
+            if is_methylated {
+                self.n_meth += 1;
+            } else {
+                self.n_unmeth += 1;
             }
         }
     }
 
-    for (top_c, (n_meth, n_unmeth)) in by_ref_pos {
-        let denom = n_meth + n_unmeth;
-        if denom == 0 {
-            continue;
-        }
+    /// Writes this CpG as one bedGraph record.
+    fn write<W: Write>(&self, writer: &mut W, chrom: &str) -> Result<()> {
+        let Self { top_c, n_meth, n_unmeth } = *self;
         // MethylDackel's `extract` reports the rate as an integer percentage;
         // round to match so this output and `simulate --cpg-truth-bedgraph`
         // (which rounds identically) can be compared by the same downstream
         // tooling.
-        let rate = (f64::from(n_meth) / f64::from(denom) * 100.0).round();
+        let rate = (f64::from(n_meth) / f64::from(n_meth + n_unmeth) * 100.0).round();
         #[expect(clippy::cast_possible_truncation, reason = "rate is in [0, 100]")]
         #[expect(clippy::cast_sign_loss, reason = "rate is non-negative")]
         let rate = rate as u32;
         writeln!(writer, "{chrom}\t{top_c}\t{}\t{rate}\t{n_meth}\t{n_unmeth}", top_c + 1)?;
+        Ok(())
     }
-    Ok(())
 }
 
 /// Write a complete population-fraction bedGraph — header line followed by

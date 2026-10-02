@@ -528,6 +528,44 @@ fn methylate_applies_variants_from_input_vcf() {
     );
 }
 
+#[test]
+fn methylate_emits_no_cpgs_inside_a_run_of_n() {
+    // 40 Ns between two real CpGs. The Ns are resolved to random bases, which
+    // would contain several CG dinucleotides by chance, but only the two real
+    // CpGs (top-C at 0-based 1 and 45) may appear in either output.
+    let mut seq = b"ACGT".to_vec();
+    seq.extend(std::iter::repeat_n(b'N', 40));
+    seq.extend_from_slice(b"ACGT");
+    let env = TestEnv::new(&[("chr1", &seq)]);
+    let vcf = env.dir.path().join("meth.vcf");
+    let bedgraph = env.dir.path().join("meth.bedgraph");
+
+    let (ok, _, stderr) = run_methylate(&[
+        "methylate",
+        "--reference",
+        env.fasta_path.to_str().unwrap(),
+        "--output",
+        vcf.to_str().unwrap(),
+        "--bedgraph",
+        bedgraph.to_str().unwrap(),
+        "--seed",
+        "42",
+    ]);
+    assert!(ok, "methylate failed: {stderr}");
+
+    let vcf_positions: Vec<String> = std::fs::read_to_string(&vcf)
+        .unwrap()
+        .lines()
+        .filter(|l| !l.starts_with('#'))
+        .map(|l| l.split('\t').nth(1).unwrap().to_string())
+        .collect();
+    assert_eq!(vcf_positions, ["2", "46"]);
+
+    let bedgraph_starts: Vec<usize> =
+        parse_bedgraph(&std::fs::read_to_string(&bedgraph).unwrap()).iter().map(|r| r.0).collect();
+    assert_eq!(bedgraph_starts, [1, 45]);
+}
+
 // ── Command runner ───────────────────────────────────────────────────────────
 
 /// Run `holodeck methylate` with the given arguments and return
