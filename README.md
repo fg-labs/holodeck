@@ -154,6 +154,8 @@ Real references contain a mix of `A`/`C`/`G`/`T`, large stretches of `N` (assemb
 
    Set `--max-n-frac 1.0` to disable the filter (accept reads from any region). Set `--max-n-frac 0.0` to require every base in every read to come from an unambiguous reference position.
 
+`methylate` ignores synthesized bases when looking for CpGs: a `CG` that includes a lowercase base is not a CpG, so assembly gaps and other ambiguous positions get no methylation records.
+
 **Known limitation:** requested `--coverage` is computed from raw contig/BED lengths, not from the non-ambiguous territory. For a reference like hs38DH (~5% N), rejection is noise and coverage lands where you'd expect. For simulations targeted at heavily-N contigs (or with `--max-n-frac 0.0` in N-dense regions), effective coverage will be slightly below the requested value; a warning is logged if the resampling budget is exhausted.
 
 ### Golden BAM

@@ -96,13 +96,14 @@ pub fn parse_variants_by_contig(
         #[expect(clippy::cast_possible_truncation, reason = "genomic positions fit in u32")]
         let position = (usize::from(pos_1based) - 1) as u32;
 
-        // Extract alleles.
-        let ref_allele: Vec<u8> = record.reference_bases().as_bytes().to_vec();
+        // Extract alleles, uppercased: downstream, a lowercase base means one
+        // synthesized from a reference ambiguity code (see `Fasta::load_contig`).
+        let ref_allele: Vec<u8> = record.reference_bases().as_bytes().to_ascii_uppercase();
         let alt_alleles: Vec<Vec<u8>> = record
             .alternate_bases()
             .iter()
             .filter_map(Result::ok)
-            .map(|a| a.as_bytes().to_vec())
+            .map(|a| a.as_bytes().to_ascii_uppercase())
             .collect();
 
         // Parse genotype for the selected sample.
@@ -416,6 +417,22 @@ chr2\t20\t.\tA\tG\t.\t.\t.\tGT\t0|1
 
         // Diploid sample → ploidy 2 (resolved from the GTs).
         assert_eq!(parsed.sample_ploidy, 2);
+    }
+
+    #[test]
+    fn parse_variants_by_contig_uppercases_alleles() {
+        let vcf = "\
+##fileformat=VCFv4.4
+##contig=<ID=chr1,length=100>
+##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\">
+#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tSAMPLE
+chr1\t10\t.\ta\tacg\t.\t.\t.\tGT\t0|1
+";
+        let f = write_temp_vcf(vcf);
+        let parsed = parse_variants_by_contig(f.path(), None, &dict_for(&[("chr1", 100)])).unwrap();
+        let variant = &parsed.by_contig["chr1"][0];
+        assert_eq!(variant.ref_allele, b"A");
+        assert_eq!(variant.alt_alleles, vec![b"ACG".to_vec()]);
     }
 
     /// A VCF with no alt-bearing records on a given contig must produce no

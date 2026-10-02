@@ -486,27 +486,26 @@ pub struct MethylationConfig<'a> {
     pub failure_rate: f64,
 }
 
+/// Positions of the `C` of every `CG` dinucleotide in `seq`, ascending.
+///
+/// Only uppercase `CG` matches. A lowercase base is one that
+/// [`crate::fasta::Fasta::load_contig`] synthesized from an `N` or other
+/// ambiguity code, so a dinucleotide containing one is not a CpG of the real
+/// sequence and gets no methylation state.
+pub(crate) fn cpg_positions(seq: &[u8]) -> impl Iterator<Item = usize> + '_ {
+    memchr::memmem::find_iter(seq, b"CG")
+}
+
 /// Reference CpG positions: the 0-based position of the top-strand `C` in
-/// each `CG` dinucleotide (case-insensitive), returned in ascending order.
+/// each `CG` dinucleotide found by [`cpg_positions`], in ascending order.
 ///
 /// Shared by the CpG-truth tally ([`crate::output::cpg_truth`]) and the
 /// MT/MB classifier ([`crate::vcf::methylation`]); both need the identical
 /// scan over an unmodified reference.
 #[must_use]
 pub(crate) fn find_reference_cpgs(reference: &[u8]) -> Vec<u32> {
-    let mut out = Vec::new();
-    if reference.len() < 2 {
-        return out;
-    }
-    for i in 0..reference.len() - 1 {
-        let c0 = reference[i].to_ascii_uppercase();
-        let c1 = reference[i + 1].to_ascii_uppercase();
-        if c0 == b'C' && c1 == b'G' {
-            #[expect(clippy::cast_possible_truncation, reason = "ref position fits u32")]
-            out.push(i as u32);
-        }
-    }
-    out
+    #[expect(clippy::cast_possible_truncation, reason = "ref position fits u32")]
+    cpg_positions(reference).map(|i| i as u32).collect()
 }
 
 /// Per-base CpG-island mask: `mask[p]` is `true` iff position `p` lies in a
@@ -516,8 +515,8 @@ pub(crate) fn find_reference_cpgs(reference: &[u8]) -> Vec<u32> {
 ///
 /// `O(len)`: a single rolling window maintains C, G, and CpG counts, and
 /// qualifying windows are painted into the mask with a monotone cursor so each
-/// base is written at most once. Case-insensitive; non-`ACGT` bases count as
-/// neither GC nor CpG. Sequences shorter than the window yield an all-`false`
+/// base is written at most once. Only uppercase `C` and `G` count (see
+/// [`cpg_positions`]); every other byte is neither GC nor CpG. Sequences shorter than the window yield an all-`false`
 /// mask (no island can be called).
 #[expect(
     clippy::similar_names,
@@ -531,8 +530,8 @@ fn island_mask(seq: &[u8]) -> BitVec {
         return mask;
     }
 
-    let is_c = |j: usize| seq[j].eq_ignore_ascii_case(&b'C');
-    let is_g = |j: usize| seq[j].eq_ignore_ascii_case(&b'G');
+    let is_c = |j: usize| seq[j] == b'C';
+    let is_g = |j: usize| seq[j] == b'G';
     // A CpG occupies `j` and `j + 1`; both must exist.
     let is_cg = |j: usize| j + 1 < len && is_c(j) && is_g(j + 1);
 
@@ -852,8 +851,10 @@ mod tests {
     }
 
     #[test]
-    fn test_find_reference_cpgs_case_insensitive() {
-        assert_eq!(find_reference_cpgs(b"acgTaCg"), vec![1, 5]);
+    fn test_find_reference_cpgs_skips_dinucleotides_with_a_lowercase_base() {
+        // Lowercase marks a base synthesized from an ambiguity code: `cg`,
+        // `Cg` and `cG` are not CpGs, only the final `CG` is.
+        assert_eq!(find_reference_cpgs(b"AcgTCgTcGTCG"), vec![10]);
     }
 
     #[test]
@@ -1114,17 +1115,18 @@ mod tests {
     }
 
     #[test]
-    fn test_from_haplotype_case_insensitive() {
-        // Lowercase "acgt" should still detect a CpG at (1, 2).
-        let reference = b"acgt";
+    fn test_from_haplotype_ignores_cpgs_with_a_lowercase_base() {
+        // Lowercase bases were synthesized from ambiguity codes, so "cg" is not
+        // a CpG even at a methylation rate of 1.0; the uppercase "CG" is.
+        let reference = b"acgtACGT";
         let hap = ref_haplotype();
         let mut rng = SmallRng::seed_from_u64(42);
         let table =
             MethylationTable::from_haplotype(&hap, reference, &uniform_model(1.0), &mut rng);
-        assert!(table.is_methylated(1, false), "lowercase 'cg' must register top-strand C");
-        assert!(table.is_methylated(2, true), "lowercase 'cg' must register bottom-strand C");
-        assert!(!table.is_methylated(0, false));
-        assert!(!table.is_methylated(3, true));
+        assert!(!table.is_methylated(1, false), "lowercase 'cg' must not be methylated");
+        assert!(!table.is_methylated(2, true), "lowercase 'cg' must not be methylated");
+        assert!(table.is_methylated(5, false), "uppercase 'CG' registers its top-strand C");
+        assert!(table.is_methylated(6, true), "uppercase 'CG' registers its bottom-strand C");
     }
 
     #[test]

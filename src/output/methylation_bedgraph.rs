@@ -95,12 +95,7 @@ pub fn write_bedgraph_records<W: Write>(
 
     if haplotypes.is_empty() {
         // No variants → ref == hap. Walk the reference once.
-        for i in 0..reference.len() - 1 {
-            if !reference[i].eq_ignore_ascii_case(&b'C')
-                || !reference[i + 1].eq_ignore_ascii_case(&b'G')
-            {
-                continue;
-            }
+        for i in crate::meth::cpg_positions(reference) {
             #[expect(clippy::cast_possible_truncation, reason = "ref pos fits u32")]
             let top_c = i as u32;
             let entry = by_ref_pos.entry(top_c).or_insert((0, 0));
@@ -134,12 +129,7 @@ pub fn write_bedgraph_records<W: Write>(
                 continue;
             }
             let table = methylation.table_for(hap_idx);
-            for h in 0..hap_bases.len() - 1 {
-                if !hap_bases[h].eq_ignore_ascii_case(&b'C')
-                    || !hap_bases[h + 1].eq_ignore_ascii_case(&b'G')
-                {
-                    continue;
-                }
+            for h in crate::meth::cpg_positions(&hap_bases) {
                 // Only count haplotype CpGs that correspond to a true ref
                 // CpG at adjacent ref positions. A CpG formed across an
                 // insertion (`ref_positions[h+1] == ref_positions[h]`) has
@@ -153,8 +143,8 @@ pub fn write_bedgraph_records<W: Write>(
                 let ref_top_idx = ref_top_c as usize;
                 let ref_bot_idx = ref_bot_c as usize;
                 if ref_bot_idx >= reference.len()
-                    || !reference[ref_top_idx].eq_ignore_ascii_case(&b'C')
-                    || !reference[ref_bot_idx].eq_ignore_ascii_case(&b'G')
+                    || reference[ref_top_idx] != b'C'
+                    || reference[ref_bot_idx] != b'G'
                 {
                     continue;
                 }

@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- `methylate` no longer assigns methylation to CpGs in ambiguous reference
+  sequence. `N`s and other ambiguity codes are resolved to random bases, which
+  contain a `CG` about every 16 bases, and each of these was written as a CpG
+  record; on hs38DH they were 26% of all records. A `CG` now counts as a CpG
+  only when both bases are real reference or variant bases. The same rule
+  applies to `simulate`'s CpG truth bedGraph. Whole-genome `methylate` on hs38DH
+  is about 1.7× faster (87 s to 52 s) and its outputs are about a quarter
+  smaller. For a given `--seed`, methylation values differ from earlier versions
+  on any reference that contains ambiguity codes; VCFs written by earlier
+  versions are still read.
+- Lowercase alleles in an input VCF are now uppercased when read, so they are
+  treated as real bases and not as ambiguous reference positions.
+
 ### Fixed
 
 - `methylate --vcf` no longer slows down in proportion to the number of
