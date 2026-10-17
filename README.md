@@ -117,7 +117,7 @@ holodeck simulate -r ref.fa -v methylated.vcf.gz -o output_taps \
 | `-b, --targets` | none | BED file of target regions |
 | `-o, --output` | required | Output prefix |
 | `-c, --coverage` | 30 | Mean coverage depth |
-| `-l, --read-length` | 150 | Read length in bases |
+| `-l, --read-length` | 150 | Read length in bases. Give two values (`R1 R2`, e.g. `-l 150 100`) for different R1 and R2 lengths; not allowed with `--single-end` |
 | `-d, --fragment-mean` | 300 | Mean fragment size |
 | `-s, --fragment-stddev` | 50 | Fragment size standard deviation |
 | `--min-fragment-length` | 20 | Minimum fragment length; sampled lengths below this are clamped up. Must be ≥1 |
@@ -485,7 +485,7 @@ Example:
 
 Fields: read number, source fragment length (bp), contig, R1 position (1-based) + strand (F/R), R2 position + strand, haplotype index, R1 errors, R2 errors.
 
-`FRAG_LEN` is the length of the originating template. When it is smaller than the read length, the remainder of each read (`read_length - FRAG_LEN` bases) is adapter sequence (possibly padded with `N` if the configured adapter is shorter than that remainder). This lets consumers locate the adapter boundary in both PE and SE reads without the golden BAM.
+`FRAG_LEN` is the length of the originating template. When it is smaller than a read's length, the remainder of that read (its length minus `FRAG_LEN` bases) is adapter sequence (possibly padded with `N` if the configured adapter is shorter than that remainder). This lets consumers locate the adapter boundary in both PE and SE reads without the golden BAM.
 
 Fields are separated by `::` (double colon) so contig names that legally contain single `:` characters (e.g. HLA alleles like `HLA-A*01:01:01:01`) parse unambiguously. Contig names must not contain `@` (the FASTQ header prefix) or `::`; both are rejected by a debug assertion in the read-name formatter.
 

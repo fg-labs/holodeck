@@ -116,6 +116,28 @@ fn apply_fragment_chemistry(
     (bases, conversion_failed)
 }
 
+/// Reference positions of the genomic (non-adapter) bases of a mate with
+/// `read_length` bases, in ascending reference order.
+///
+/// A mate covers at most `read_length` bases of the fragment; any remainder
+/// of the read is adapter. Fragment `ref_positions` are always in forward
+/// reference order, so negative-strand mates take from the right end of the
+/// fragment and positive-strand mates from the left.
+#[must_use]
+pub fn mate_ref_positions(
+    fragment: &Fragment,
+    read_length: usize,
+    is_negative_strand: bool,
+) -> &[u32] {
+    let frag_len = fragment.ref_positions.len();
+    let genomic = frag_len.min(read_length);
+    if is_negative_strand {
+        &fragment.ref_positions[frag_len - genomic..]
+    } else {
+        &fragment.ref_positions[..genomic]
+    }
+}
+
 /// Build one mate (R1 or R2) from already-extracted bases.
 ///
 /// `bases` is post-chemistry, post-uppercase, in read 5'→3' orientation
@@ -135,36 +157,20 @@ fn build_mate(
     is_negative_strand: bool,
     mut bases: Vec<u8>,
     pre_conversion: Option<Vec<u8>>,
-    adapter_bases: usize,
     model: &impl ErrorModel,
     rng: &mut impl Rng,
 ) -> MateOutput {
-    let frag_len = fragment.bases.len();
-    let genomic = frag_len.min(bases.len());
-    let right_start = frag_len.saturating_sub(genomic);
-
-    // Fragment ref_positions are always in ascending (forward) reference
-    // order; negative-strand reads take from the right end of the fragment.
-    let positions = if is_negative_strand {
-        &fragment.ref_positions[right_start..frag_len]
-    } else {
-        &fragment.ref_positions[..genomic]
-    };
+    let positions = mate_ref_positions(fragment, bases.len(), is_negative_strand);
+    let adapter_bases = bases.len() - positions.len();
 
     let (n_errors, qualities) = error_model::apply_errors(model, &mut bases, end, rng);
 
     let cigar = cigar_from_ref_positions(positions, adapter_bases, is_negative_strand);
 
-    let ref_pos = if fragment.ref_positions.is_empty() {
-        0
-    } else if is_negative_strand {
-        fragment.ref_positions[right_start] + 1
-    } else {
-        fragment.ref_positions[0] + 1
-    };
+    let ref_pos = positions.first().map_or(0, |&p| p + 1);
 
     #[expect(clippy::cast_possible_truncation, reason = "fragment length fits in u32")]
-    let fragment_length = frag_len as u32;
+    let fragment_length = fragment.bases.len() as u32;
 
     let truth = TruthAlignment {
         contig: contig_name.to_string(),
@@ -198,7 +204,8 @@ fn build_mate(
 /// * `fragment` — The source fragment with bases and reference positions.
 /// * `contig_name` — Contig name for read naming.
 /// * `read_num` — 1-based read pair number.
-/// * `read_length` — Desired read length.
+/// * `r1_length` — Desired length of R1.
+/// * `r2_length` — Desired length of R2. Ignored when `paired` is `false`.
 /// * `paired` — Whether to generate both R1 and R2.
 /// * `adapter_r1` — Adapter sequence for R1.
 /// * `adapter_r2` — Adapter sequence for R2.
@@ -220,7 +227,8 @@ pub fn generate_read_pair(
     fragment: &Fragment,
     contig_name: &str,
     read_num: u64,
-    read_length: usize,
+    r1_length: usize,
+    r2_length: usize,
     paired: bool,
     adapter_r1: &[u8],
     adapter_r2: &[u8],
@@ -231,9 +239,6 @@ pub fn generate_read_pair(
     capture_pre_conversion: bool,
     rng: &mut impl Rng,
 ) -> Option<ReadPair> {
-    let frag_len = fragment.bases.len();
-    let adapter_bases = read_length.saturating_sub(frag_len.min(read_length));
-
     let r1_negative_strand = !fragment.is_forward;
     let r2_negative_strand = fragment.is_forward;
 
@@ -241,13 +246,12 @@ pub fn generate_read_pair(
     // lowercase_fraction can detect ambiguity-resolved positions). Reject
     // BEFORE drawing any error-model RNG so a rejection doesn't desync the
     // stream.
-    let r1_raw = extract_read_bases(&fragment.bases, read_length, adapter_r1, r1_negative_strand);
+    let r1_raw = extract_read_bases(&fragment.bases, r1_length, adapter_r1, r1_negative_strand);
     if lowercase_fraction(&r1_raw) > max_n_frac {
         return None;
     }
     if paired {
-        let r2_raw =
-            extract_read_bases(&fragment.bases, read_length, adapter_r2, r2_negative_strand);
+        let r2_raw = extract_read_bases(&fragment.bases, r2_length, adapter_r2, r2_negative_strand);
         if lowercase_fraction(&r2_raw) > max_n_frac {
             return None;
         }
@@ -279,14 +283,14 @@ pub fn generate_read_pair(
     // Step 4 — derive per-mate read bases from the chemistry-applied
     // fragment. extract_read_bases handles orientation (revcomp when
     // is_negative_strand) and adapter padding for short fragments.
-    let r1_bases = extract_read_bases(&post_chem_top, read_length, adapter_r1, r1_negative_strand);
+    let r1_bases = extract_read_bases(&post_chem_top, r1_length, adapter_r1, r1_negative_strand);
 
     // Capture pre-conversion mate bases for YS:Z when requested. Read these
     // from `pre_chem_top` so the orientation matches the post-chemistry
     // mate bases (extract_read_bases revcomps the same way for both).
     let want_pre = capture_pre_conversion && methylation.is_some();
     let r1_pre_conversion = want_pre
-        .then(|| extract_read_bases(&pre_chem_top, read_length, adapter_r1, r1_negative_strand));
+        .then(|| extract_read_bases(&pre_chem_top, r1_length, adapter_r1, r1_negative_strand));
 
     let r1 = build_mate(
         fragment,
@@ -295,7 +299,6 @@ pub fn generate_read_pair(
         r1_negative_strand,
         r1_bases,
         r1_pre_conversion,
-        adapter_bases,
         model,
         rng,
     );
@@ -324,9 +327,9 @@ pub fn generate_read_pair(
         });
     }
 
-    let r2_bases = extract_read_bases(&post_chem_top, read_length, adapter_r2, r2_negative_strand);
+    let r2_bases = extract_read_bases(&post_chem_top, r2_length, adapter_r2, r2_negative_strand);
     let r2_pre_conversion = want_pre
-        .then(|| extract_read_bases(&pre_chem_top, read_length, adapter_r2, r2_negative_strand));
+        .then(|| extract_read_bases(&pre_chem_top, r2_length, adapter_r2, r2_negative_strand));
     let r2 = build_mate(
         fragment,
         contig_name,
@@ -334,7 +337,6 @@ pub fn generate_read_pair(
         r2_negative_strand,
         r2_bases,
         r2_pre_conversion,
-        adapter_bases,
         model,
         rng,
     );
@@ -574,11 +576,11 @@ mod tests {
     #[test]
     fn test_generate_pe_read_pair() {
         let fragment = test_fragment(b"ACGTACGTACGTACGTACGT", 100);
-        let model = IlluminaErrorModel::new(10, 0.0, 0.0);
+        let model = IlluminaErrorModel::new(10, 10, 0.0, 0.0);
         let mut rng = SmallRng::seed_from_u64(42);
 
         let pair = generate_read_pair(
-            &fragment, "chr1", 1, 10, true, b"ADAPTER", b"ADAPTER", 1.0, &model, false, None,
+            &fragment, "chr1", 1, 10, 10, true, b"ADAPTER", b"ADAPTER", 1.0, &model, false, None,
             false, &mut rng,
         )
         .expect("no ambiguous bases — should not reject");
@@ -594,11 +596,11 @@ mod tests {
     #[test]
     fn test_generate_se_read() {
         let fragment = test_fragment(b"ACGTACGTAC", 100);
-        let model = IlluminaErrorModel::new(10, 0.0, 0.0);
+        let model = IlluminaErrorModel::new(10, 10, 0.0, 0.0);
         let mut rng = SmallRng::seed_from_u64(42);
 
         let pair = generate_read_pair(
-            &fragment, "chr1", 5, 10, false, b"ADAPTER", b"ADAPTER", 1.0, &model, false, None,
+            &fragment, "chr1", 5, 10, 10, false, b"ADAPTER", b"ADAPTER", 1.0, &model, false, None,
             false, &mut rng,
         )
         .unwrap();
@@ -613,11 +615,11 @@ mod tests {
         // Forward-strand fragment: R1 is positive-strand (trailing S), R2 is
         // negative-strand (leading S after BAM reverse-complement).
         let fragment = test_fragment(b"AC", 0);
-        let model = IlluminaErrorModel::new(5, 0.0, 0.0);
+        let model = IlluminaErrorModel::new(5, 5, 0.0, 0.0);
         let mut rng = SmallRng::seed_from_u64(42);
 
         let pair = generate_read_pair(
-            &fragment, "chr1", 1, 5, true, b"TTTTT", b"GGGGG", 1.0, &model, false, None, false,
+            &fragment, "chr1", 1, 5, 5, true, b"TTTTT", b"GGGGG", 1.0, &model, false, None, false,
             &mut rng,
         )
         .unwrap();
@@ -627,13 +629,140 @@ mod tests {
     }
 
     #[test]
-    fn test_simple_name_mode() {
-        let fragment = test_fragment(b"ACGT", 0);
-        let model = IlluminaErrorModel::new(4, 0.0, 0.0);
+    fn test_asymmetric_read_lengths_produce_mates_of_each_length() {
+        // Forward fragment at ref 100..120: R1 reads the first 10 bases, R2
+        // the last 6 (reverse-complemented), so R2 starts at ref 114.
+        let fragment = test_fragment(b"ACGTACGTACGTACGTACGT", 100);
+        let model = IlluminaErrorModel::new(10, 6, 0.0, 0.0);
         let mut rng = SmallRng::seed_from_u64(42);
 
         let pair = generate_read_pair(
-            &fragment, "chr1", 42, 4, true, b"A", b"A", 1.0, &model, true, None, false, &mut rng,
+            &fragment, "chr1", 1, 10, 6, true, b"ADAPTER", b"ADAPTER", 1.0, &model, false, None,
+            false, &mut rng,
+        )
+        .unwrap();
+
+        let r2 = pair.read2.as_ref().unwrap();
+        assert_eq!(pair.read1.bases.len(), 10);
+        assert_eq!(pair.read1.qualities.len(), 10);
+        assert_eq!(r2.bases, b"ACGTAC");
+        assert_eq!(r2.qualities.len(), 6);
+        assert_eq!(cigar_to_string(&pair.r1_cigar), "10M");
+        assert_eq!(cigar_to_string(pair.r2_cigar.as_ref().unwrap()), "6M");
+        assert_eq!(pair.r1_truth.position, 101);
+        assert_eq!(pair.r2_truth.as_ref().unwrap().position, 115);
+    }
+
+    #[test]
+    fn test_asymmetric_read_lengths_soft_clip_adapter_per_mate() {
+        // 8-base fragment: R1 (5) reads only genomic bases, while R2 (12)
+        // runs 4 bases into its adapter.
+        let fragment = test_fragment(b"ACGTACGT", 0);
+        let model = IlluminaErrorModel::new(5, 12, 0.0, 0.0);
+        let mut rng = SmallRng::seed_from_u64(42);
+
+        let pair = generate_read_pair(
+            &fragment, "chr1", 1, 5, 12, true, b"TTTTT", b"GGGGG", 1.0, &model, false, None, false,
+            &mut rng,
+        )
+        .unwrap();
+
+        assert_eq!(cigar_to_string(&pair.r1_cigar), "5M");
+        assert_eq!(cigar_to_string(pair.r2_cigar.as_ref().unwrap()), "4S8M");
+        assert_eq!(pair.read2.as_ref().unwrap().bases, b"ACGTACGTGGGG");
+    }
+
+    #[test]
+    fn test_asymmetric_read_lengths_on_reverse_strand_fragment() {
+        // Reverse fragment at ref 100..120: R1 is the negative-strand mate
+        // and reads the last 6 bases (starting at ref 114); R2 reads the
+        // first 10 from ref 100.
+        let mut fragment = test_fragment(b"ACGTACGTACGTACGTACGT", 100);
+        fragment.is_forward = false;
+        let model = IlluminaErrorModel::new(6, 10, 0.0, 0.0);
+        let mut rng = SmallRng::seed_from_u64(42);
+
+        let pair = generate_read_pair(
+            &fragment, "chr1", 1, 6, 10, true, b"ADAPTER", b"ADAPTER", 1.0, &model, false, None,
+            false, &mut rng,
+        )
+        .unwrap();
+
+        let r2_truth = pair.r2_truth.as_ref().unwrap();
+        assert_eq!(pair.read1.bases.len(), 6);
+        assert_eq!(pair.read2.as_ref().unwrap().bases.len(), 10);
+        assert_eq!(pair.r1_truth.position, 115);
+        assert!(!pair.r1_truth.is_forward);
+        assert_eq!(r2_truth.position, 101);
+        assert!(r2_truth.is_forward);
+        assert_eq!(cigar_to_string(&pair.r1_cigar), "6M");
+        assert_eq!(cigar_to_string(pair.r2_cigar.as_ref().unwrap()), "10M");
+    }
+
+    #[test]
+    fn test_asymmetric_read_lengths_with_indels_give_each_mate_its_own_cigar() {
+        // One inserted base after ref 103 and ref 105-106 deleted. R1 (6)
+        // spans the insertion; R2 (5) spans the deletion.
+        let mut fragment = test_fragment(b"ACGTACGTAC", 100);
+        fragment.ref_positions = vec![100, 101, 102, 103, 103, 104, 107, 108, 109, 110];
+        let model = IlluminaErrorModel::new(6, 5, 0.0, 0.0);
+        let mut rng = SmallRng::seed_from_u64(42);
+
+        let pair = generate_read_pair(
+            &fragment, "chr1", 1, 6, 5, true, b"ADAPTER", b"ADAPTER", 1.0, &model, false, None,
+            false, &mut rng,
+        )
+        .unwrap();
+
+        assert_eq!(cigar_to_string(&pair.r1_cigar), "4M1I1M");
+        assert_eq!(pair.r1_truth.position, 101);
+        assert_eq!(cigar_to_string(pair.r2_cigar.as_ref().unwrap()), "1M2D4M");
+        assert_eq!(pair.r2_truth.as_ref().unwrap().position, 105);
+    }
+
+    #[test]
+    fn test_single_end_ignores_r2_length() {
+        let fragment = test_fragment(b"ACGTACGTAC", 0);
+        let model = IlluminaErrorModel::new(10, 10, 0.0, 0.0);
+        let mut rng = SmallRng::seed_from_u64(42);
+
+        let pair = generate_read_pair(
+            &fragment, "chr1", 1, 10, 3, false, b"A", b"A", 1.0, &model, false, None, false,
+            &mut rng,
+        )
+        .unwrap();
+
+        assert_eq!(pair.read1.bases.len(), 10);
+        assert!(pair.read2.is_none());
+    }
+
+    #[test]
+    fn test_mate_ref_positions_positive_strand_takes_left_end() {
+        let fragment = test_fragment(b"ACGTACGTAC", 100);
+        assert_eq!(mate_ref_positions(&fragment, 3, false), &[100, 101, 102]);
+    }
+
+    #[test]
+    fn test_mate_ref_positions_negative_strand_takes_right_end() {
+        let fragment = test_fragment(b"ACGTACGTAC", 100);
+        assert_eq!(mate_ref_positions(&fragment, 3, true), &[107, 108, 109]);
+    }
+
+    #[test]
+    fn test_mate_ref_positions_read_longer_than_fragment_returns_whole_fragment() {
+        let fragment = test_fragment(b"ACGT", 100);
+        assert_eq!(mate_ref_positions(&fragment, 10, false), &[100, 101, 102, 103]);
+        assert_eq!(mate_ref_positions(&fragment, 10, true), &[100, 101, 102, 103]);
+    }
+
+    #[test]
+    fn test_simple_name_mode() {
+        let fragment = test_fragment(b"ACGT", 0);
+        let model = IlluminaErrorModel::new(4, 4, 0.0, 0.0);
+        let mut rng = SmallRng::seed_from_u64(42);
+
+        let pair = generate_read_pair(
+            &fragment, "chr1", 42, 4, 4, true, b"A", b"A", 1.0, &model, true, None, false, &mut rng,
         )
         .unwrap();
 
@@ -643,11 +772,12 @@ mod tests {
     #[test]
     fn test_quality_scores_correct_length() {
         let fragment = test_fragment(b"ACGTACGTAC", 0);
-        let model = IlluminaErrorModel::new(10, 0.001, 0.01);
+        let model = IlluminaErrorModel::new(10, 10, 0.001, 0.01);
         let mut rng = SmallRng::seed_from_u64(42);
 
         let pair = generate_read_pair(
-            &fragment, "chr1", 1, 10, true, b"A", b"A", 1.0, &model, false, None, false, &mut rng,
+            &fragment, "chr1", 1, 10, 10, true, b"A", b"A", 1.0, &model, false, None, false,
+            &mut rng,
         )
         .unwrap();
 
@@ -662,11 +792,11 @@ mod tests {
         let mut fragment = test_fragment(b"acgtacgtac", 100);
         // Mark as forward so R1 is the positive-strand, genomic-bases read.
         fragment.is_forward = true;
-        let model = IlluminaErrorModel::new(10, 0.0, 0.0);
+        let model = IlluminaErrorModel::new(10, 10, 0.0, 0.0);
         let mut rng = SmallRng::seed_from_u64(42);
 
         let pair = generate_read_pair(
-            &fragment, "chr1", 1, 10, true, b"ADAPTER", b"ADAPTER", 0.5, &model, false, None,
+            &fragment, "chr1", 1, 10, 10, true, b"ADAPTER", b"ADAPTER", 0.5, &model, false, None,
             false, &mut rng,
         );
 
@@ -678,11 +808,11 @@ mod tests {
         // 3 lowercase out of 10 = 0.3, below threshold 0.5 — should accept
         // and also emit uppercase bases.
         let fragment = test_fragment(b"ACaGcTAtCA", 0);
-        let model = IlluminaErrorModel::new(10, 0.0, 0.0);
+        let model = IlluminaErrorModel::new(10, 10, 0.0, 0.0);
         let mut rng = SmallRng::seed_from_u64(42);
 
         let pair = generate_read_pair(
-            &fragment, "chr1", 1, 10, true, b"ADAPTER", b"ADAPTER", 0.5, &model, false, None,
+            &fragment, "chr1", 1, 10, 10, true, b"ADAPTER", b"ADAPTER", 0.5, &model, false, None,
             false, &mut rng,
         )
         .expect("0.3 < 0.5 — should accept");
@@ -714,13 +844,14 @@ mod tests {
         // directly; with 0% methylation and 100% conversion, every C in the
         // genomic portion of R1 must become T.
         let fragment = test_fragment(b"ACGTACGTAC", 100);
-        let model = IlluminaErrorModel::new(10, 0.0, 0.0);
+        let model = IlluminaErrorModel::new(10, 10, 0.0, 0.0);
         let mut rng = SmallRng::seed_from_u64(42);
 
         let pair = generate_read_pair(
             &fragment,
             "chr1",
             1,
+            10,
             10,
             true,
             b"ADAPTER",
@@ -783,13 +914,14 @@ mod tests {
         // Reverse-strand fragment → reads come from the bottom strand → XG=GA.
         let mut fragment = test_fragment(b"ACGTACGTAC", 100);
         fragment.is_forward = false;
-        let model = IlluminaErrorModel::new(10, 0.0, 0.0);
+        let model = IlluminaErrorModel::new(10, 10, 0.0, 0.0);
         let mut rng = SmallRng::seed_from_u64(42);
 
         let pair = generate_read_pair(
             &fragment,
             "chr1",
             1,
+            10,
             10,
             true,
             b"ADAPTER",
@@ -855,13 +987,14 @@ mod tests {
         };
 
         let fragment = test_fragment(b"ACAGACAGACAG", 0);
-        let model = IlluminaErrorModel::new(12, 0.0, 0.0);
+        let model = IlluminaErrorModel::new(12, 12, 0.0, 0.0);
         let mut rng = SmallRng::seed_from_u64(42);
 
         let pair = generate_read_pair(
             &fragment,
             "chr1",
             1,
+            12,
             12,
             true,
             b"ADAPTER",
@@ -909,13 +1042,14 @@ mod tests {
 
         let mut fragment = test_fragment(b"ACAGACAGACAG", 0);
         fragment.is_forward = false;
-        let model = IlluminaErrorModel::new(12, 0.0, 0.0);
+        let model = IlluminaErrorModel::new(12, 12, 0.0, 0.0);
         let mut rng = SmallRng::seed_from_u64(42);
 
         let pair = generate_read_pair(
             &fragment,
             "chr1",
             1,
+            12,
             12,
             true,
             b"ADAPTER",
@@ -952,7 +1086,7 @@ mod tests {
         fragment_half_bad.is_forward = true;
 
         let clean_fragment = test_fragment(&[b'A'; 20], 0);
-        let model = IlluminaErrorModel::new(10, 0.5, 0.5); // High rate so errors are observable.
+        let model = IlluminaErrorModel::new(10, 10, 0.5, 0.5); // High rate so errors are observable.
 
         // Run A: rejected pair, then clean pair.
         let mut rng_a = SmallRng::seed_from_u64(123);
@@ -960,6 +1094,7 @@ mod tests {
             &fragment_half_bad,
             "chr1",
             1,
+            10,
             10,
             true,
             b"TTTTTTTTTT",
@@ -976,6 +1111,7 @@ mod tests {
             &clean_fragment,
             "chr1",
             2,
+            10,
             10,
             true,
             b"TTTTTTTTTT",
@@ -995,6 +1131,7 @@ mod tests {
             &clean_fragment,
             "chr1",
             2,
+            10,
             10,
             true,
             b"TTTTTTTTTT",

@@ -12,7 +12,7 @@ use std::path::PathBuf;
 
 use helpers::{
     PileupColumn, TestEnv, VcfVariant, count_fastq_records, non_repetitive_seq, pileup_bases,
-    read_gzipped, run_simulate, simple_env,
+    read_bam_records, read_gzipped, run_simulate, simple_env,
 };
 use std::collections::HashMap;
 
@@ -136,6 +136,187 @@ fn test_simulate_basic_pe() {
         first_name.starts_with("@holodeck::"),
         "Read name should start with @holodeck:: got {first_name}"
     );
+}
+
+#[test]
+fn test_simulate_asymmetric_read_lengths_sets_each_mate_length() {
+    let seq = non_repetitive_seq(20_000);
+    let env = TestEnv::new(&[("chr1", &seq)]);
+    let out = env.output_prefix();
+
+    let (ok, _, stderr) = run_simulate(&[
+        "simulate",
+        "-r",
+        env.fasta_path.to_str().unwrap(),
+        "-o",
+        out.to_str().unwrap(),
+        "--coverage",
+        "5",
+        "--read-length",
+        "50",
+        "100",
+        "--fragment-mean",
+        "300",
+        "--fragment-stddev",
+        "30",
+        "--seed",
+        "7",
+    ]);
+    assert!(ok, "simulate failed: {stderr}");
+
+    let check = |suffix: &str, expected_len: usize| {
+        let path = PathBuf::from(format!("{}.{suffix}.fastq.gz", out.display()));
+        let contents = read_gzipped(&path);
+        let lines: Vec<&str> = contents.lines().collect();
+        assert!(!lines.is_empty(), "{suffix}: expected some reads");
+        for record in lines.chunks(4) {
+            assert_eq!(record[1].len(), expected_len, "{suffix} bases: {}", record[0]);
+            assert_eq!(record[3].len(), expected_len, "{suffix} qualities: {}", record[0]);
+        }
+    };
+    check("r1", 50);
+    check("r2", 100);
+}
+
+/// Each golden BAM mate soft-clips its own adapter run: a fragment between
+/// the two read lengths leaves R1 fully genomic while R2 reads into adapter.
+#[test]
+fn test_golden_bam_soft_clips_adapter_per_mate_with_asymmetric_read_lengths() {
+    use holodeck_lib::read_naming::parse_encoded_pe_name;
+
+    let seq = non_repetitive_seq(20_000);
+    let env = TestEnv::new(&[("chr1", &seq)]);
+    let out = env.output_prefix();
+
+    let (ok, _, stderr) = run_simulate(&[
+        "simulate",
+        "-r",
+        env.fasta_path.to_str().unwrap(),
+        "-o",
+        out.to_str().unwrap(),
+        "--coverage",
+        "5",
+        "--read-length",
+        "40",
+        "120",
+        "--fragment-mean",
+        "80",
+        "--fragment-stddev",
+        "20",
+        "--golden-bam",
+        "--seed",
+        "13",
+    ]);
+    assert!(ok, "simulate failed: {stderr}");
+
+    let records = read_bam_records(&PathBuf::from(format!("{}.golden.bam", out.display())));
+    assert!(!records.is_empty(), "expected golden BAM records");
+
+    let mut r2_only_clipped = 0usize;
+    for record in &records {
+        let name = record.name().map(ToString::to_string).unwrap();
+        let (_, r1_truth, _) = parse_encoded_pe_name(&name).unwrap();
+        let frag_len = r1_truth.fragment_length as usize;
+        let is_r1 = record.flags().is_first_segment();
+        let read_len = if is_r1 { 40 } else { 120 };
+
+        assert_eq!(record.sequence().len(), read_len, "SEQ length for {name}");
+        let soft_clipped: usize = record
+            .cigar()
+            .as_ref()
+            .iter()
+            .filter(|op| op.kind() == CigarKind::SoftClip)
+            .map(|op| op.len())
+            .sum();
+        assert_eq!(soft_clipped, read_len.saturating_sub(frag_len), "soft clip for {name}");
+
+        if !is_r1 && (40..120).contains(&frag_len) {
+            r2_only_clipped += 1;
+        }
+    }
+    assert!(r2_only_clipped > 0, "expected fragments between the two read lengths");
+}
+
+#[test]
+fn test_simulate_rejects_three_read_lengths() {
+    let env = simple_env();
+    let out = env.output_prefix();
+
+    let (ok, _, stderr) = run_simulate(&[
+        "simulate",
+        "-r",
+        env.fasta_path.to_str().unwrap(),
+        "-o",
+        out.to_str().unwrap(),
+        "--read-length",
+        "50",
+        "60",
+        "70",
+    ]);
+    assert!(!ok, "three --read-length values must be rejected");
+    assert!(stderr.contains("70"), "error should name the extra value: {stderr}");
+}
+
+#[test]
+fn test_simulate_rejects_two_read_lengths_with_single_end() {
+    let env = simple_env();
+    let out = env.output_prefix();
+
+    let (ok, _, stderr) = run_simulate(&[
+        "simulate",
+        "-r",
+        env.fasta_path.to_str().unwrap(),
+        "-o",
+        out.to_str().unwrap(),
+        "--single-end",
+        "--read-length",
+        "150",
+        "100",
+    ]);
+    assert!(!ok, "two --read-length values must be rejected with --single-end");
+    assert!(
+        stderr.contains("--single-end accepts only one --read-length value"),
+        "unexpected stderr: {stderr}"
+    );
+}
+
+/// Giving the same length twice is the same run as giving it once: same
+/// derived seed, same reads.
+#[test]
+fn test_simulate_equal_read_lengths_match_single_read_length() {
+    let seq = non_repetitive_seq(20_000);
+    let env = TestEnv::new(&[("chr1", &seq)]);
+    let one = env.dir.path().join("one");
+    let two = env.dir.path().join("two");
+
+    for (out, lengths) in [(&one, &["100"][..]), (&two, &["100", "100"][..])] {
+        let mut args = vec![
+            "simulate",
+            "-r",
+            env.fasta_path.to_str().unwrap(),
+            "-o",
+            out.to_str().unwrap(),
+            "--coverage",
+            "2",
+            "--fragment-mean",
+            "120",
+            "--fragment-stddev",
+            "40",
+            "--read-length",
+        ];
+        args.extend_from_slice(lengths);
+        let (ok, _, stderr) = run_simulate(&args);
+        assert!(ok, "simulate failed: {stderr}");
+    }
+
+    for suffix in ["r1", "r2"] {
+        let fastq = |prefix: &std::path::Path| {
+            read_gzipped(&PathBuf::from(format!("{}.{suffix}.fastq.gz", prefix.display())))
+        };
+        let expected = fastq(&one);
+        assert!(!expected.is_empty(), "{suffix}: expected some reads");
+        assert_eq!(fastq(&two), expected, "{suffix} FASTQs differ");
+    }
 }
 
 #[test]

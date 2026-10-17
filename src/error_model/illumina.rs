@@ -6,6 +6,13 @@ const DECAY_START_FRACTION: f64 = 0.7;
 /// Default R2 error rate multiplier relative to R1.
 const DEFAULT_R2_MULTIPLIER: f64 = 1.5;
 
+/// Cycle at which the error ramp begins for a read of `read_length` cycles.
+#[expect(clippy::cast_possible_truncation, reason = "product is bounded by read_length")]
+#[expect(clippy::cast_sign_loss, reason = "product is non-negative")]
+fn decay_start(read_length: usize) -> usize {
+    (read_length as f64 * DECAY_START_FRACTION).round() as usize
+}
+
 /// Precomputed per-cycle error probability and base quality score.
 #[derive(Debug, Clone, Copy)]
 struct CycleParams {
@@ -19,8 +26,9 @@ struct CycleParams {
 ///
 /// Error rate starts at `min_error_rate` for early cycles and linearly ramps
 /// to `max_error_rate` by the last cycle. The ramp begins at approximately
-/// 70% of the read length, mimicking the quality decay caused by phasing and
-/// dephasing in Illumina sequencing.
+/// 70% of each read's own length, mimicking the quality decay caused by
+/// phasing and dephasing in Illumina sequencing. R1 and R2 may have
+/// different lengths, in which case each ramps over its own length.
 ///
 /// Read 2 has a higher error rate than read 1 (controlled by
 /// `r2_multiplier`), reflecting the typically worse quality of the second
@@ -30,16 +38,16 @@ struct CycleParams {
 /// construction time for each cycle and read end, so the per-base hot path
 /// is a table lookup rather than repeated floating-point math.
 pub struct IlluminaErrorModel {
-    /// Read length this model is configured for.
-    read_length: usize,
+    /// Number of cycles in R1.
+    r1_length: usize,
+    /// Number of cycles in R2.
+    r2_length: usize,
     /// Error rate at the start of reads (e.g. 0.001).
     min_error_rate: f64,
     /// Maximum error rate at the end of reads (e.g. 0.01).
     max_error_rate: f64,
     /// Multiplier applied to the entire R2 error curve (e.g. 1.5).
     r2_multiplier: f64,
-    /// Cycle position where the error ramp begins (computed from read_length).
-    decay_start: usize,
     /// Precomputed per-cycle parameters for R1.
     r1_params: Vec<CycleParams>,
     /// Precomputed per-cycle parameters for R2.
@@ -50,56 +58,68 @@ impl IlluminaErrorModel {
     /// Create a new Illumina error model with default R2 multiplier (1.5x).
     ///
     /// # Arguments
-    /// * `read_length` — Number of cycles (bases) per read.
+    /// * `r1_length` — Number of cycles (bases) in R1.
+    /// * `r2_length` — Number of cycles (bases) in R2. For single-end
+    ///   simulation pass the R1 length; the R2 table is then never used.
     /// * `min_error_rate` — Per-base error rate at the start of reads.
     /// * `max_error_rate` — Per-base error rate at the end of reads.
     ///
     /// # Panics
-    /// Panics if `read_length` is 0 or if `min_error_rate > max_error_rate`.
+    /// Panics if either length is 0 or if `min_error_rate > max_error_rate`.
     #[must_use]
-    pub fn new(read_length: usize, min_error_rate: f64, max_error_rate: f64) -> Self {
-        Self::with_r2_multiplier(read_length, min_error_rate, max_error_rate, DEFAULT_R2_MULTIPLIER)
+    pub fn new(
+        r1_length: usize,
+        r2_length: usize,
+        min_error_rate: f64,
+        max_error_rate: f64,
+    ) -> Self {
+        Self::with_r2_multiplier(
+            r1_length,
+            r2_length,
+            min_error_rate,
+            max_error_rate,
+            DEFAULT_R2_MULTIPLIER,
+        )
     }
 
     /// Create a new Illumina error model with a custom R2 multiplier.
     ///
     /// The `r2_multiplier` scales the entire error curve for read 2 relative
-    /// to read 1. A value of 1.0 means R1 and R2 have identical error rates.
+    /// to read 1. A value of 1.0 means R1 and R2 have identical error rates
+    /// at the same relative position in the read.
     ///
     /// # Panics
-    /// Panics if `read_length` is 0 or if `min_error_rate > max_error_rate`.
+    /// Panics if either length is 0 or if `min_error_rate > max_error_rate`.
     #[must_use]
     pub fn with_r2_multiplier(
-        read_length: usize,
+        r1_length: usize,
+        r2_length: usize,
         min_error_rate: f64,
         max_error_rate: f64,
         r2_multiplier: f64,
     ) -> Self {
-        assert!(read_length > 0, "read_length must be > 0");
+        assert!(r1_length > 0, "r1_length must be > 0");
+        assert!(r2_length > 0, "r2_length must be > 0");
         assert!(
             min_error_rate <= max_error_rate,
             "min_error_rate ({min_error_rate}) must be <= max_error_rate ({max_error_rate})"
         );
 
-        #[expect(clippy::cast_possible_truncation, reason = "product is bounded by read_length")]
-        #[expect(clippy::cast_sign_loss, reason = "product is non-negative")]
-        let decay_start = (read_length as f64 * DECAY_START_FRACTION).round() as usize;
-
         let mut model = Self {
-            read_length,
+            r1_length,
+            r2_length,
             min_error_rate,
             max_error_rate,
             r2_multiplier,
-            decay_start,
             r1_params: Vec::new(),
             r2_params: Vec::new(),
         };
 
         // Precompute per-cycle error probabilities and base quality scores.
         model.r1_params =
-            (0..read_length).map(|c| model.compute_cycle_params(c, ReadEnd::Read1)).collect();
+            (0..r1_length).map(|c| model.compute_cycle_params(c, ReadEnd::Read1)).collect();
         model.r2_params =
-            (0..read_length).map(|c| model.compute_cycle_params(c, ReadEnd::Read2)).collect();
+            (0..r2_length).map(|c| model.compute_cycle_params(c, ReadEnd::Read2)).collect();
 
         model
     }
@@ -108,11 +128,16 @@ impl IlluminaErrorModel {
 impl IlluminaErrorModel {
     /// Compute error probability for a given cycle using the ramp model.
     fn compute_error_probability(&self, cycle: usize, read_end: ReadEnd) -> f64 {
-        let base_rate = if cycle < self.decay_start {
+        let read_length = match read_end {
+            ReadEnd::Read1 => self.r1_length,
+            ReadEnd::Read2 => self.r2_length,
+        };
+        let decay_start = decay_start(read_length);
+        let base_rate = if cycle < decay_start {
             self.min_error_rate
         } else {
-            let ramp_len = self.read_length.saturating_sub(self.decay_start).max(1);
-            let progress = (cycle - self.decay_start) as f64 / ramp_len as f64;
+            let ramp_len = read_length.saturating_sub(decay_start).max(1);
+            let progress = (cycle - decay_start) as f64 / ramp_len as f64;
             self.min_error_rate + (self.max_error_rate - self.min_error_rate) * progress.min(1.0)
         };
 
@@ -163,14 +188,14 @@ mod tests {
 
     #[test]
     fn test_error_rate_at_start() {
-        let model = IlluminaErrorModel::new(150, 0.001, 0.01);
+        let model = IlluminaErrorModel::new(150, 150, 0.001, 0.01);
         let p = model.error_probability(0, ReadEnd::Read1);
         assert!((p - 0.001).abs() < 1e-10);
     }
 
     #[test]
     fn test_error_rate_flat_before_decay() {
-        let model = IlluminaErrorModel::new(150, 0.001, 0.01);
+        let model = IlluminaErrorModel::new(150, 150, 0.001, 0.01);
         // decay_start ≈ 105 for read_length 150
         for cycle in 0..100 {
             let p = model.error_probability(cycle, ReadEnd::Read1);
@@ -180,14 +205,14 @@ mod tests {
 
     #[test]
     fn test_error_rate_ramps_to_max() {
-        let model = IlluminaErrorModel::new(150, 0.001, 0.01);
+        let model = IlluminaErrorModel::new(150, 150, 0.001, 0.01);
         let p = model.error_probability(149, ReadEnd::Read1);
         assert!((p - 0.01).abs() < 0.001, "expected ~0.01 at last cycle, got {p}");
     }
 
     #[test]
     fn test_error_rate_increases_monotonically() {
-        let model = IlluminaErrorModel::new(150, 0.001, 0.01);
+        let model = IlluminaErrorModel::new(150, 150, 0.001, 0.01);
         let mut prev = 0.0;
         for cycle in 0..150 {
             let p = model.error_probability(cycle, ReadEnd::Read1);
@@ -198,7 +223,7 @@ mod tests {
 
     #[test]
     fn test_r2_higher_than_r1() {
-        let model = IlluminaErrorModel::new(150, 0.001, 0.01);
+        let model = IlluminaErrorModel::new(150, 150, 0.001, 0.01);
         for cycle in [0, 50, 100, 149] {
             let p1 = model.error_probability(cycle, ReadEnd::Read1);
             let p2 = model.error_probability(cycle, ReadEnd::Read2);
@@ -208,7 +233,7 @@ mod tests {
 
     #[test]
     fn test_r2_multiplier() {
-        let model = IlluminaErrorModel::new(150, 0.001, 0.01);
+        let model = IlluminaErrorModel::new(150, 150, 0.001, 0.01);
         let p1 = model.error_probability(0, ReadEnd::Read1);
         let p2 = model.error_probability(0, ReadEnd::Read2);
         assert!((p2 - p1 * 1.5).abs() < 1e-10, "R2 should be 1.5x R1 at start");
@@ -219,7 +244,7 @@ mod tests {
         use rand::SeedableRng;
         use rand::rngs::SmallRng;
 
-        let model = IlluminaErrorModel::new(10, 0.1, 0.3);
+        let model = IlluminaErrorModel::new(10, 10, 0.1, 0.3);
         let mut bases1 = b"ACGTACGTAC".to_vec();
         let mut bases2 = b"ACGTACGTAC".to_vec();
 
@@ -241,7 +266,7 @@ mod tests {
         use rand::SeedableRng;
         use rand::rngs::SmallRng;
 
-        let model = IlluminaErrorModel::new(100, 0.5, 0.5); // High error rate
+        let model = IlluminaErrorModel::new(100, 100, 0.5, 0.5); // High error rate
         let original = vec![b'A'; 100];
         let mut bases = original.clone();
         let mut rng = SmallRng::seed_from_u64(123);
@@ -260,7 +285,7 @@ mod tests {
         use rand::SeedableRng;
         use rand::rngs::SmallRng;
 
-        let model = IlluminaErrorModel::new(10, 0.001, 0.01);
+        let model = IlluminaErrorModel::new(10, 10, 0.001, 0.01);
         let mut bases = b"ACGTACGTAC".to_vec();
         let mut rng = SmallRng::seed_from_u64(99);
 
@@ -279,7 +304,7 @@ mod tests {
         use rand::SeedableRng;
         use rand::rngs::SmallRng;
 
-        let model = IlluminaErrorModel::new(10, 0.0, 0.0);
+        let model = IlluminaErrorModel::new(10, 10, 0.0, 0.0);
         let original = b"ACGTACGTAC".to_vec();
         let mut bases = original.clone();
         let mut rng = SmallRng::seed_from_u64(42);
@@ -293,14 +318,63 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "read_length must be > 0")]
-    fn test_zero_read_length_panics() {
-        let _ = IlluminaErrorModel::new(0, 0.001, 0.01);
+    fn test_asymmetric_lengths_ramp_each_read_over_its_own_length() {
+        // R1 decay starts at cycle 105 (70% of 150); R2 at cycle 70 (70% of 100).
+        let model = IlluminaErrorModel::new(150, 100, 0.001, 0.01);
+        let r1_flat = model.error_probability(99, ReadEnd::Read1);
+        assert!((r1_flat - 0.001).abs() < 1e-10, "R1 should still be flat at 99, got {r1_flat}");
+        let r2_flat = model.error_probability(69, ReadEnd::Read2);
+        assert!((r2_flat - 0.0015).abs() < 1e-10, "R2 should still be flat at 69, got {r2_flat}");
+        let r2_ramping = model.error_probability(85, ReadEnd::Read2);
+        assert!(r2_ramping > 0.0015, "R2 should be ramping at 85, got {r2_ramping}");
+    }
+
+    #[test]
+    fn test_shorter_r2_reaches_max_at_its_last_cycle() {
+        let model = IlluminaErrorModel::new(150, 100, 0.001, 0.01);
+        let p = model.error_probability(99, ReadEnd::Read2);
+        assert!((p - 0.015).abs() < 0.0015, "expected ~0.015 (1.5 x max) at cycle 99, got {p}");
+    }
+
+    #[test]
+    fn test_longer_r2_has_parameters_for_every_cycle() {
+        let model = IlluminaErrorModel::new(50, 100, 0.001, 0.01);
+        let p = model.error_probability(99, ReadEnd::Read2);
+        assert!((p - 0.015).abs() < 0.0015, "expected ~0.015 (1.5 x max) at cycle 99, got {p}");
+        let q = model.base_quality_phred33(99, ReadEnd::Read2);
+        assert!(q >= 35, "quality {q} below minimum Phred+33 (35)");
+    }
+
+    #[test]
+    fn test_apply_errors_covers_full_length_of_longer_r2() {
+        use rand::SeedableRng;
+        use rand::rngs::SmallRng;
+
+        let model = IlluminaErrorModel::new(50, 100, 0.001, 0.01);
+        let mut bases = vec![b'A'; 100];
+        let mut rng = SmallRng::seed_from_u64(7);
+
+        let (_, qualities) =
+            crate::error_model::apply_errors(&model, &mut bases, ReadEnd::Read2, &mut rng);
+
+        assert_eq!(qualities.len(), 100);
+    }
+
+    #[test]
+    #[should_panic(expected = "r1_length must be > 0")]
+    fn test_zero_r1_length_panics() {
+        let _ = IlluminaErrorModel::new(0, 150, 0.001, 0.01);
+    }
+
+    #[test]
+    #[should_panic(expected = "r2_length must be > 0")]
+    fn test_zero_r2_length_panics() {
+        let _ = IlluminaErrorModel::new(150, 0, 0.001, 0.01);
     }
 
     #[test]
     #[should_panic(expected = "min_error_rate")]
     fn test_min_gt_max_panics() {
-        let _ = IlluminaErrorModel::new(150, 0.1, 0.01);
+        let _ = IlluminaErrorModel::new(150, 150, 0.1, 0.01);
     }
 }
