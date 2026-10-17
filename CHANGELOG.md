@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `simulate --read-length` accepts two values to give R1 and R2 different lengths (e.g. `--read-length 150 100`); a single value still sets both. Each read's error-rate ramp spans its own length, the number of pairs simulated for `--coverage` accounts for both lengths, and the golden BAM soft-clips each mate's own adapter run. Two values are rejected with `--single-end`. A single value, or two equal values, produces the same output and seed as before.
+
 ### Fixed
 
 - `methylate --vcf` no longer slows down in proportion to the number of

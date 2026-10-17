@@ -18,7 +18,7 @@ use crate::fragment::extract_fragment;
 use crate::haplotype::build_haplotypes;
 use crate::output::fastq::FastqWriter;
 use crate::output::golden_bam::{GoldenBamMetadata, GoldenBamWriter};
-use crate::read::generate_read_pair;
+use crate::read::{generate_read_pair, mate_ref_positions};
 use crate::seed::{derive_seed, resolve_seed};
 use crate::sequence_dict::SequenceDictionary;
 use crate::version::VERSION;
@@ -73,9 +73,18 @@ pub struct Simulate {
     #[arg(short = 'c', long, default_value_t = 30.0, value_name = "FLOAT")]
     pub coverage: f64,
 
-    /// Length of each read in bases.
-    #[arg(short = 'l', long, default_value_t = 150, value_name = "INT")]
-    pub read_length: usize,
+    /// Read length in bases. One value sets both R1 and R2; two values
+    /// (`R1 R2`) set each read's length separately for paired-end runs and
+    /// are rejected with `--single-end`.
+    #[arg(
+        short = 'l',
+        long,
+        num_args = 1..=2,
+        action = clap::ArgAction::Set,
+        default_values_t = [150],
+        value_name = "INT"
+    )]
+    pub read_length: Vec<usize>,
 
     /// Mean insert size (outer distance between read pair ends).
     #[arg(short = 'd', long, default_value_t = 300, value_name = "INT")]
@@ -208,8 +217,14 @@ impl Simulate {
         if !self.coverage.is_finite() || self.coverage <= 0.0 {
             bail!("--coverage must be a finite positive number");
         }
-        if self.read_length == 0 {
+        if !(1..=2).contains(&self.read_length.len()) {
+            bail!("--read-length takes one or two values");
+        }
+        if self.read_length.contains(&0) {
             bail!("--read-length must be > 0");
+        }
+        if self.single_end && self.read_length.len() > 1 {
+            bail!("--single-end accepts only one --read-length value");
         }
         if self.min_fragment_length == 0 {
             bail!("--min-fragment-length must be at least 1");
@@ -347,8 +362,12 @@ impl Simulate {
         let total_reads = self.compute_total_reads(effective_size);
         log::info!("Will generate {total_reads} read pairs for {:.1}x coverage", self.coverage);
 
-        let error_model =
-            IlluminaErrorModel::new(self.read_length, self.min_error_rate, self.max_error_rate);
+        let error_model = IlluminaErrorModel::new(
+            self.r1_length(),
+            self.r2_length(),
+            self.min_error_rate,
+            self.max_error_rate,
+        );
         let frag_dist = Normal::new(self.fragment_mean as f64, self.fragment_stddev as f64)
             .map_err(|e| anyhow::anyhow!("Invalid fragment distribution parameters: {e}"))?;
 
@@ -529,20 +548,32 @@ impl Simulate {
         GoldenBamMetadata { command_line, version: VERSION.clone(), sample }
     }
 
+    /// Length of R1 in bases: the first `--read-length` value. Clap's
+    /// default and [`Self::validate`] guarantee at least one value.
+    fn r1_length(&self) -> usize {
+        self.read_length[0]
+    }
+
+    /// Length of R2 in bases: the second `--read-length` value, or the first
+    /// when only one was given.
+    fn r2_length(&self) -> usize {
+        self.read_length.get(1).copied().unwrap_or_else(|| self.r1_length())
+    }
+
     /// Compute the deterministic seed from simulation parameters.
     ///
     /// IMPORTANT: the legacy 7-field format
-    /// `<reference>:<coverage>:<read_length>:<frag_mean>:<frag_stddev>:<min_err>:<max_err>`
+    /// `<reference>:<coverage>:<r1_length>:<frag_mean>:<frag_stddev>:<min_err>:<max_err>`
     /// MUST NOT change. Existing users rely on the same params producing the
-    /// same seed. New parameters (e.g. methylation chemistry) must only
-    /// extend the string when explicitly enabled, and only as conditional
-    /// suffixes.
+    /// same seed. New parameters (e.g. methylation chemistry, an R2 length
+    /// that differs from R1's) must only extend the string when explicitly
+    /// enabled, and only as conditional suffixes.
     fn compute_seed(&self) -> u64 {
         let mut seed_desc = format!(
             "{}:{}:{}:{}:{}:{}:{}",
             self.reference.reference.display(),
             self.coverage,
-            self.read_length,
+            self.r1_length(),
             self.fragment_mean,
             self.fragment_stddev,
             self.min_error_rate,
@@ -559,6 +590,10 @@ impl Simulate {
             seed_desc.push_str(
                 &self.methylation_failure_rate.unwrap_or(DEFAULT_FAILURE_RATE).to_string(),
             );
+        }
+        if self.r2_length() != self.r1_length() {
+            seed_desc.push(':');
+            seed_desc.push_str(&self.r2_length().to_string());
         }
         resolve_seed(self.seed.seed, &seed_desc)
     }
@@ -577,11 +612,14 @@ impl Simulate {
 
     /// Compute total number of read pairs needed for the requested coverage.
     fn compute_total_reads(&self, effective_size: u64) -> u64 {
-        let bases_per_read =
-            if self.single_end { self.read_length as u64 } else { self.read_length as u64 * 2 };
+        let bases_per_pair = if self.single_end {
+            self.r1_length() as u64
+        } else {
+            (self.r1_length() + self.r2_length()) as u64
+        };
         #[expect(clippy::cast_possible_truncation, reason = "read count fits u64")]
         #[expect(clippy::cast_sign_loss, reason = "coverage is positive")]
-        let n = ((self.coverage * effective_size as f64) / bases_per_read as f64).round() as u64;
+        let n = ((self.coverage * effective_size as f64) / bases_per_pair as f64).round() as u64;
         n
     }
 
@@ -742,7 +780,7 @@ impl Simulate {
             attempts += 1;
 
             // Draw fragment length, clamped to [min_fragment_length, contig_length].
-            // Fragments shorter than read_length are padded with adapter sequence
+            // Fragments shorter than a read are padded with adapter sequence
             // by the read extraction layer.
             #[expect(clippy::cast_possible_truncation, reason = "fragment length fits usize")]
             #[expect(clippy::cast_sign_loss, reason = "clamped to positive")]
@@ -791,7 +829,8 @@ impl Simulate {
                 &fragment,
                 contig_name,
                 read_num,
-                self.read_length,
+                self.r1_length(),
+                self.r2_length(),
                 !self.single_end,
                 adapter_r1,
                 adapter_r2,
@@ -843,19 +882,9 @@ impl Simulate {
             }
 
             // Tally CpG truth from each mate's genomic ref-position slice.
-            // Mirrors `read::build_mate`'s slicing: forward mates take the
-            // left window (`[..genomic]`); negative-strand mates take the
-            // right window (`[frag_len - genomic..frag_len]`).
             if let (Some(tally), Some((cm, _))) = (cpg_truth.as_deref_mut(), methylation.as_ref()) {
-                let frag_len = fragment.bases.len();
-                let genomic = frag_len.min(self.read_length);
-                let right_start = frag_len.saturating_sub(genomic);
-                let r1_neg = !fragment.is_forward;
-                let r1_positions: &[u32] = if r1_neg {
-                    &fragment.ref_positions[right_start..frag_len]
-                } else {
-                    &fragment.ref_positions[..genomic]
-                };
+                let r1_positions =
+                    mate_ref_positions(&fragment, self.r1_length(), !fragment.is_forward);
                 tally.record_mate(
                     contig_idx,
                     r1_positions,
@@ -866,12 +895,8 @@ impl Simulate {
                     fragment.is_forward,
                 );
                 if pair.read2.is_some() {
-                    let r2_neg = fragment.is_forward;
-                    let r2_positions: &[u32] = if r2_neg {
-                        &fragment.ref_positions[right_start..frag_len]
-                    } else {
-                        &fragment.ref_positions[..genomic]
-                    };
+                    let r2_positions =
+                        mate_ref_positions(&fragment, self.r2_length(), fragment.is_forward);
                     tally.record_mate(
                         contig_idx,
                         r2_positions,
@@ -916,7 +941,7 @@ mod tests {
             output: OutputPrefixOptions { output: PathBuf::from("out") },
             seed: SeedOptions { seed: None },
             coverage: 30.0,
-            read_length: 150,
+            read_length: vec![150],
             fragment_mean: 300,
             fragment_stddev: 50,
             min_fragment_length: 20,
@@ -996,6 +1021,90 @@ mod tests {
         sim_b.methylation_mode = Some(crate::meth::MethylationMode::EmSeq);
         sim_b.methylation_failure_rate = Some(0.5);
         assert_ne!(sim_a.compute_seed(), sim_b.compute_seed());
+    }
+
+    /// Giving the same length twice is the same run as giving it once, so it
+    /// must keep the legacy seed.
+    #[test]
+    fn test_compute_seed_equal_read_lengths_matches_legacy() {
+        let mut sim = make_default_simulate();
+        sim.read_length = vec![150, 150];
+        let expected = resolve_seed(None, "/tmp/ref.fa:30:150:300:50:0.001:0.01");
+        assert_eq!(sim.compute_seed(), expected);
+    }
+
+    #[test]
+    fn test_compute_seed_asymmetric_read_lengths_appends_r2_length() {
+        let mut sim = make_default_simulate();
+        sim.read_length = vec![150, 100];
+        let expected = resolve_seed(None, "/tmp/ref.fa:30:150:300:50:0.001:0.01:100");
+        assert_eq!(sim.compute_seed(), expected);
+    }
+
+    #[test]
+    fn test_compute_seed_differs_when_read_lengths_swapped() {
+        let mut sim_a = make_default_simulate();
+        sim_a.read_length = vec![150, 100];
+        let mut sim_b = make_default_simulate();
+        sim_b.read_length = vec![100, 150];
+        assert_ne!(sim_a.compute_seed(), sim_b.compute_seed());
+    }
+
+    #[test]
+    fn test_compute_total_reads_uses_both_read_lengths() {
+        let mut sim = make_default_simulate();
+        sim.coverage = 10.0;
+        sim.read_length = vec![150, 50];
+        // 10x over 1,000 bp = 10,000 bases at 200 bases per pair.
+        assert_eq!(sim.compute_total_reads(1_000), 50);
+    }
+
+    #[test]
+    fn test_compute_total_reads_single_end_uses_r1_length() {
+        let mut sim = make_default_simulate();
+        sim.coverage = 10.0;
+        sim.single_end = true;
+        sim.read_length = vec![100];
+        assert_eq!(sim.compute_total_reads(1_000), 100);
+    }
+
+    #[test]
+    fn test_two_read_lengths_with_single_end_rejected() {
+        let mut sim = make_default_simulate();
+        sim.single_end = true;
+        sim.read_length = vec![150, 100];
+        let err = sim.validate().expect_err("validate must reject two lengths with --single-end");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("--single-end accepts only one --read-length value"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_zero_r2_read_length_rejected() {
+        let mut sim = make_default_simulate();
+        sim.read_length = vec![150, 0];
+        let err = sim.validate().expect_err("validate must reject a zero R2 length");
+        assert!(format!("{err}").contains("--read-length must be > 0"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn test_empty_read_length_rejected() {
+        let mut sim = make_default_simulate();
+        sim.read_length = Vec::new();
+        let err = sim.validate().expect_err("validate must reject an empty --read-length");
+        assert!(
+            format!("{err}").contains("--read-length takes one or two values"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_asymmetric_read_lengths_accepted() {
+        let mut sim = make_default_simulate();
+        sim.read_length = vec![150, 100];
+        assert!(sim.validate().is_ok(), "two positive lengths must validate cleanly");
     }
 
     /// Non-default `--methylation-conversion-rate` without a mode is also

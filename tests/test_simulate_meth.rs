@@ -1709,6 +1709,119 @@ fn test_cpg_truth_bedgraph_full_methylation_emits_only_methylated_calls() {
     assert!(sites > 0, "expected at least one CpG site in bedGraph");
 }
 
+/// With asymmetric read lengths each mate contributes truth calls over its
+/// own genomic span. Rebuilding per-CpG call counts from the golden BAM
+/// (`YM:Z` CpG calls placed on the reference via POS/CIGAR) gives an upper
+/// bound for every bedGraph site: the tally never counts a call its reads do
+/// not carry, but does skip a few bottom-strand calls on a mate's first
+/// aligned base. Tallying a mate over the wrong length or the wrong end of
+/// the fragment breaks either the per-site bound or the near-equal totals.
+#[test]
+fn test_cpg_truth_bedgraph_tallies_each_mate_over_its_own_read_length() {
+    use noodles::sam::alignment::record::cigar::op::Kind;
+    use std::collections::HashMap;
+
+    let env = cytosine_rich_env();
+    let out = env.output_prefix();
+    let bg = env.dir.path().join("truth.bedGraph");
+    let vcf = methylate_to_vcf(&env, &env.fasta_path, 1.0, 42, "meth.vcf.gz");
+
+    let (ok, _, stderr) = run_simulate(&[
+        "simulate",
+        "-r",
+        env.fasta_path.to_str().unwrap(),
+        "-v",
+        vcf.to_str().unwrap(),
+        "-o",
+        out.to_str().unwrap(),
+        "--coverage",
+        "10",
+        "--read-length",
+        "30",
+        "90",
+        "--fragment-mean",
+        "200",
+        "--fragment-stddev",
+        "10",
+        "--methylation-mode",
+        "em-seq",
+        "--methylation-conversion-rate",
+        "1.0",
+        "--methylation-failure-rate",
+        "0.0",
+        "--cpg-truth-bedgraph",
+        bg.to_str().unwrap(),
+        "--golden-bam",
+        "--seed",
+        "42",
+        "--threads",
+        "1",
+    ]);
+    assert!(ok, "simulate failed: {stderr}");
+
+    // bedGraph: CpG start (top-strand C, 0-based) -> total calls.
+    let body = std::fs::read_to_string(&bg).expect("bedGraph must exist");
+    let bedgraph_calls: HashMap<u32, u32> = body
+        .lines()
+        .skip(1)
+        .map(|row| {
+            let fields: Vec<&str> = row.split('\t').collect();
+            let total = fields[4].parse::<u32>().unwrap() + fields[5].parse::<u32>().unwrap();
+            (fields[1].parse().unwrap(), total)
+        })
+        .collect();
+
+    // Golden BAM: place each YM CpG call on the reference. A bottom-strand
+    // (XG:GA) call sits on the CpG's G, one base right of the site start.
+    let ym_tag = DataTag::new(b'Y', b'M');
+    let xg_tag = DataTag::new(b'X', b'G');
+    let mut bam_calls: HashMap<u32, u32> = HashMap::new();
+    for rec in read_bam_records(&out.with_extension("golden.bam")) {
+        let DataValue::String(ym) = rec.data().get(&ym_tag).expect("YM:Z must be present") else {
+            panic!("YM must be String");
+        };
+        let DataValue::String(xg) = rec.data().get(&xg_tag).expect("XG:Z must be present") else {
+            panic!("XG must be String");
+        };
+        let ym: &[u8] = ym.as_ref();
+        let site_offset = u32::from(<_ as AsRef<[u8]>>::as_ref(xg) == b"GA");
+        let mut ref_pos = u32::try_from(usize::from(rec.alignment_start().unwrap()) - 1).unwrap();
+        let mut read_pos = 0usize;
+        for op in rec.cigar().as_ref() {
+            let len = op.len();
+            match op.kind() {
+                Kind::Match | Kind::SequenceMatch | Kind::SequenceMismatch => {
+                    for i in 0..len {
+                        if matches!(ym[read_pos + i], b'Z' | b'z') {
+                            let site = ref_pos + u32::try_from(i).unwrap() - site_offset;
+                            *bam_calls.entry(site).or_default() += 1;
+                        }
+                    }
+                    ref_pos += u32::try_from(len).unwrap();
+                    read_pos += len;
+                }
+                Kind::Insertion | Kind::SoftClip => read_pos += len,
+                Kind::Deletion | Kind::Skip => ref_pos += u32::try_from(len).unwrap(),
+                Kind::HardClip | Kind::Pad => {}
+            }
+        }
+    }
+
+    for (site, &n) in &bedgraph_calls {
+        let bam_n = bam_calls.get(site).copied().unwrap_or(0);
+        assert!(n <= bam_n, "site {site}: bedGraph has {n} calls but the golden BAM has {bam_n}");
+    }
+    let bedgraph_total: u32 = bedgraph_calls.values().sum();
+    let bam_total: u32 = bam_calls.values().sum();
+    assert!(bam_total > 0, "expected CpG calls in the golden BAM");
+    let ratio = f64::from(bedgraph_total) / f64::from(bam_total);
+    assert!(
+        ratio >= 0.95,
+        "bedGraph calls ({bedgraph_total}) should nearly match golden BAM YM CpG calls \
+         ({bam_total}); ratio {ratio:.3}"
+    );
+}
+
 #[test]
 fn test_cpg_truth_bedgraph_zero_methylation_emits_only_unmethylated_calls() {
     // methylation-rate 0 → bitmap is all-false → every covered CpG records
